@@ -22,7 +22,7 @@ import uuid, logging, jwt, bcrypt, math, asyncio
 import base64, hashlib, secrets
 from cryptography.fernet import Fernet, InvalidToken
 from pymongo import IndexModel, ReturnDocument
-from pymongo.errors import DuplicateKeyError, OperationFailure
+from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure
 
 import seed_data
 from production_recipes import PREDEFINED_BLOCK_RECIPES
@@ -87,6 +87,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 api = APIRouter(prefix="/api")
 backup_scheduler_task = None
 fleet_notification_scheduler_task = None
+legacy_migration_task = None
 
 
 def now_iso():
@@ -18139,7 +18140,7 @@ async def initialize_empty_company(company_id):
 
 @app.on_event("startup")
 async def on_startup():
-    global backup_scheduler_task, fleet_notification_scheduler_task
+    global backup_scheduler_task, fleet_notification_scheduler_task, legacy_migration_task
     startup_company = active_company_id.set(DEFAULT_COMPANY_ID)
     try:
         await seed()
@@ -18149,10 +18150,7 @@ async def on_startup():
         await initialize_multi_company()
     except OperationFailure as error:
         logging.warning("Multi-company initialization incomplete (index or setup conflict): %s", error)
-    try:
-        await migrate_legacy_company_databases()
-    except Exception:
-        logging.exception("Legacy company database migration did not complete; it will retry on next startup")
+    legacy_migration_task = asyncio.create_task(run_legacy_migration_in_background())
     try:
         await initialize_workflow_indexes()
     except OperationFailure as error:
@@ -18187,11 +18185,28 @@ def legacy_counter_id(company_id, counter_id):
     return f"{company_id}:{counter_id}"
 
 
+async def run_legacy_migration_in_background():
+    try:
+        await migrate_legacy_company_databases()
+    except Exception:
+        logging.exception("Legacy company database migration did not complete; it will retry on next startup")
+
+
 async def migrate_legacy_company_collection(source, target, company_id):
     stats = {"inserted": 0, "existing": 0, "conflicts": 0}
     is_counters = source.name == "counters"
+    existing_ids = set(await target.distinct("id", {"company_id": company_id}))
+    pending = []
     async for doc in source.find({}):
         doc["company_id"] = company_id
+        if doc.get("id") is not None and not is_counters:
+            if doc["id"] in existing_ids:
+                stats["existing"] += 1
+                continue
+            doc.pop("_id", None)
+            existing_ids.add(doc["id"])
+            pending.append(doc)
+            continue
         if is_counters and "id" not in doc:
             doc["_id"] = legacy_counter_id(company_id, doc["_id"])
             match = {"_id": doc["_id"]}
@@ -18209,6 +18224,19 @@ async def migrate_legacy_company_collection(source, target, company_id):
         except DuplicateKeyError as error:
             stats["conflicts"] += 1
             logging.warning("Legacy %s.%s record not copied (conflict): %s", company_id, source.name, error.details.get("keyValue") if error.details else error)
+    for start in range(0, len(pending), 500):
+        batch = pending[start:start + 500]
+        try:
+            result = await target.insert_many(batch, ordered=False)
+            stats["inserted"] += len(result.inserted_ids)
+        except BulkWriteError as error:
+            errors = error.details.get("writeErrors", [])
+            stats["inserted"] += error.details.get("nInserted", 0)
+            stats["conflicts"] += len(errors)
+            for item in errors[:5]:
+                logging.warning("Legacy %s.%s record not copied (conflict): %s", company_id, source.name, item.get("keyValue") or item.get("errmsg"))
+            if any(item.get("code") != 11000 for item in errors):
+                raise
     return stats
 
 
@@ -18225,7 +18253,12 @@ async def migrate_legacy_company_databases():
         for name in sorted(names):
             if name.startswith("system.") or name in LEGACY_SKIP_COLLECTIONS:
                 continue
-            report[name] = await migrate_legacy_company_collection(legacy_db[name], base_db[name], company_id)
+            try:
+                report[name] = await migrate_legacy_company_collection(legacy_db[name], base_db[name], company_id)
+            except Exception as error:
+                report[name] = {"error": str(error)[:300]}
+                logging.exception("Legacy %s.%s migration failed; other collections continue", company_id, name)
+            logging.info("Legacy %s.%s: %s", company_id, name, report[name])
         await base_db.legacy_migrations.update_one(
             {"source_database": legacy_name},
             {"$set": {"company_id": company_id, "ran_at": now_iso(), "collections": report}},
