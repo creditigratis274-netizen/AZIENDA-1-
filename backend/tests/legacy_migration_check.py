@@ -8,7 +8,7 @@ MAIN = "test_database"
 LEGACY = ["iqfoam-whole-sallers", "iqfoam-manufactoring"]
 SKIP = {"users", "companies", "user_sessions", "user_devices", "company_admin_counts",
         "login_attempts", "backup_locks", "backup_operations", "legacy_migrations"}
-COLLS = ["invoices", "customers", "payments", "counters", "stock", "expenses", "audit_log"]
+COLLS = ["invoices", "customers", "payments", "counters", "stock", "expenses", "audit_log", "attendance"]
 c = MongoClient(os.environ.get("MONGO_URL", "mongodb://localhost:27017"))
 main = c[MAIN]
 
@@ -55,8 +55,8 @@ if __name__ == "__main__":
         miss = verify_copies()
         print("MISSING:", {k: (len(v), v[:5]) for k, v in miss.items()} or "none")
         for m in main.legacy_migrations.find({}, {"_id": 0}).sort("ran_at", -1).limit(2):
-            ins = {k: v["inserted"] for k, v in m["collections"].items() if v["inserted"]}
-            conf = {k: v["conflicts"] for k, v in m["collections"].items() if v["conflicts"]}
+            ins = {k: v["inserted"] for k, v in m["collections"].items() if v.get("inserted")}
+            conf = {k: v["conflicts"] for k, v in m["collections"].items() if v.get("conflicts")}
             print(m["company_id"], m["ran_at"], "inserted:", ins or 0, "conflicts:", conf)
     elif mode == "diff":
         a, b = json.load(open(sys.argv[2])), json.load(open(sys.argv[3]))

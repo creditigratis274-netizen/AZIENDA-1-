@@ -44,3 +44,8 @@ Private ERP for SUPER IQ-FOAM (foam/mattress manufacturer & wholesaler, Kokstad,
 - Startup index creation tolerant (create_company_unique_index catches OperationFailure; startup index groups wrapped). grvs grv_number unique index now company-scoped (stale global index dropped).
 - Preview verified by testing agent (iteration_2) + GRV fix re-checked. NOT deployed. Production per-company DBs are not readable by the prod Mongo user, so nothing can be migrated there by this code.
 - Backup: BACKUP_S3_BUCKET secret value invalid ("R2 SUPER-IQFOAM-BACKUP"), must be 'super-iqfoam-backups'.
+
+## 2026-11-16 — Manufacturing legacy migration fix
+- Prod logs: __iqfoam-manufactoring readable; migration started (attendance) then pod died during slow blocking startup.
+- Fix: migration now runs as a background task after startup (no health-check timeout); bulk insert_many(ordered=False) in 500-doc batches with pre-fetched existing ids; per-collection error isolation; marker upserted per source DB. initialize_multi_company wrapped.
+- Verified in preview by testing agent (iteration_4, 12/12). NOT yet deployed; needs Republish, then verify legacy_migrations marker for iqfoam-manufactoring in prod.

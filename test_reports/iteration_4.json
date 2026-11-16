@@ -1,0 +1,28 @@
+{
+  "summary": "Backend only. Reviewed the background legacy migration code and tested it on throwaway DBs. Batch insert, conflict counting, idempotence, counters and docs without an id, and per-collection error isolation all work (12/12 checks). After a backend restart, 'Application startup complete' was logged before both legacy migrations finished. Both migrations inserted 0 records. test_database counts per company were the same before and after the restart for invoices, customers, payments, counters, stock, expenses, audit_log and attendance. Legacy DBs were unchanged.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "startup migration (prices)", "issue": "Each restart logs 44 'prices' conflicts per company. The unique index on (company_id, zone, category, size) blocks the legacy rows because the main DB already has rows for the same key with different ids. I checked: all 45 Wholesale and 136 Manufacturing legacy price values match the main DB, so no data is lost. The warning repeats on every startup."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": ["/app/backend/tests/legacy_migration_batch_check.py", "/app/backend/tests/legacy_migration_check.py"],
+  "action_items": [
+    "Optional: treat a conflict whose stored values match the legacy row as 'existing' (or check the unique key before inserting) so prices don't warn on every startup.",
+    "Production risk: target.distinct('id') returns one BSON document, limited to 16MB (roughly 300k+ uuid ids). A very large collection would fail on this call. The error is caught per collection, so that collection would never migrate. Consider an aggregation/cursor or a $in lookup per batch.",
+    "Production risk: pending holds all new docs of a collection in memory before batching. For a large attendance/audit_log this could cause OOM, which matches the pod dying during manufactoring.attendance. Consider flushing each 500-doc batch while iterating the cursor."
+  ],
+  "critical_code_review_comments": [
+    "on_startup: the migration now runs via asyncio.create_task and does not block startup (confirmed in the logs). initialize_multi_company is wrapped in try/except OperationFailure. OK.",
+    "migrate_legacy_company_collection: insert_many(ordered=False) in batches of 500; 11000 errors are counted as conflicts and logged (first 5), other codes are re-raised; counters get the '<cid>:<_id>' _id. OK. A doc whose id is repeated inside the source is skipped as 'existing'.",
+    "There is no cross-process lock. If several workers or pods start at once, each one migrates, and collections without a unique id index could get duplicates. Low risk with a single uvicorn worker.",
+    "run_legacy_migration_in_background keeps no strong reference beyond the module global (OK) and logs the exception; the run retries on the next startup."
+  ],
+  "updated_files": ["/app/backend/tests/legacy_migration_batch_check.py (new)", "/app/backend/tests/legacy_migration_check.py (added attendance; verify tolerates error entries)"],
+  "success_rate": {"backend": "100%", "frontend": "N/A"},
+  "seed_data_creation": "None. Used only the throwaway DBs tmp_mig_src, tmp_mig_tgt, tmp_mig_main and tmp_mig_main__*, all dropped afterwards.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Run 'python tests/legacy_migration_batch_check.py' from /app/backend to check the migration on throwaway DBs. For a restart check, run 'legacy_migration_check.py snap /tmp/before.json', restart the backend, take the 'after' snapshot, then run 'diff' and 'verify'. The prices 'missing' entries are expected: matching rows exist with different ids."
+}
