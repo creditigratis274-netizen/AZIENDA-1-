@@ -37,3 +37,10 @@ Private ERP for SUPER IQ-FOAM (foam/mattress manufacturer & wholesaler, Kokstad,
 - Left as-is by user choice: TEST records in the 2 new profiles; customers test_qa_2010140f and zuneer in superiqfoam.
 - Invoice preview no longer clipped; PDF verified (1 page, complete). Delivery note: user tests it.
 - Pending: banking details (shows N/A), employee names, mattress weights.
+
+## 2026-11-16 — Legacy per-company DB migration + tolerant startup indexes
+- server.py: migrate_legacy_company_databases() runs at startup (insert-only, idempotent, match company_id+id; counters without id stored as '<company_id>:<_id>'; conflicts logged, never overwritten; legacy DBs never touched; unreadable DB -> warning).
+- invoice_counter_id(): non-superiqfoam invoice sequences use '<company_id>:invoice-sequence-YYYY'.
+- Startup index creation tolerant (create_company_unique_index catches OperationFailure; startup index groups wrapped). grvs grv_number unique index now company-scoped (stale global index dropped).
+- Preview verified by testing agent (iteration_2) + GRV fix re-checked. NOT deployed. Production per-company DBs are not readable by the prod Mongo user, so nothing can be migrated there by this code.
+- Backup: BACKUP_S3_BUCKET secret value invalid ("R2 SUPER-IQFOAM-BACKUP"), must be 'super-iqfoam-backups'.

@@ -1,0 +1,32 @@
+{
+  "summary": "Backend-only, read-only verification of legacy per-company DB -> main DB migration. Restarted backend with before/after snapshots. Startup OK, migration INFO lines logged for both companies, inserted=0 on rerun (idempotent), main/legacy counts and superiqfoam counters identical across restart, legacy counters stored as '<company_id>:<_id>' with matching seq. Tolerant index simulated in throwaway DB tmp_idx_test (logged warning, no raise, DB dropped). One real gap: 1 wholesaler GRV not migrated because of a stale global unique index grvs.grv_number_1 in the main DB.",
+  "backend_issues": {
+    "critical": [
+      {"endpoint": "startup migration / grvs collection", "issue": "Legacy record test_database__iqfoam-whole-sallers.grvs id=aea9fa8a-23b2-4bc4-93ba-5462230cf3fc (grv_number GRV-2026-0007) NOT copied: DuplicateKey on stale global unique index 'grv_number_1' {grv_number:1} in test_database.grvs, because superiqfoam already has GRV-2026-0007 (id c76c7241-...). The code only creates the company-scoped {company_id,grv_number} index (server.py ~18001) and never drops the old global one. This also means new GRVs in other companies will hit DuplicateKey whenever their sequence number matches another company's GRV.", "priority": "HIGH"}
+    ],
+    "minor": [
+      {"endpoint": "startup migration / prices", "issue": "44 prices conflicts for BOTH companies (whole-sallers and manufactoring), not just manufactoring. Legacy prices DO have an 'id' field, but the seeded main-DB rows use different ids, so they collide on unique (company_id, zone, category, size). Main DB counts match legacy (45/45, 136/136). This is the expected 'do not overwrite' behaviour, but the handoff note's description was slightly wrong."},
+      {"endpoint": "legacy_migrations collection", "issue": "Every startup/hot reload inserts a new legacy_migrations report doc, so the collection grows without limit. Consider upserting one doc per company, or skipping once a completion marker exists."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": ["/app/backend/tests/legacy_migration_check.py"],
+  "action_items": [
+    "Drop the stale global unique index test_database.grvs 'grv_number_1' on startup (e.g. call create_company_unique_index(base_db.grvs, 'grv_number', unique=True) so the legacy key is dropped, or drop it explicitly inside try/except). Then restart so the missing wholesaler GRV-2026-0007 is migrated.",
+    "Review other non-company-scoped unique indexes in the main DB: buyings.idempotency_key_1 and production_costs (stock_id, block_ref) could collide across companies if values can repeat. token_hash/credential_id/public_submission_id are globally unique by nature, so they are fine.",
+    "Optional: stop legacy_migrations from growing on every startup."
+  ],
+  "critical_code_review_comments": [
+    "invoice_counter_id: returns the plain id for superiqfoam and '<company_id>:<id>' for other companies; used by both current_invoice_sequence and next_invoice_number. Correct.",
+    "migrate_legacy_company_databases: OperationFailure from list_collection_names is caught and logged, then the loop continues to the next company. on_startup also wraps the whole migration in except Exception. Correct.",
+    "on_startup wraps initialize_workflow_indexes and create_startup_feed_indexes (OperationFailure), and both ensure_performance_indexes calls are wrapped. Correct. Note that initialize_multi_company itself and its other plain create_index calls (e.g. salary_payments) are not wrapped.",
+    "For docs with an 'id', migration drops the legacy _id and lets MongoDB generate a new ObjectId. That is acceptable, but any references to the legacy ObjectId would break (unlikely, since the app uses 'id')."
+  ],
+  "updated_files": ["/app/backend/tests/legacy_migration_check.py"],
+  "success_rate": {"backend": "7/8 checks fully passed (check 2 has 1 unexpected missing GRV; the 88 price conflicts are expected)", "frontend": "N/A"},
+  "seed_data_creation": "None. The only writes were the temporary tmp_idx_test DB (dropped) and the legacy_migrations report doc that the restart itself creates.",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Use: python /app/backend/tests/legacy_migration_check.py snap /tmp/a.json; restart backend; snap /tmp/b.json; verify; diff /tmp/a.json /tmp/b.json. Expected after the fix: MISSING lists only prices (44 per company). Superiqfoam counters were invoice-sequence-2026 seq=49 and express seq=5; legacy counters were whole-sallers seq=17 and manufactoring seq=5.",
+  "rca of the issue": "test_database.grvs still has an old single-field unique index grv_number_1 from before multi-tenancy. Because company GRV numbers are per-company sequences (GRV-YYYY-NNNN), the same number exists in superiqfoam and whole-sallers. insert_one raises DuplicateKeyError and the migration correctly counts it as a conflict and skips it. Fix: drop grv_number_1, keep company_id_1_grv_number_1, then restart."
+}

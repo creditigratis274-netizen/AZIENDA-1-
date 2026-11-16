@@ -17995,12 +17995,9 @@ async def ensure_performance_indexes(database):
                     partialFilterExpression={"source_buying_id": {"$type": "string"}},
                     name="grv_source_buying_once",
                 )
+                await create_company_unique_index(database.grvs, "grv_number", unique=True)
             await database[collection_name].create_indexes([
                 IndexModel([("company_id", 1), ("id", 1)]),
-                *(
-                    [IndexModel([("company_id", 1), ("grv_number", 1)], unique=True)]
-                    if collection_name == "grvs" else []
-                ),
                 *(
                     IndexModel([("company_id", 1), *definition])
                     for definition in definitions
@@ -18226,10 +18223,11 @@ async def migrate_legacy_company_databases():
             if name.startswith("system.") or name in LEGACY_SKIP_COLLECTIONS:
                 continue
             report[name] = await migrate_legacy_company_collection(legacy_db[name], base_db[name], company_id)
-        await base_db.legacy_migrations.insert_one({
-            "source_database": legacy_name, "company_id": company_id,
-            "ran_at": now_iso(), "collections": report,
-        })
+        await base_db.legacy_migrations.update_one(
+            {"source_database": legacy_name},
+            {"$set": {"company_id": company_id, "ran_at": now_iso(), "collections": report}},
+            upsert=True,
+        )
         logging.info("Legacy migration %s -> %s: %s", legacy_name, base_db.name, report)
 
 
