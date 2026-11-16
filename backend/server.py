@@ -137,6 +137,7 @@ WORKER_SECTION_PREFIXES = {
     "intercompany": "intercompany",
     "stock": "stock",
     "company-inventory": "company-inventory",
+    "production/monthly-chemical-sheet": "superiqfoam-monthly-sheet",
     "production": "production",
     "simple-production": "production",
     "attendance": "attendance",
@@ -494,6 +495,7 @@ WORKER_SECTIONS = {
     "express-invoices", "express-client-payments", "intercompany", "company-inventory",
     "chemicals-quantity", "chemical-usage-log", "warehouse-a", "warehouse-b",
     "warehouse-c", "warehouse-chemical", "warehouse-chemical-inventory",
+    "superiqfoam-monthly-sheet",
 }
 
 def canonical_email(email):
@@ -792,6 +794,12 @@ def enforce_worker_api_access(request, user):
 
     section = worker_section_for_request(path, user)
     if section and section in allowed:
+        return
+    if (
+        section == "superiqfoam-monthly-sheet"
+        and user.get("_active_company_id") == DEFAULT_COMPANY_ID
+        and set(allowed) & {"chemicals-quantity", "chemical-usage-log"}
+    ):
         return
     raise HTTPException(403, "This worker account cannot access this section")
 
@@ -1220,6 +1228,8 @@ def validate_worker_company_sections(company_id, sections):
         raise HTTPException(400, "Warehouse access is only available in IQFOAM Manufacturing")
     if set(sections) & {"chemicals-quantity", "chemical-usage-log"} and company_id != "superiqfoam":
         raise HTTPException(400, "These chemical sections are only available in SUPERIQFOAM")
+    if "superiqfoam-monthly-sheet" in sections and company_id != "superiqfoam":
+        raise HTTPException(400, "The monthly chemical sheet is only available in SUPERIQFOAM")
 
 def worker_warehouse_ids(doc):
     ids = doc.get("worker_warehouse_ids")
@@ -3268,6 +3278,94 @@ class ChemicalLogIn(BaseModel):
         return value
 
 
+MONTHLY_SHEET_BLOCK_KEYS = {
+    "big_block", "big_blue_block", "medium_block", "small_block", "small_blue_block",
+}
+
+
+class MonthlySheetChemicalValues(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    ppg: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+    tdi: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+    t9: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+    silicone: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+    amine52: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+    mcl: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+
+
+class MonthlySheetProductionBlockIn(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    quantity: Optional[int] = Field(default=None, ge=0)
+    weight_kg: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+
+
+class MonthlySheetWeekIn(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    big_block: MonthlySheetProductionBlockIn = Field(default_factory=MonthlySheetProductionBlockIn)
+    big_blue_block: MonthlySheetProductionBlockIn = Field(default_factory=MonthlySheetProductionBlockIn)
+    medium_block: MonthlySheetProductionBlockIn = Field(default_factory=MonthlySheetProductionBlockIn)
+    small_block: MonthlySheetProductionBlockIn = Field(default_factory=MonthlySheetProductionBlockIn)
+    small_blue_block: MonthlySheetProductionBlockIn = Field(default_factory=MonthlySheetProductionBlockIn)
+
+
+class MonthlySheetArrivalLineIn(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    line_index: int = Field(ge=0)
+    chemical_key: str = Field(pattern=r"^(ppg|tdi|t9|silicone|amine52|mcl)$")
+
+
+class MonthlySheetArrivalSourceIn(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    grv_id: str = Field(min_length=1, max_length=120)
+    lines: List[MonthlySheetArrivalLineIn] = Field(min_length=1)
+
+    @field_validator("lines")
+    @classmethod
+    def validate_unique_arrival_lines(cls, value):
+        indexes = [line.line_index for line in value]
+        if len(indexes) != len(set(indexes)):
+            raise ValueError("A GRV line can only be mapped once")
+        return value
+
+
+class MonthlyChemicalSheetIn(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    month: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    arrivals: MonthlySheetChemicalValues
+    arrival_sources: List[MonthlySheetArrivalSourceIn] = Field(default_factory=list)
+    minimums: MonthlySheetChemicalValues
+    formula_rates: Dict[str, MonthlySheetChemicalValues]
+    weeks: List[MonthlySheetWeekIn]
+
+    @field_validator("formula_rates")
+    @classmethod
+    def validate_formula_rate_blocks(cls, value):
+        if set(value) != MONTHLY_SHEET_BLOCK_KEYS:
+            raise ValueError("Formula rates must include each supported block type")
+        return value
+
+    @model_validator(mode="after")
+    def validate_month_weeks(self):
+        year, month = map(int, self.month.split("-"))
+        expected_weeks = len(calendar.Calendar(firstweekday=calendar.MONDAY).monthdayscalendar(year, month))
+        if len(self.weeks) != expected_weeks:
+            raise ValueError(f"The monthly sheet must contain exactly {expected_weeks} production weeks")
+        return self
+
+    @model_validator(mode="after")
+    def validate_unique_arrival_grvs(self):
+        grv_ids = [source.grv_id for source in self.arrival_sources]
+        if len(grv_ids) != len(set(grv_ids)):
+            raise ValueError("A GRV can only be added to the monthly sheet once")
+        return self
+
+
 CHEMICAL_COMPANY_IDS = {MANUFACTURING_COMPANY_ID, DEFAULT_COMPANY_ID}
 
 
@@ -3284,6 +3382,156 @@ def require_chemical_access(user):
         user.get("worker_allowed_sections", [])
     ):
         raise HTTPException(403, "This worker account cannot access the Chemical section")
+
+
+def require_superiqfoam_monthly_sheet_access(user):
+    if user.get("_active_company_id") != DEFAULT_COMPANY_ID:
+        raise HTTPException(403, "The monthly chemical sheet is only available in SUPERIQFOAM")
+    if worker_restrictions_apply(user) and (
+        not set(user.get("worker_allowed_sections", []))
+        .intersection({"superiqfoam-monthly-sheet", "chemicals-quantity", "chemical-usage-log"})
+    ):
+        raise HTTPException(403, "This worker account cannot access the monthly chemical sheet")
+
+
+@api.get("/production/monthly-chemical-sheet")
+async def get_monthly_chemical_sheet(month: str = Query(pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+                                     user=Depends(get_current_user)):
+    require_superiqfoam_monthly_sheet_access(user)
+    sheet_id = f"monthly-chemical-sheet:{month}"
+    saved = await db.monthly_chemical_sheets.find_one({"id": sheet_id}, {"_id": 0})
+    if saved:
+        return saved
+    previous = await db.monthly_chemical_sheets.find(
+        {"month": {"$lt": month}}, {"_id": 0, "formula_rates": 1},
+    ).sort("month", -1).limit(1).to_list(1)
+    default_values = MonthlySheetChemicalValues().model_dump()
+    return {
+        "id": sheet_id,
+        "month": month,
+        "arrivals": default_values,
+        "minimums": default_values,
+        "formula_rates": (
+            previous[0].get("formula_rates")
+            if previous else {key: default_values for key in MONTHLY_SHEET_BLOCK_KEYS}
+        ),
+        "weeks": [
+            MonthlySheetWeekIn().model_dump()
+            for _ in calendar.Calendar(firstweekday=calendar.MONDAY).monthdayscalendar(
+                int(month[:4]), int(month[5:7]),
+            )
+        ],
+        "arrival_sources": [],
+    }
+
+
+@api.get("/production/monthly-chemical-sheet/grvs")
+async def get_monthly_chemical_sheet_grvs(
+    month: str = Query(pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    user=Depends(get_current_user),
+):
+    require_superiqfoam_monthly_sheet_access(user)
+    start = f"{month}-01"
+    end = f"{month}-{calendar.monthrange(int(month[:4]), int(month[5:7]))[1]:02d}"
+    records = await db.grvs.find(
+        {
+            "received_date": {"$gte": start, "$lte": end},
+            "status": {"$in": ["completed", "partially_received", "discrepancy"]},
+            "purpose": "raw_material",
+            "is_chemical": True,
+        },
+        {"_id": 0},
+    ).sort([("received_date", -1), ("created_at", -1)]).to_list(None)
+    return [{
+        "id": grv["id"],
+        "grv_number": grv.get("grv_number", ""),
+        "received_date": grv.get("received_date", ""),
+        "supplier_name": grv.get("supplier_name", ""),
+        "items": [
+            {
+                "line_index": index,
+                "product": line.get("product", ""),
+                "accepted_quantity": float(line.get("accepted_quantity", 0) or 0),
+                "capacity": float(line.get("size", 0) or 0),
+                "container_type": line.get("container_type") or "Container",
+                "unit": line.get("unit", ""),
+                "accepted_quantity": float(line.get("accepted_quantity", 0) or 0),
+                "quantity_kg": round(
+                    float(line.get("accepted_quantity", 0) or 0) * float(line.get("size", 0) or 0),
+                    4,
+                ) if str(line.get("unit", "")).strip().casefold() in {
+                    "kg", "kgs", "kilogram", "kilograms",
+                } and float(line.get("size", 0) or 0) > 0 else None,
+            }
+            for index, line in enumerate(grv.get("items", []))
+        ],
+    } for grv in records]
+
+
+async def validate_monthly_sheet_arrival_sources(month, sources):
+    validated = []
+    for source in sources:
+        grv = await db.grvs.find_one({"id": source.grv_id}, {"_id": 0})
+        if (
+            not grv
+            or grv.get("received_date", "")[:7] != month
+            or grv.get("status") not in {"completed", "partially_received", "discrepancy"}
+            or grv.get("purpose") != "raw_material"
+            or not grv.get("is_chemical")
+        ):
+            raise HTTPException(422, f"GRV {source.grv_id} is not an eligible chemical receipt for {month}")
+        mapped_lines = []
+        for mapping in source.lines:
+            if mapping.line_index >= len(grv.get("items", [])):
+                raise HTTPException(422, f"GRV {grv.get('grv_number', source.grv_id)} has no line {mapping.line_index + 1}")
+            line = grv["items"][mapping.line_index]
+            unit = str(line.get("unit", "")).strip().casefold()
+            try:
+                capacity = float(line.get("size", 0) or 0)
+                accepted = float(line.get("accepted_quantity", 0) or 0)
+            except (TypeError, ValueError):
+                capacity, accepted = 0, 0
+            if unit not in {"kg", "kgs", "kilogram", "kilograms"} or capacity <= 0 or accepted <= 0:
+                raise HTTPException(422, f"GRV line {mapping.line_index + 1} must have accepted quantity and capacity in kg")
+            mapped_lines.append({
+                "line_index": mapping.line_index,
+                "chemical_key": mapping.chemical_key,
+                "product": line.get("product", ""),
+                "container_type": line.get("container_type") or "Container",
+                "container_capacity": capacity,
+                "container_count": accepted,
+                "unit": line.get("unit", ""),
+                "quantity_kg": round(accepted * capacity, 4),
+            })
+        validated.append({
+            "grv_id": grv["id"],
+            "grv_number": grv.get("grv_number", ""),
+            "received_date": grv.get("received_date", ""),
+            "supplier_name": grv.get("supplier_name", ""),
+            "lines": mapped_lines,
+        })
+    return validated
+
+
+@api.put("/production/monthly-chemical-sheet")
+async def save_monthly_chemical_sheet(body: MonthlyChemicalSheetIn, user=Depends(get_current_user)):
+    require_superiqfoam_monthly_sheet_access(user)
+    require_global_owner(user)
+    sheet_id = f"monthly-chemical-sheet:{body.month}"
+    timestamp = now_iso()
+    values = body.model_dump()
+    values["arrival_sources"] = await validate_monthly_sheet_arrival_sources(
+        body.month, body.arrival_sources,
+    )
+    await db.monthly_chemical_sheets.update_one(
+        {"id": sheet_id},
+        {"$set": {**values, "updated_at": timestamp, "updated_by": user["id"]},
+         "$setOnInsert": {"id": sheet_id, "created_at": timestamp}},
+        upsert=True,
+    )
+    saved = await db.monthly_chemical_sheets.find_one({"id": sheet_id}, {"_id": 0})
+    await log_audit("monthly_chemical_sheet", sheet_id, "saved", user, after=saved)
+    return saved
 
 
 class ProductionRecipeComponentIn(BaseModel):
@@ -8447,6 +8695,9 @@ class EmployeeIn(BaseModel):
     name: str
     department: str = "Production"
     is_general_worker: bool = False
+    is_plastic_cleaning: bool = False
+    is_machine_work: bool = False
+    is_plastic_cutting: bool = False
     skills: Optional[str] = ""
     notes: Optional[str] = ""
     active: bool = True
@@ -8516,8 +8767,11 @@ def validate_payroll_roster_company(user):
 
 def validate_employee_worker_type(body, user):
     company_id = user.get("_active_company_id") or user.get("company_id")
-    if body.is_general_worker and company_id != "iqfoam-whole-sallers":
-        raise HTTPException(400, "General workers are only available for IQ Foam Wholesalers")
+    if company_id != "iqfoam-whole-sallers":
+        if body.is_general_worker:
+            raise HTTPException(400, "General workers are only available for IQ Foam Wholesalers")
+        if body.is_plastic_cleaning or body.is_machine_work or body.is_plastic_cutting:
+            raise HTTPException(400, "Plastic work categories are only available for IQ Foam Wholesalers")
 
 @api.post("/employees/import-roster")
 async def import_employee_roster(user=Depends(get_current_user)):
@@ -9185,6 +9439,9 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
             "employee_id": employee["id"], "name": employee.get("name", ""),
             "department": employee.get("department", ""), "active": employee.get("active", True),
             "is_general_worker": employee.get("is_general_worker", False),
+            "is_plastic_cleaning": employee.get("is_plastic_cleaning", False),
+            "is_machine_work": employee.get("is_machine_work", False),
+            "is_plastic_cutting": employee.get("is_plastic_cutting", False),
             "hourly_rate": hourly_rate, "weekly_salary": weekly_salary,
             "monthly_salary": monthly_salary,
             "pay_frequency": "piece" if is_piece_paid else ("monthly_fixed" if is_monthly_fixed else "weekly_fixed"),
@@ -11281,14 +11538,14 @@ INTERFACE_NAV_GROUPS = {
     "purchasing": ("intercompany", "grv", "suppliers", "buyings"),
     "operations": ("stock", "fleet"),
     "company-inventory": ("company-inventory",),
-    "production": ("production", "chemicals-quantity", "chemical-usage-log"),
+    "production": ("production", "superiqfoam-monthly-sheet"),
     "warehouses": ("warehouse-a", "warehouse-b", "warehouse-c", "warehouse-chemical", "warehouse-chemical-inventory"),
     "finance-team": ("expenses", "daily-report", "attendance"),
     "administration": ("settings",),
 }
 INTERFACE_SECTIONS = {
     section for sections in INTERFACE_NAV_GROUPS.values() for section in sections
-}
+} | {"chemicals-quantity", "chemical-usage-log"}
 INTERFACE_CUSTOM_LINKS = {
     "/": "dashboard",
     "/customers": "customers",
@@ -11305,6 +11562,7 @@ INTERFACE_CUSTOM_LINKS = {
     "/fleet": "fleet",
     "/company-inventory": "company-inventory",
     "/production": "production",
+    "/production/monthly-sheet": "superiqfoam-monthly-sheet",
     "/warehouses/chemical-inventory": "chemicals-quantity",
     "/warehouses/chemical": "chemical-usage-log",
     "/warehouses/A": "warehouse-a",
@@ -11317,6 +11575,7 @@ INTERFACE_CUSTOM_LINKS = {
 }
 INTERFACE_CUSTOM_LINK_COMPANIES = {
     "/production": {"superiqfoam"},
+    "/production/monthly-sheet": {"superiqfoam"},
     "/warehouses/A": {"iqfoam-manufactoring"},
     "/warehouses/B": {"iqfoam-manufactoring"},
     "/warehouses/C": {"iqfoam-manufactoring"},
@@ -11369,6 +11628,21 @@ def normalize_interface_config(config, company_id=None, allow_legacy_fields=Fals
     section_order = {}
     for group, sections in INTERFACE_NAV_GROUPS.items():
         custom_order = supplied_section_order.get(group, [])
+        if group == "production" and isinstance(custom_order, list):
+            legacy_chemical_sections = {"chemicals-quantity", "chemical-usage-log"}
+            if legacy_chemical_sections.intersection(custom_order):
+                first_legacy_index = min(
+                    index for index, section in enumerate(custom_order)
+                    if section in legacy_chemical_sections
+                )
+                custom_order = [
+                    section for section in custom_order
+                    if section not in legacy_chemical_sections
+                ]
+                custom_order.insert(
+                    min(first_legacy_index, len(custom_order)),
+                    "superiqfoam-monthly-sheet",
+                )
         if not isinstance(custom_order, list) or any(
             not isinstance(section, str) or section not in sections
             for section in custom_order
