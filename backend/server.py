@@ -5384,15 +5384,20 @@ async def invoice_sequence_start(year, invoice_type="standard"):
 
 async def current_invoice_sequence(year=None, invoice_type="standard"):
     year = year or local_now().year
-    counter_id = f"express-invoice-sequence-{year}" if invoice_type == "express" else f"invoice-sequence-{year}"
+    counter_id = invoice_counter_id(year, invoice_type)
     counter = await db.counters.find_one({"_id": counter_id})
     if counter:
         return int(counter["seq"])
     return await invoice_sequence_start(year, invoice_type)
 
+def invoice_counter_id(year, invoice_type):
+    counter_id = f"express-invoice-sequence-{year}" if invoice_type == "express" else f"invoice-sequence-{year}"
+    company_id = active_company_id.get() or DEFAULT_COMPANY_ID
+    return counter_id if company_id == DEFAULT_COMPANY_ID else legacy_counter_id(company_id, counter_id)
+
 async def next_invoice_number(invoice_date=None, invoice_type="standard"):
     year = invoice_numbering_year(invoice_date)
-    counter_id = f"express-invoice-sequence-{year}" if invoice_type == "express" else f"invoice-sequence-{year}"
+    counter_id = invoice_counter_id(year, invoice_type)
     counter = await db.counters.find_one({"_id": counter_id})
     if not counter:
         initial_seq = await invoice_sequence_start(year, invoice_type)
@@ -17638,6 +17643,13 @@ async def attendance_summary(user=Depends(get_current_user)):
 
 # ---------------- Seeding ----------------
 async def create_company_unique_index(collection, keys, **options):
+    try:
+        await _create_company_unique_index(collection, keys, **options)
+    except OperationFailure as error:
+        logging.warning("Index %s on %s not created: %s", options.get("name") or keys, collection.name, error)
+
+
+async def _create_company_unique_index(collection, keys, **options):
     legacy_keys = [(keys, 1)] if isinstance(keys, str) else list(keys)
     if options.pop("sparse", False):
         indexed_field = legacy_keys[-1][0]
@@ -17823,7 +17835,10 @@ async def initialize_multi_company():
         base_db.warehouse_report_share_links,
         "token_hash", unique=True, name="warehouse_report_share_token_once",
     )
-    await ensure_performance_indexes(base_db)
+    try:
+        await ensure_performance_indexes(base_db)
+    except OperationFailure as error:
+        logging.warning("Performance indexes not fully created: %s", error)
 
     for profile in COMPANY_PROFILES:
         if profile["id"] != DEFAULT_COMPANY_ID:
@@ -18120,7 +18135,10 @@ async def initialize_empty_company(company_id):
         [("payment_date", -1)],
         name="salary_payment_date",
     )
-    await ensure_performance_indexes(company_db)
+    try:
+        await ensure_performance_indexes(company_db)
+    except OperationFailure as error:
+        logging.warning("Performance indexes not fully created: %s", error)
 
 @app.on_event("startup")
 async def on_startup():
@@ -18131,7 +18149,91 @@ async def on_startup():
     finally:
         active_company_id.reset(startup_company)
     await initialize_multi_company()
-    await initialize_workflow_indexes()
+    try:
+        await migrate_legacy_company_databases()
+    except Exception:
+        logging.exception("Legacy company database migration did not complete; it will retry on next startup")
+    try:
+        await initialize_workflow_indexes()
+    except OperationFailure as error:
+        logging.warning("Workflow indexes not fully created: %s", error)
+    try:
+        await create_startup_feed_indexes()
+    except OperationFailure as error:
+        logging.warning("Notification/intercompany indexes not fully created: %s", error)
+    fleet_notification_scheduler_task = asyncio.create_task(
+        scheduled_fleet_notification_loop()
+    )
+    status = backup_runtime_status()
+    if status["configured"] and status["tools_available"]:
+        backup_scheduler_task = asyncio.create_task(scheduled_backup_loop(
+            mongo_url=mongo_url,
+            database_names=backup_database_names(),
+            configuration=backup_configuration(),
+            local_timezone=TZ,
+            lock_database=base_db,
+        ))
+    else:
+        logging.warning(
+            "Automated backups are not active; configure S3-compatible storage and MongoDB backup tools"
+        )
+
+
+LEGACY_COMPANY_DATABASES = ("iqfoam-whole-sallers", "iqfoam-manufactoring")
+LEGACY_SKIP_COLLECTIONS = GLOBAL_COLLECTIONS | {"backup_locks", "backup_operations", "legacy_migrations"}
+
+
+def legacy_counter_id(company_id, counter_id):
+    return f"{company_id}:{counter_id}"
+
+
+async def migrate_legacy_company_collection(source, target, company_id):
+    stats = {"inserted": 0, "existing": 0, "conflicts": 0}
+    is_counters = source.name == "counters"
+    async for doc in source.find({}):
+        doc["company_id"] = company_id
+        if is_counters and "id" not in doc:
+            doc["_id"] = legacy_counter_id(company_id, doc["_id"])
+            match = {"_id": doc["_id"]}
+        elif doc.get("id") is not None:
+            doc.pop("_id", None)
+            match = {"company_id": company_id, "id": doc["id"]}
+        else:
+            match = {"company_id": company_id, "_id": doc["_id"]}
+        if await target.find_one(match, {"_id": 1}):
+            stats["existing"] += 1
+            continue
+        try:
+            await target.insert_one(doc)
+            stats["inserted"] += 1
+        except DuplicateKeyError as error:
+            stats["conflicts"] += 1
+            logging.warning("Legacy %s.%s record not copied (conflict): %s", company_id, source.name, error.details.get("keyValue") if error.details else error)
+    return stats
+
+
+async def migrate_legacy_company_databases():
+    for company_id in LEGACY_COMPANY_DATABASES:
+        legacy_name = f"{base_db.name}__{company_id}"
+        legacy_db = client[legacy_name]
+        try:
+            names = await legacy_db.list_collection_names()
+        except OperationFailure as error:
+            logging.warning("Legacy database %s not readable, nothing migrated: %s", legacy_name, error)
+            continue
+        report = {}
+        for name in sorted(names):
+            if name.startswith("system.") or name in LEGACY_SKIP_COLLECTIONS:
+                continue
+            report[name] = await migrate_legacy_company_collection(legacy_db[name], base_db[name], company_id)
+        await base_db.legacy_migrations.insert_one({
+            "source_database": legacy_name, "company_id": company_id,
+            "ran_at": now_iso(), "collections": report,
+        })
+        logging.info("Legacy migration %s -> %s: %s", legacy_name, base_db.name, report)
+
+
+async def create_startup_feed_indexes():
     await base_db.notifications.create_index(
         [("company_id", 1), ("event_key", 1), ("recipient_user_id", 1)],
         unique=True,
@@ -18151,22 +18253,6 @@ async def on_startup():
         [("supplying_company_id", 1), ("created_at", -1)],
         name="intercompany_supplier_feed",
     )
-    fleet_notification_scheduler_task = asyncio.create_task(
-        scheduled_fleet_notification_loop()
-    )
-    status = backup_runtime_status()
-    if status["configured"] and status["tools_available"]:
-        backup_scheduler_task = asyncio.create_task(scheduled_backup_loop(
-            mongo_url=mongo_url,
-            database_names=backup_database_names(),
-            configuration=backup_configuration(),
-            local_timezone=TZ,
-            lock_database=base_db,
-        ))
-    else:
-        logging.warning(
-            "Automated backups are not active; configure S3-compatible storage and MongoDB backup tools"
-        )
 
 app.include_router(api)
 configured_cors_origins = [origin.strip() for origin in os.environ.get("CORS_ORIGINS", "*").split(",") if origin.strip()]

@@ -1,53 +1,90 @@
-# RCA — iqfoam-business data / multi-company DB investigation (READ-ONLY)
+# iqfoam-business — READ-ONLY Production Audit
 
-Deployment: iqfoam-business (dbb69438-5a91-48fa-b52a-f7f69ab24638)
-Live URL: https://iqfoam-business.emergent.host (health check 200 OK)
-Active run: 09a403a9-bcd0-40cd-bd7c-fe5d26e966e2 (redeploy, success, 2026-11-16 14:29Z)
-Resolved production DB: `iqfoam-business-test_database`
+Audit timestamp: ~2026-11-16T15:45Z (UTC, approximate — based on latest observed run/log activity; no wall-clock tool available).
+Mode: READ-ONLY. No deploy, restore, index change, or config write was performed.
+Scope note: reports counts, aggregate dates, and technical source names only. No personal data, invoice content, URIs, or secrets included.
 
-## (1) Which commit is live + did backend start cleanly
-- I cannot map the run to a git SHA — `pull_source` excludes `.git`, and no tool exposes the commit hash. The live RUN is `09a403a9`. The exact SHA (401ef07 or later) is not retrievable from my tools.
-- BEHAVIORAL confirmation it is the post-migration code: the live run's logs only touch the main DB `iqfoam-business-test_database` and filter by a `company_id` FIELD (e.g. `GET /api/access/workers?company_id=iqfoam-whole-sallers` 200). It never opens any per-company suffixed database. The earlier FAILED run `4efd4a1f` (13:26Z) still did, and crashed on it (see §3). So the live code is the "all companies in main DB, filtered by company_id" version.
-- Backend started cleanly on the active run: `INFO: Application startup complete.` + `Uvicorn running on http://0.0.0.0:8001`. It currently serves 200/401/400 normally. (Older crash lines in the 24h window belong to the two preceding FAILED runs, not the active one.)
+Deployment: iqfoam-business (deployment_id dbb69438-5a91-48fa-b52a-f7f69ab24638)
+Active/serving run: 09a403a9-bcd0-40cd-bd7c-fe5d26e966e2 (type=redeploy, success, completed 2026-11-16T14:29:04Z)
 
-## (2) Main DB `iqfoam-business-test_database` counts by company_id
-Verified via mongo_query count/distinct. Companies: superiqfoam | iqfoam-manufactoring | iqfoam-whole-sallers | imraan-plastics
+---
 
-| collection        | superiqfoam | iqfoam-manufactoring | iqfoam-whole-sallers | imraan-plastics |
-|-------------------|-------------|----------------------|----------------------|-----------------|
-| invoices          | 69          | 0                    | 0                    | 0               |
-| payments          | 64          | 0                    | 0                    | 0               |
-| customers         | 278         | 0                    | 0                    | 0               |
-| employees         | 30          | 0                    | 0                    | 0               |
-| attendance        | 741         | 0                    | 0                    | 0               |
-| stock             | 73          | 89                   | 56                   | 0               |
-| buyings           | 5           | 0                    | 0                    | 0               |
-| expenses          | 79          | 0                    | 0                    | 0               |
-| orders            | 27          | 0                    | 0                    | 0               |
-| grvs              | 3           | 0                    | 0                    | 0               |
-| suppliers         | 3           | 0                    | 0                    | 0               |
-| production_daily  | 4           | 0                    | 0                    | 0               |
+## (1) Databases / clusters visible to tooling
 
-Method note: `distinct(company_id)` returned only `["superiqfoam"]` for every collection EXCEPT `stock`, which returned `["iqfoam-manufactoring","iqfoam-whole-sallers","superiqfoam"]`. So the 0s above are proven by distinct, not just inferred. `imraan-plastics` has NO data in any collection (it is a freshly-initialized empty profile — log warning: `Initial profile IMRAAN PLASTICS is waiting for a secure server-side password configuration`).
+Main production DB (resolved server-side by mongo_query): **iqfoam-business-test_database**
+- Accessible: **YES**. How I know: mongo_query resolved and returned this db_name and successfully ran list_collections (61 collections) + counts against it.
 
-KEY FINDING: In the main production DB, only `superiqfoam` has transactional data. `iqfoam-manufactoring` and `iqfoam-whole-sallers` appear ONLY in `stock` (89 / 56 rows — most likely default stock seeded by `initialize_empty_company`), and have ZERO invoices, payments, customers, employees, attendance, buyings, expenses, orders, grvs, suppliers, production_daily.
+Per-company suffixed DBs (naming pattern `iqfoam-business-test_database__<company>`). The `companies` collection in the main DB lists 4 company ids: `superiqfoam`, `iqfoam-whole-sallers`, `iqfoam-manufactoring`, `imraan-plastics`. Under the app's one-DB-per-company model that implies:
+- `iqfoam-business-test_database__iqfoam-whole-sallers` — Accessible: **NO / NOT VERIFIED**
+- `iqfoam-business-test_database__iqfoam-manufactoring` — Accessible: **NO / NOT VERIFIED**
+- `iqfoam-business-test_database__imraan-plastics` — Accessible: **NO / NOT VERIFIED**
 
-## (3) Do the two separate databases exist + their counts / authorization
-- I CANNOT read them. `mongo_query` is scoped server-side to the active run's resolved DB (`iqfoam-business-test_database`) only; it cannot target another database name.
-- AUTHORIZATION — proven from logs: failed run `4efd4a1f` backend crashed on startup with:
-  `pymongo.errors.OperationFailure: not authorized on iqfoam-business-test_database__imraan-plastics to execute command { aggregate: "settings" ... } ... 'code': 13, 'codeName': 'Unauthorized'`
-  => The production Mongo user is NOT authorized on the per-company suffixed databases (`iqfoam-business-test_database__<company>`). By the identical naming/scoping this applies to `__iqfoam-manufactoring` and `__iqfoam-whole-sallers` as well.
-- EXISTENCE: cannot be confirmed in production. On the INITIAL deploy, `provision_mongo` migrates only the single configured DB (`db_name`), not extra per-company databases. So the separate DBs were most likely never migrated into production (they would live in the PREVIEW cluster). Even if copies exist on the prod cluster, the prod user cannot read them (code 13 above). Either way the Manufacturing/Wholesalers historical records are NOT accessible from production today.
+How I know: the mongo_query tool is pinned server-side to the deployment's resolved main db_name and accepts no database parameter, so I cannot target any suffixed DB. Independent corroboration that these DBs exist but are permission-restricted: the failed redeploy run 4efd4a1f recorded `OperationFailure: not authorized on iqfoam-business-test_database__imraan-plastics to execute command {aggregate: "settings"...}` (code 13, Unauthorized) — i.e. the app's OWN DB user lacked privileges on that suffixed DB during startup.
 
-## (4) Log evidence the LIVE app ever saved Manufacturing/Wholesalers invoices or customers
-- None found. Across the 24h window the only invoice writes were `POST /api/invoices 400 Bad Request` (×4) — rejected, not saved. No successful invoice/customer POST for `iqfoam-manufactoring` or `iqfoam-whole-sallers`. Observed Manufacturing/Wholesalers traffic was read-only (`GET /api/access/workers?company_id=iqfoam-whole-sallers` 200, `GET /api/interface-settings?company_id=iqfoam-whole-sallers` 200).
-- Consistent with the data: 0 invoices / 0 customers for both companies in the main DB.
-- Scope caveat: log retention is limited (~24h visible); this is not proof of "never in all history", only that no such writes are visible in the available logs, and no such rows exist in the main DB now.
+No other clusters are visible to my tools (a single MONGO_URL / cluster backs this deployment).
 
-## Bottom line (no data was deleted by me — read-only)
-The live app is healthy and reading all companies from the main DB by `company_id`. superiqfoam data is fully present. Manufacturing and Wholesalers have ONLY seeded stock in the main DB and NO invoices/payments/customers/etc.; their historical records are not in the main production DB. If that history exists, it is in the old separate per-company databases, which the production Mongo user is not authorized to read (and which were likely never migrated to production). Those records need to be migrated into the main DB tagged with the correct `company_id` before they will appear.
+---
 
-## Suggested actions (NOT performed)
-1. USER / change_mongo_data: Recover the Manufacturing & Wholesalers history from the separate `..__iqfoam-manufactoring` / `..__iqfoam-whole-sallers` databases (on the preview/source cluster) and migrate it into the main `iqfoam-business-test_database`, stamping each document with `company_id`. Do this BEFORE relying on prod, since nothing currently reads those separate DBs.
-2. CODE (E1): The consolidation is best done by a one-time migration script that reads the per-company DBs and upserts into the main collections with `company_id`. Needed because the running code no longer reads the separate DBs.
-3. Authorization: the prod Mongo user lacks privileges on the suffixed DBs (Atlas/platform-managed). A direct prod-to-prod copy from them is blocked; migrate from the source/preview cluster instead.
+## (2) `invoices` collection audit — per ACCESSIBLE DB
+
+### iqfoam-business-test_database (ACCESSIBLE)
+- invoices total: **69**
+- company_id = 'iqfoam-whole-sallers': **0**
+- company_id missing or null: **0** (filter {company_id: null} matched 0; no documents lack the field)
+- breakdown by company_id: distinct(company_id) = **['superiqfoam']** → superiqfoam: 69 (100%); all other companies: 0 in this DB
+- date fields present: both **`created_at`** (ISO datetime) and **`date`** (YYYY-MM-DD string)
+  - created_at min: 2026-10-31T18:28:21Z ; max: 2026-11-16T14:02:40Z
+  - date min: 2026-10-31 ; max: 2026-11-16
+
+Interpretation (not verified): the main DB holds only superiqfoam's invoices. Any iqfoam-whole-sallers invoices would live in the separate `..__iqfoam-whole-sallers` DB, which is NOT accessible to this audit.
+
+### iqfoam-business-test_database__iqfoam-whole-sallers (INACCESSIBLE)
+- invoices total / wholesale count / null count / breakdown / date range: **NOT VERIFIED**
+
+### iqfoam-business-test_database__iqfoam-manufactoring (INACCESSIBLE)
+- all metrics: **NOT VERIFIED**
+
+### iqfoam-business-test_database__imraan-plastics (INACCESSIBLE)
+- all metrics: **NOT VERIFIED**
+
+---
+
+## (3) Platform snapshots / backups / checkpoints
+
+No backup/snapshot/checkpoint listing capability is exposed to this agent's tools. Therefore:
+- Visible snapshots: **NONE VISIBLE / NOT VERIFIED** (absence of a listing tool, not proof none exist).
+- Per-snapshot invoice counts (total/wholesale) and date ranges: **NOT VERIFIED**.
+(Atlas backups, if any, must be checked in the MongoDB Atlas console by the account owner.)
+
+---
+
+## (4) Production logs — POST /api/invoices success while active company = iqfoam-whole-sallers
+
+Window: last 1440 min (24h) of the active run's pods — the maximum log retention available; this run's pods started ~2026-11-16T14:22Z, so the window effectively covers ~14:22Z→now only.
+
+Findings (filter "invoices" on active run logs):
+- POST /api/invoices observed: **4 occurrences, ALL HTTP 400 Bad Request**.
+- POST /api/invoices with 200/201: **0** in the retained window.
+- GET /api/invoices (list reads): 200 OK (multiple).
+
+Company attribution: the access logs do **not** carry the active-company context, so no POST can be tied to `iqfoam-whole-sallers` (or any company) from logs alone. Combined with the zero successful creates in-window, there is **no evidence of a successful invoice creation under iqfoam-whole-sallers**, and anything older than the ~24h retention is **NOT VERIFIED**.
+
+---
+
+## Current live status
+
+- The deployed URL returns **HTTP 200 (healthy)**. The **previous good version is still serving** — active_run_id = 09a403a9 (success, 2026-11-16T14:29:04Z).
+- The most recent deploy attempts all FAILED and were never promoted (no traffic switch):
+  - run 4de047d5 (rollback, 15:42Z) — FAILED: backend startup crash, `pymongo OperationFailure IndexKeySpecsConflict` (code 86) creating index **`invoice_share_once`** on `invoice_share_links`: requested `{invoice_id:1} unique name "invoice_share_once"` conflicts with existing `{company_id:1, invoice_id:1} unique name "invoice_share_once"`. Also a secondary warning: index `zone_1_category_1_size_1` on `prices` failed to build with E11000 duplicate key (zone/category/size dup, e.g. "Ribbon Black"/"1070x100").
+  - run 8c4f9a57 (rollback, 15:37Z) — FAILED: frontend unhealthy at / status 503.
+  - run 6b191d00 (redeploy, 13:50Z) — FAILED health_check: frontend 503.
+  - run 4efd4a1f (redeploy, 13:26Z) — FAILED: backend startup crash, `not authorized on ..__imraan-plastics` (code 13) during per-company init.
+- Net: the index conflict crash is confined to the FAILED runs; the live version is unaffected and up.
+
+---
+
+## Root cause of the failed deploys (for reference; NOT fixed per read-only scope)
+
+The startup routine `initialize_multi_company` (backend/server.py ~line 17738) calls `base_db.invoice_share_links.create_index(..., name="invoice_share_once")` requesting key `{invoice_id:1}`, but an index already exists on `{company_id:1, invoice_id:1}` under that same name. MongoDB rejects same-name/different-spec (code 86). Because this runs in the FastAPI lifespan startup and raises, the backend exits → CrashLoopBackOff → deploy never becomes ready. A separate startup path also assumes auth on every per-company DB (`..__imraan-plastics` returned Unauthorized, code 13) which crashed an earlier attempt.
+
+These are application/startup-code issues (and a DB index/privilege state issue), not a platform/manifest fault.
