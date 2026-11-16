@@ -18145,7 +18145,10 @@ async def on_startup():
         await seed()
     finally:
         active_company_id.reset(startup_company)
-    await initialize_multi_company()
+    try:
+        await initialize_multi_company()
+    except OperationFailure as error:
+        logging.warning("Multi-company initialization incomplete (index or setup conflict): %s", error)
     try:
         await migrate_legacy_company_databases()
     except Exception:

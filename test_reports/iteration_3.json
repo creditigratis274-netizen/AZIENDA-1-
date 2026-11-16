@@ -1,0 +1,26 @@
+{
+  "summary": "Backend only. Simulated production index states for invoice_share_links.invoice_share_once on a throwaway DB tmp_prod_idx_sim, then dropped it (confirmed it is gone). In all 5 scenarios create_company_unique_index raised no exception: (1) prod {company_id,invoice_id} unique -> left as is; (2) legacy unique {invoice_id} -> dropped and replaced with unique {company_id,invoice_id}, and the same invoice_id under a different company could then be inserted; (2b) legacy NON-unique {invoice_id} plus duplicate docs -> code 86 caught and a warning logged, legacy index kept; (3) and (3b) {token_hash} non-unique and unique with the same name -> code 86 caught, warning logged, index unchanged. grep: no raw .create_index( for invoice_share_once; only the create_company_unique_index calls at lines 17823 and 18091. on_startup wraps migrate_legacy_company_databases (Exception), initialize_workflow_indexes (OperationFailure) and create_startup_feed_indexes (OperationFailure). ensure_performance_indexes is not called in on_startup itself; it is wrapped in try/except OperationFailure inside initialize_multi_company (line 17838). After the backend restart it is RUNNING and the last log line is 'Application startup complete.'",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "startup/_create_company_unique_index", "issue": "A legacy NON-unique index with the name invoice_share_once is skipped by the migration loop (it only looks at unique indexes), so the company-scoped unique index is never created. Startup still succeeds and a warning is logged, but uniqueness is not enforced. Same if another index already holds the name."},
+      {"endpoint": "startup/initialize_multi_company", "issue": "on_startup calls initialize_multi_company without try/except. It still contains raw create_index calls that can conflict, e.g. product_identifications {company_id,stock_id} unique, companies.id unique, users/user_sessions indexes, and the per-collection company_id loop. Any OperationFailure there would still crash startup."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": ["/app/backend/tests/sim_invoice_share_index.py"],
+  "action_items": [
+    "Optional hardening: wrap the raw create_index calls in initialize_multi_company (or the whole call in on_startup) in try/except OperationFailure, so that no index conflict can block startup.",
+    "Optional: in _create_company_unique_index, also drop a same-named index whose keys differ (unique or not) before creating the company-scoped one, after checking the data has no duplicates."
+  ],
+  "critical_code_review_comments": [
+    "create_company_unique_index catches only OperationFailure. That is fine for IndexKeySpecsConflict (86) and IndexOptionsConflict (85).",
+    "initialize_workflow_indexes and create_startup_feed_indexes catch only OperationFailure. Network or timeout errors (e.g. AutoReconnect, ServerSelectionTimeoutError) would still propagate. That is acceptable, since the DB is required anyway."
+  ],
+  "updated_files": ["/app/backend/tests/sim_invoice_share_index.py"],
+  "success_rate": {"backend": "100%", "frontend": "N/A"},
+  "seed_data_creation": "Only in tmp_prod_idx_sim, which was dropped at the end. test_database was not touched by the tests.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Rerun the simulation with: cd /app/backend && python3 tests/sim_invoice_share_index.py (it uses tmp_prod_idx_sim and drops it itself)."
+}
