@@ -23,11 +23,30 @@ const blankWeek = () => ({
   ...Object.fromEntries(MONTHLY_SHEET_BLOCKS.map(({ key }) => [key, { quantity: "", weight_kg: "" }])),
 });
 
+const blankProductionDay = (date, weekIndex) => ({
+  date,
+  week_index: weekIndex,
+  ...blankWeek(),
+});
+
 export function monthlyWeekCount(month) {
   const [year, monthNumber] = month.split("-").map(Number);
   const daysInMonth = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
   const mondayOffset = (new Date(Date.UTC(year, monthNumber - 1, 1)).getUTCDay() + 6) % 7;
   return Math.ceil((mondayOffset + daysInMonth) / 7);
+}
+
+export function monthlyProductionDays(month) {
+  const [year, monthNumber] = month.split("-").map(Number);
+  const daysInMonth = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
+  const mondayOffset = (new Date(Date.UTC(year, monthNumber - 1, 1)).getUTCDay() + 6) % 7;
+  return Array.from({ length: daysInMonth }, (_, index) => {
+    const day = index + 1;
+    return blankProductionDay(
+      `${month}-${String(day).padStart(2, "0")}`,
+      Math.floor((mondayOffset + index) / 7),
+    );
+  });
 }
 
 export function createBlankMonthlySheet(month, formulaRates = {}) {
@@ -41,6 +60,7 @@ export function createBlankMonthlySheet(month, formulaRates = {}) {
       { ...blankChemicalValues(), ...(formulaRates[key] || {}) },
     ])),
     weeks: Array.from({ length: monthlyWeekCount(month) }, blankWeek),
+    production_days: monthlyProductionDays(month),
   };
 }
 
@@ -50,9 +70,35 @@ function numericValue(value) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
 
-function emptyContainerCount(used, total, capacity, count) {
-  if (total - used <= 1e-8) return count;
-  return Math.min(count, Math.floor((used + 1e-8) / capacity));
+function hasProductionEntry(row) {
+  return MONTHLY_SHEET_BLOCKS.some(({ key }) =>
+    row[key]?.quantity !== "" && row[key]?.quantity != null
+      || row[key]?.weight_kg !== "" && row[key]?.weight_kg != null);
+}
+
+function productionTotalsByWeek(sheet) {
+  const days = sheet.production_days || [];
+  const [, monthNumber] = sheet.month.split("-").map(Number);
+  const mondayOffset = (new Date(Date.UTC(
+    Number(sheet.month.slice(0, 4)), monthNumber - 1, 1,
+  )).getUTCDay() + 6) % 7;
+  const weekIndexOf = (day) => day.week_index ?? Math.floor(
+    (mondayOffset + Number(day.date.slice(-2)) - 1) / 7,
+  );
+  return Array.from({ length: monthlyWeekCount(sheet.month) }, (_, weekIndex) => {
+    const weekDays = days.filter((day) => weekIndexOf(day) === weekIndex);
+    const dailyEntriesExist = weekDays.some(hasProductionEntry);
+    const dayRows = dailyEntriesExist
+      ? weekDays
+      : (sheet.weeks || [])[weekIndex] ? [(sheet.weeks || [])[weekIndex]] : [];
+    return MONTHLY_SHEET_BLOCKS.reduce((weekTotal, { key }) => ({
+      ...weekTotal,
+      [key]: dayRows.reduce((blockTotal, row) => ({
+        quantity: blockTotal.quantity + (numericValue(row[key]?.quantity) || 0),
+        weight_kg: blockTotal.weight_kg + (numericValue(row[key]?.weight_kg) || 0),
+      }), { quantity: 0, weight_kg: 0 }),
+    }), {});
+  });
 }
 
 export function calculateMonthlySheet(sheet) {
@@ -62,11 +108,12 @@ export function calculateMonthlySheet(sheet) {
       .filter((line) => line.chemical_key === key)
       .reduce((lineTotal, line) => lineTotal + (numericValue(line.quantity_kg) || 0), 0), 0),
   ]));
+  const productionByWeek = productionTotalsByWeek(sheet);
   const blockTotals = Object.fromEntries(MONTHLY_SHEET_BLOCKS.map(({ key }) => [
     key,
-    (sheet.weeks || []).reduce((total, week) => ({
-      quantity: total.quantity + (numericValue(week[key]?.quantity) || 0),
-      weight_kg: total.weight_kg + (numericValue(week[key]?.weight_kg) || 0),
+    productionByWeek.reduce((total, week) => ({
+      quantity: total.quantity + week[key].quantity,
+      weight_kg: total.weight_kg + week[key].weight_kg,
     }), { quantity: 0, weight_kg: 0 }),
   ]));
   const totalBlocks = Object.values(blockTotals).reduce((total, item) => total + item.quantity, 0);
@@ -100,8 +147,24 @@ export function calculateMonthlySheet(sheet) {
       missingRates,
       status: remaining == null
         ? arrival == null ? "missing-arrival" : "missing-formula"
-        : minimum == null ? "set-minimum" : remaining < minimum ? "reorder" : "ok",
+        : remaining <= 0 ? "finished"
+          : minimum == null ? "set-minimum"
+            : remaining <= minimum ? "reorder" : "ok",
     }];
+  }));
+  const chemicalUsageByBlock = Object.fromEntries(MONTHLY_SHEET_CHEMICALS.map(({ key: chemicalKey }) => {
+    return [chemicalKey, MONTHLY_SHEET_BLOCKS.map(({ key: blockKey, label }) => {
+      const quantity = blockTotals[blockKey].quantity;
+      const formulaRate = numericValue(sheet.formula_rates?.[blockKey]?.[chemicalKey]);
+      return {
+        block_key: blockKey,
+        block_label: label,
+        blocks_produced: quantity,
+        formula_rate_kg_per_block: formulaRate,
+        used_kg: quantity > 0 && formulaRate == null ? null : quantity * (formulaRate || 0),
+        formula_missing: quantity > 0 && formulaRate == null,
+      };
+    })];
   }));
   const containerTracking = MONTHLY_SHEET_CHEMICALS.map(({ key: chemicalKey, label }) => {
     const balance = chemicalBalances[chemicalKey];
@@ -121,63 +184,43 @@ export function calculateMonthlySheet(sheet) {
       .sort((left, right) => left.received_date.localeCompare(right.received_date)
         || left.grv_number.localeCompare(right.grv_number)
         || left.line_index - right.line_index)
-      .map((line) => ({
-        ...line,
-        container_capacity: numericValue(line.container_capacity),
-        container_count: numericValue(line.container_count),
-        total_quantity_kg: numericValue(line.quantity_kg)
-          ?? numericValue(line.container_capacity) * numericValue(line.container_count),
-        estimated_used_kg: 0,
-        depletion_week: null,
-      }));
-    let activeContainers = [];
-    let nextReceiptIndex = 0;
+      .map((line) => {
+        const containerCapacity = numericValue(line.container_capacity);
+        const containerCount = numericValue(line.container_count);
+        const statedContainerQuantity = containerCapacity * containerCount;
+        const totalQuantity = numericValue(line.quantity_kg) ?? statedContainerQuantity;
+        return {
+          ...line,
+          container_capacity: containerCapacity,
+          container_count: containerCount,
+          total_quantity_kg: totalQuantity,
+          container_data_consistent: Math.abs(totalQuantity - statedContainerQuantity) <= 0.0001,
+          actually_used_kg: 0,
+          usage_by_block: Object.fromEntries(MONTHLY_SHEET_BLOCKS.map(({ key }) => [key, 0])),
+          depletion_week: null,
+        };
+      });
     let untrackedConsumption = 0;
-    const missingRates = new Set(balance.missingRates);
+    const missingRates = new Set(MONTHLY_SHEET_BLOCKS
+      .filter(({ label: blockLabel }) => balance.missingRates.includes(blockLabel))
+      .map(({ key: blockKey }) => blockKey));
 
-    (sheet.weeks || []).forEach((week, weekIndex) => {
-      const monthStart = new Date(`${sheet.month}-01T00:00:00Z`);
-      const weekStart = new Date(monthStart);
-      weekStart.setUTCDate(weekStart.getUTCDate() - ((weekStart.getUTCDay() + 6) % 7) + weekIndex * 7);
-      const weekEnd = new Date(weekStart);
-      weekEnd.setUTCDate(weekEnd.getUTCDate() + 6);
-      const weekEndDate = weekEnd.toISOString().slice(0, 10);
-      while (nextReceiptIndex < containers.length
-        && containers[nextReceiptIndex].received_date <= weekEndDate) {
-        activeContainers.push(containers[nextReceiptIndex]);
-        nextReceiptIndex += 1;
-      }
-
-      let weeklyConsumption = 0;
+    if (!missingRates.size) {
       MONTHLY_SHEET_BLOCKS.forEach(({ key: blockKey }) => {
-        const quantity = numericValue(week[blockKey]?.quantity) || 0;
-        const rate = numericValue(sheet.formula_rates?.[blockKey]?.[chemicalKey]);
-        if (quantity > 0 && rate == null) missingRates.add(blockKey);
-        else weeklyConsumption += quantity * (rate || 0);
+        const usage = chemicalUsageByBlock[chemicalKey]
+          .find((item) => item.block_key === blockKey);
+        let remainingConsumption = usage.used_kg || 0;
+        containers.forEach((container) => {
+          if (remainingConsumption <= 0) return;
+          const remainingInLot = Math.max(0, container.total_quantity_kg - container.actually_used_kg);
+          const allocated = Math.min(remainingConsumption, remainingInLot);
+          container.actually_used_kg += allocated;
+          container.usage_by_block[blockKey] += allocated;
+          remainingConsumption -= allocated;
+        });
+        untrackedConsumption += remainingConsumption;
       });
-      if (missingRates.size) return;
-
-      let remainingConsumption = weeklyConsumption;
-      activeContainers.forEach((container) => {
-        if (remainingConsumption <= 0) return;
-        const containerTotal = container.total_quantity_kg;
-        const remainingInLot = Math.max(0, containerTotal - container.estimated_used_kg);
-        const usedBefore = container.estimated_used_kg;
-        const allocated = Math.min(remainingConsumption, remainingInLot);
-        container.estimated_used_kg += allocated;
-        remainingConsumption -= allocated;
-        const emptyBefore = emptyContainerCount(
-          usedBefore, containerTotal, container.container_capacity, container.container_count,
-        );
-        const emptyAfter = emptyContainerCount(
-          container.estimated_used_kg, containerTotal, container.container_capacity, container.container_count,
-        );
-        if (emptyAfter > emptyBefore && container.depletion_week == null) {
-          container.depletion_week = weekIndex + 1;
-        }
-      });
-      untrackedConsumption += remainingConsumption;
-    });
+    }
 
     const missingRateLabels = MONTHLY_SHEET_BLOCKS
       .filter(({ key: blockKey }) => missingRates.has(blockKey))
@@ -185,33 +228,120 @@ export function calculateMonthlySheet(sheet) {
     return {
       chemical_key: chemicalKey,
       chemical_label: label,
+      usage_by_block: chemicalUsageByBlock[chemicalKey],
       containers: containers.map((container) => {
         const total = container.total_quantity_kg;
-        const remaining = Math.max(0, total - container.estimated_used_kg);
+        const remaining = Math.max(0, total - container.actually_used_kg);
         return {
           ...container,
           remaining_quantity_kg: remaining,
-          empty_container_count: emptyContainerCount(
-            container.estimated_used_kg, total, container.container_capacity, container.container_count,
-          ),
-          containers_with_stock: remaining > 1e-8
-            ? Math.min(container.container_count, Math.ceil((remaining - 1e-8) / container.container_capacity))
-            : 0,
+          empty_container_count: container.container_data_consistent
+            ? Math.min(
+              container.container_count,
+              Math.floor((container.actually_used_kg + 1e-8) / container.container_capacity),
+            )
+            : null,
+          containers_with_stock: container.container_data_consistent
+            ? (remaining > 1e-8
+              ? Math.min(container.container_count, Math.ceil((remaining - 1e-8) / container.container_capacity))
+              : 0)
+            : null,
           status: missingRateLabels.length
             ? "missing-formula"
-            : remaining <= 1e-8 ? "empty"
-              : container.estimated_used_kg > 1e-8 ? "in-use" : "full",
+            : !container.container_data_consistent ? "container-data-mismatch"
+              : remaining <= 1e-8 ? "empty"
+                : container.actually_used_kg > 1e-8 ? "in-use" : "full",
         };
       }),
       missing_rates: missingRateLabels,
       untracked_consumption_kg: missingRateLabels.length ? null : untrackedConsumption,
       tracked_quantity_kg: containers.reduce((sum, container) => sum + container.total_quantity_kg, 0),
       tracked_remaining_kg: containers.reduce((sum, container) =>
-        sum + Math.max(0, container.total_quantity_kg - container.estimated_used_kg), 0),
+        sum + Math.max(0, container.total_quantity_kg - container.actually_used_kg), 0),
     };
   });
   return {
-    blockTotals, totalBlocks, totalBlockWeight, totalArrivals, chemicalBalances, containerTracking,
+    blockTotals, productionByWeek, totalBlocks, totalBlockWeight, totalArrivals, chemicalBalances, containerTracking,
+  };
+}
+
+export function calculateDailyProductionReport(sheet, reportDate) {
+  if (!reportDate || !reportDate.startsWith(`${sheet.month}-`)) return null;
+  const day = sheet.production_days.find((item) => item.date === reportDate);
+  if (!day) return null;
+
+  const blocks = MONTHLY_SHEET_BLOCKS.map(({ key, label }) => ({
+    key,
+    label,
+    quantity: numericValue(day[key]?.quantity) || 0,
+    weight_kg: numericValue(day[key]?.weight_kg) || 0,
+  }));
+  const totalBlocks = blocks.reduce((total, block) => total + block.quantity, 0);
+  const totalWeightKg = blocks.reduce((total, block) => total + block.weight_kg, 0);
+  const chemicalUsage = MONTHLY_SHEET_CHEMICALS.map(({ key, label }) => {
+    const byBlock = blocks.map((block) => {
+      const formulaRate = numericValue(sheet.formula_rates?.[block.key]?.[key]);
+      return {
+        block_key: block.key,
+        block_label: block.label,
+        quantity: block.quantity,
+        used_kg: block.quantity > 0 && formulaRate == null
+          ? null
+          : block.quantity * (formulaRate || 0),
+        formula_missing: block.quantity > 0 && formulaRate == null,
+      };
+    });
+    const missingRates = byBlock.filter((item) => item.formula_missing)
+      .map((item) => item.block_label);
+    return {
+      key,
+      label,
+      byBlock,
+      used_today_kg: missingRates.length
+        ? null
+        : byBlock.reduce((total, item) => total + item.used_kg, 0),
+      missingRates,
+    };
+  });
+
+  const throughDate = {
+    ...sheet,
+    arrival_sources: (sheet.arrival_sources || []).filter((source) =>
+      source.received_date && source.received_date <= reportDate),
+    production_days: sheet.production_days.filter((item) => item.date <= reportDate),
+    weeks: sheet.weeks.map(() => blankWeek()),
+  };
+  const cumulative = calculateMonthlySheet(throughDate);
+  const balances = MONTHLY_SHEET_CHEMICALS.map(({ key, label }) => {
+    const balance = cumulative.chemicalBalances[key];
+    const tracking = cumulative.containerTracking.find((item) => item.chemical_key === key);
+    const containerCountIsReliable = !tracking.missing_rates.length
+      && tracking.containers.every((container) => container.container_data_consistent);
+    return {
+      key,
+      label,
+      used_today_kg: chemicalUsage.find((item) => item.key === key).used_today_kg,
+      remaining_kg: balance.remaining,
+      barrels_remaining: containerCountIsReliable
+        ? tracking.containers.reduce((total, container) =>
+          total + (container.containers_with_stock || 0), 0)
+        : null,
+      tracked_remaining_kg: tracking.missing_rates.length ? null : tracking.tracked_remaining_kg,
+      missingRates: balance.missingRates,
+      hasContainerMismatch: tracking.containers.some((container) =>
+        !container.container_data_consistent),
+    };
+  });
+
+  return {
+    date: reportDate,
+    blocks,
+    totalBlocks,
+    totalWeightKg,
+    chemicalUsage,
+    balances,
+    undatedArrivalCount: (sheet.arrival_sources || []).filter((source) =>
+      !source.received_date).length,
   };
 }
 
@@ -241,5 +371,15 @@ export function monthlySheetPayload(sheet) {
         weight_kg: numberOrNull(week[key].weight_kg),
       },
     ]))),
+    production_days: (sheet.production_days || []).map((day) => ({
+      date: day.date,
+      ...Object.fromEntries(MONTHLY_SHEET_BLOCKS.map(({ key }) => [
+        key,
+        {
+          quantity: numberOrNull(day[key].quantity),
+          weight_kg: numberOrNull(day[key].weight_kg),
+        },
+      ])),
+    })),
   };
 }

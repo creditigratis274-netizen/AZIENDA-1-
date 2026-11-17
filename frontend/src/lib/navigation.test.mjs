@@ -37,8 +37,10 @@ test("SuperIQFoam replaces the two chemical menu links with the monthly sheet", 
   assert.ok(!superIqSections.includes("chemicals-quantity"));
   assert.ok(!superIqSections.includes("chemical-usage-log"));
 
-  const manufacturingSections = navigationLinksForCompany("iqfoam-manufactoring")
-    .map((link) => link.section);
-  assert.ok(manufacturingSections.includes("warehouse-chemical"));
-  assert.ok(manufacturingSections.includes("warehouse-chemical-inventory"));
+  const manufacturingLinks = navigationLinksForCompany("iqfoam-manufactoring");
+  assert.ok(manufacturingLinks.some((link) =>
+    link.path === "/warehouses/production-chemical-balance"
+      && link.label === "Production Management & Chemical Balance"));
+  assert.ok(!manufacturingLinks.some((link) =>
+    ["warehouse-chemical", "warehouse-chemical-inventory"].includes(link.section)));
 });

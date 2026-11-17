@@ -32,6 +32,7 @@ export default function Attendance() {
   const { user } = useAuth();
   const isSuperIqFoam = user?.company_id === "superiqfoam";
   const isIqfoamWholesaler = user?.company_id === "iqfoam-whole-sallers";
+  const isImraanPlastics = user?.company_id === "imraan-plastics";
   const canManageDepartments = user?.is_owner || user?.is_company_owner || user?.is_admin || user?.role === "admin"
     || user?.company_roles?.[user?.company_id] === "admin";
   const [employees, setEmployees] = useState([]);
@@ -74,7 +75,7 @@ export default function Attendance() {
   };
   useEffect(() => { load(); }, [date, user?.company_id]);
   useEffect(() => {
-    if (!isIqfoamWholesaler) {
+    if (!isIqfoamWholesaler && !isImraanPlastics) {
       setCompanyDepartments([]);
       return undefined;
     }
@@ -87,7 +88,7 @@ export default function Attendance() {
         if (activeRequest) toast.error(`Could not load departments: ${apiError(error)}`);
       });
     return () => { activeRequest = false; };
-  }, [isIqfoamWholesaler]);
+  }, [isIqfoamWholesaler, isImraanPlastics]);
   useEffect(() => {
     let activeRequest = true;
     setPieceLoading(true);
@@ -99,6 +100,11 @@ export default function Attendance() {
   }, [date]);
 
   const active = employees.filter((e) => e.active !== false);
+  const employeeDepartmentOptions = isIqfoamWholesaler || isImraanPlastics
+    ? companyDepartments
+    : DEPTS;
+  const hasLegacyEmployeeDepartment = empModal?.department
+    && !employeeDepartmentOptions.includes(empModal.department);
   const statusOf = (eid) => {
     const status = records.find((record) => record.employee_id === eid && record.date === date)?.status;
     if (!isSuperIqFoam) return status;
@@ -278,10 +284,13 @@ export default function Attendance() {
   };
   const saveEmp = async () => {
     if (!empModal.name.trim()) return toast.error("Name required");
-    if (isIqfoamWholesaler) {
-      const validDepartment = !empModal.department || companyDepartments.includes(empModal.department);
+    if (isIqfoamWholesaler || isImraanPlastics) {
+      const currentEmployeeDepartment = empModal.id && employees.find(({ id }) => id === empModal.id)?.department;
+      const validDepartment = !empModal.department
+        || companyDepartments.includes(empModal.department)
+        || (isImraanPlastics && empModal.department === currentEmployeeDepartment);
       if (!validDepartment || (!empModal.is_general_worker && !empModal.department)) {
-        return toast.error(empModal.is_general_worker
+        return toast.error(isIqfoamWholesaler && empModal.is_general_worker
           ? "Select a department from this company or leave it blank."
           : "Select or create a department for this worker.");
       }
@@ -683,7 +692,7 @@ export default function Attendance() {
             />
             General worker
           </label>}
-          {isIqfoamWholesaler && <>
+          {isImraanPlastics && <>
             <label className="flex items-center gap-2 text-sm text-slate-700">
               <input
                 type="checkbox"
@@ -722,10 +731,12 @@ export default function Attendance() {
           >
             <option value="">{empModal.is_general_worker ? "No department (optional)" : "Select a department"}</option>
             {isIqfoamWholesaler && <option value="__general_worker__">General Worker</option>}
-            {empModal.department && !(isIqfoamWholesaler ? companyDepartments : DEPTS).includes(empModal.department) && <option value={empModal.department}>{empModal.department} (legacy)</option>}
-            {(isIqfoamWholesaler ? companyDepartments : DEPTS).map((department) => <option key={department} value={department}>{department}</option>)}
+            {hasLegacyEmployeeDepartment && <option value={empModal.department}>
+              {isImraanPlastics ? empModal.department : `${empModal.department} (legacy)`}
+            </option>}
+            {employeeDepartmentOptions.map((department) => <option key={department} value={department}>{department}</option>)}
           </Select>
-          {isIqfoamWholesaler && canManageDepartments && <div className="flex items-end gap-2">
+          {(isIqfoamWholesaler || isImraanPlastics) && canManageDepartments && <div className="flex items-end gap-2">
             <Input
               label="Create department"
               value={newDepartmentName}

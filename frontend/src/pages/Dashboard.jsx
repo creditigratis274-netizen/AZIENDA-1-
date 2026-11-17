@@ -31,12 +31,10 @@ const WORKER_SECTION_OPTIONS = [
   ["orders", "Orders"], ["intercompany", "Intercompany"],
   ["stock", "Stock"],   ["company-inventory", "Company Inventory"],
   ["production", "Production", ["superiqfoam"]],
-  ["superiqfoam-monthly-sheet", "Monthly Production & Chemical Balance", ["superiqfoam"]],
+  ["superiqfoam-monthly-sheet", "Production Management & Chemical Balance", ["superiqfoam"]],
   ["warehouse-a", "Warehouse A", [MANUFACTURING_COMPANY_ID]],
   ["warehouse-b", "Warehouse B", [MANUFACTURING_COMPANY_ID]],
   ["warehouse-c", "Warehouse C", [MANUFACTURING_COMPANY_ID]],
-  ["warehouse-chemical", "Chemical", [MANUFACTURING_COMPANY_ID]],
-  ["warehouse-chemical-inventory", "Chemical Inventory", [MANUFACTURING_COMPANY_ID]],
   ["attendance", "Attendance"], ["deliveries", "Deliveries"],
   ["fleet", "Fleet"], ["expenses", "Expenses"], ["costs", "Costs report"],
   ["grv", "GRV"], ["daily-report", "Daily Report"],
@@ -68,8 +66,6 @@ const WORKER_SECTION_OPERATIONS = {
   "warehouse-a": [["create", "Create report"], ["update", "Edit report"], ["delete", "Delete report"]],
   "warehouse-b": [["create", "Create report"], ["update", "Edit report"], ["delete", "Delete report"]],
   "warehouse-c": [["create", "Create report"], ["update", "Edit report"], ["delete", "Delete report"]],
-  "warehouse-chemical": [["create", "Record usage"], ["update", "Edit usage"], ["delete", "Delete usage record"]],
-  "warehouse-chemical-inventory": [["create", "Record quantity"], ["update", "Update quantity"], ["delete", "Delete quantity record"]],
   attendance: [["create", "Record attendance"], ["update", "Edit attendance"], ["delete", "Delete attendance record"]],
   deliveries: [["create", "Schedule delivery"], ["update", "Edit delivery"], ["delete", "Delete delivery"]],
   fleet: [["create", "Add fleet record"], ["update", "Edit fleet record"], ["delete", "Delete fleet record"]],
@@ -451,9 +447,6 @@ export default function Dashboard() {
       workerWarehouseIds.forEach((id) => expandedSections.add(`warehouse-${id.toLowerCase()}`));
       if (worker.company_id === "superiqfoam") {
         expandedSections.add("superiqfoam-monthly-sheet");
-      } else {
-        expandedSections.add("warehouse-chemical");
-        expandedSections.add("warehouse-chemical-inventory");
       }
     }
     const expandedSectionList = [...expandedSections].filter((section) => WORKER_SECTION_OPTIONS

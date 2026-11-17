@@ -57,6 +57,33 @@ def test_monthly_chemical_sheet_requires_number_of_weeks_in_selected_month(week_
         ))
 
 
+def test_monthly_chemical_sheet_accepts_daily_production_for_selected_month():
+    day = {
+        "date": "2026-11-16",
+        "big_block": {"quantity": 1, "weight_kg": 500},
+    }
+
+    sheet = server.MonthlyChemicalSheetIn(**valid_monthly_sheet(production_days=[day]))
+
+    assert sheet.production_days[0].date == "2026-11-16"
+    assert sheet.production_days[0].big_block.quantity == 1
+    assert sheet.production_days[0].small_block.quantity is None
+
+
+def test_monthly_chemical_sheet_rejects_duplicate_or_out_of_month_production_days():
+    day = {"date": "2026-11-16"}
+    with pytest.raises(ValueError, match="only be saved once"):
+        server.MonthlyChemicalSheetIn(**valid_monthly_sheet(production_days=[day, day]))
+
+    with pytest.raises(ValueError, match="belong to the selected month"):
+        server.MonthlyChemicalSheetIn(**valid_monthly_sheet(
+            production_days=[{"date": "2026-10-31"}],
+        ))
+
+    with pytest.raises(ValueError, match="valid ISO date"):
+        server.MonthlySheetProductionDayIn(date="2026-11-31")
+
+
 def test_monthly_chemical_sheet_rejects_duplicate_grvs_and_duplicate_line_mappings():
     source = {"grv_id": "grv-1", "lines": [{"line_index": 0, "chemical_key": "ppg"}]}
     with pytest.raises(ValueError, match="monthly sheet once"):
@@ -202,30 +229,47 @@ def test_monthly_chemical_sheet_rejects_negative_values_and_unknown_fields():
         server.MonthlyChemicalSheetIn(**valid_monthly_sheet(arrivals=arrivals))
 
 
-def test_monthly_chemical_sheet_is_limited_to_superiqfoam_and_authorized_workers():
-    server.require_superiqfoam_monthly_sheet_access({"_active_company_id": "superiqfoam"})
+def test_monthly_chemical_sheet_is_company_scoped_and_authorized_workers():
+    server.require_monthly_chemical_sheet_access({"_active_company_id": "superiqfoam"})
+    server.require_monthly_chemical_sheet_access({"_active_company_id": "iqfoam-manufactoring"})
     with pytest.raises(HTTPException) as wrong_company:
-        server.require_superiqfoam_monthly_sheet_access({"_active_company_id": "iqfoam-manufactoring"})
+        server.require_monthly_chemical_sheet_access({"_active_company_id": "imraan-plastics"})
     assert wrong_company.value.status_code == 403
 
     with pytest.raises(HTTPException) as denied_worker:
-        server.require_superiqfoam_monthly_sheet_access({
-            "_active_company_id": "superiqfoam",
+        server.require_monthly_chemical_sheet_access({
+            "_active_company_id": "iqfoam-manufactoring",
             "is_worker": True,
             "worker_allowed_sections": ["production"],
         })
     assert denied_worker.value.status_code == 403
 
-    server.require_superiqfoam_monthly_sheet_access({
+    server.require_monthly_chemical_sheet_access({
         "_active_company_id": "superiqfoam",
         "is_worker": True,
         "worker_allowed_sections": ["superiqfoam-monthly-sheet"],
     })
-    server.require_superiqfoam_monthly_sheet_access({
+    server.require_monthly_chemical_sheet_access({
         "_active_company_id": "superiqfoam",
         "is_worker": True,
         "worker_allowed_sections": ["chemical-usage-log"],
     })
+    manufacturing_worker = {
+        "_active_company_id": "iqfoam-manufactoring",
+        "is_worker": True,
+        "worker_allowed_sections": ["warehouse-a"],
+    }
+    server.require_monthly_chemical_sheet_access(manufacturing_worker)
+    assert server.worker_section_for_request(
+        "warehouses/production-chemical-balance", manufacturing_worker,
+    ) == "warehouse-a"
+
+
+def test_monthly_chemical_sheet_ids_are_separate_by_company():
+    assert server.monthly_chemical_sheet_id("superiqfoam", "2026-11") == "monthly-chemical-sheet:2026-11"
+    assert server.monthly_chemical_sheet_id(
+        "iqfoam-manufactoring", "2026-11",
+    ) == "monthly-chemical-sheet:iqfoam-manufactoring:2026-11"
 
 
 def test_monthly_sheet_is_a_distinct_superiqfoam_navigation_section():
@@ -270,3 +314,29 @@ def test_monthly_sheet_custom_link_is_only_available_to_superiqfoam():
             company_id=server.MANUFACTURING_COMPANY_ID,
         )
     assert invalid.value.status_code == 422
+
+
+def test_manufacturing_monthly_sheet_custom_link_uses_warehouse_a_access():
+    section = {
+        "id": "production-chemical-balance",
+        "label": "Production Management & Chemical Balance",
+        "path": "/warehouses/production-chemical-balance",
+    }
+    config = server.normalize_interface_config(
+        {"custom_sections": [section]},
+        company_id=server.MANUFACTURING_COMPANY_ID,
+    )
+    assert config["custom_sections"][0]["access_section"] == "warehouse-a"
+    assert "warehouse-chemical" not in server.INTERFACE_NAV_GROUPS["warehouses"]
+    assert "warehouse-chemical-inventory" not in server.INTERFACE_NAV_GROUPS["warehouses"]
+    migrated = server.normalize_interface_config({
+        "section_order": {
+            "warehouses": [
+                "warehouse-a", "warehouse-chemical", "warehouse-chemical-inventory",
+                "warehouse-b", "warehouse-c",
+            ],
+        },
+    }, company_id=server.MANUFACTURING_COMPANY_ID)
+    assert migrated["section_order"]["warehouses"] == [
+        "warehouse-a", "warehouse-b", "warehouse-c",
+    ]

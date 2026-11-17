@@ -5,9 +5,13 @@ import { Btn, Card, Input, PageHeader, Select } from "@/components/common";
 import { useAuth } from "@/context/AuthContext";
 import { api, apiError } from "@/lib/api";
 import { today } from "@/lib/format";
-import { downloadMonthlyChemicalSheetPdf } from "@/lib/monthlyChemicalSheetPdf.mjs";
+import {
+  downloadDailyChemicalAndBlockPdf,
+  downloadMonthlyChemicalSheetPdf,
+} from "@/lib/monthlyChemicalSheetPdf.mjs";
 import {
   calculateMonthlySheet,
+  calculateDailyProductionReport,
   createBlankMonthlySheet,
   MONTHLY_SHEET_BLOCKS,
   MONTHLY_SHEET_CHEMICALS,
@@ -36,6 +40,19 @@ function hydrateSheet(month, saved) {
         chemicalKey, cellValue(saved?.formula_rates?.[blockKey]?.[chemicalKey]),
       ])),
     ])),
+    production_days: blank.production_days.map((day) => {
+      const savedDay = (saved?.production_days || []).find((item) => item.date === day.date);
+      return {
+        ...day,
+        ...Object.fromEntries(MONTHLY_SHEET_BLOCKS.map(({ key }) => [
+          key,
+          {
+            quantity: cellValue(savedDay?.[key]?.quantity),
+            weight_kg: cellValue(savedDay?.[key]?.weight_kg),
+          },
+        ])),
+      };
+    }),
     weeks: blank.weeks.map((week, index) => ({
       ...week,
       ...Object.fromEntries(MONTHLY_SHEET_BLOCKS.map(({ key }) => [
@@ -79,12 +96,23 @@ function suggestedChemical(product) {
 export default function MonthlyChemicalSheet() {
   const { user } = useAuth();
   const companyId = user?._active_company_id || user?.company_id;
-  const canEdit = user?.is_primary_owner && user?.is_owner && !user?.is_worker;
+  const isManufacturing = companyId === "iqfoam-manufactoring";
+  const apiPath = isManufacturing
+    ? "/warehouses/production-chemical-balance"
+    : "/production/monthly-chemical-sheet";
+  const companyLabel = isManufacturing ? "IQFOAM Manufacturing" : "SuperIQFoam";
+  const canEdit = !user?.is_worker && (isManufacturing
+    ? user?.is_owner || user?.is_company_owner || user?.role === "owner"
+    : user?.is_primary_owner && user?.is_owner);
   const [month, setMonth] = useState(today().slice(0, 7));
+  const [dailyReportDate, setDailyReportDate] = useState(today());
   const [sheet, setSheet] = useState(() => createBlankMonthlySheet(today().slice(0, 7)));
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [downloadingDailyReport, setDownloadingDailyReport] = useState(false);
   const [loadError, setLoadError] = useState("");
+  const [section, setSection] = useState("production");
+  const [selectedProductionWeek, setSelectedProductionWeek] = useState(0);
   const [grvs, setGrvs] = useState([]);
   const [grvLoading, setGrvLoading] = useState(false);
   const [grvError, setGrvError] = useState("");
@@ -96,7 +124,7 @@ export default function MonthlyChemicalSheet() {
     let active = true;
     setLoading(true);
     setLoadError("");
-    api.getUncached("/production/monthly-chemical-sheet", { month })
+    api.getUncached(apiPath, { month })
       .then((saved) => {
         if (active) setSheet(hydrateSheet(month, saved));
       })
@@ -107,14 +135,14 @@ export default function MonthlyChemicalSheet() {
       })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [month]);
+  }, [month, apiPath]);
 
   useEffect(() => {
     let active = true;
     setGrvLoading(true);
     setGrvError("");
     setSelectedGrvId("");
-    api.getUncached("/production/monthly-chemical-sheet/grvs", { month })
+    api.getUncached(`${apiPath}/grvs`, { month })
       .then((records) => {
         if (active) setGrvs(Array.isArray(records) ? records : []);
       })
@@ -126,7 +154,7 @@ export default function MonthlyChemicalSheet() {
       })
       .finally(() => { if (active) setGrvLoading(false); });
     return () => { active = false; };
-  }, [month, grvReload]);
+  }, [month, grvReload, apiPath]);
 
   useEffect(() => {
     if (!grvs.length) return;
@@ -158,6 +186,18 @@ export default function MonthlyChemicalSheet() {
 
   const selectedGrv = grvs.find((grv) => grv.id === selectedGrvId);
   const totals = useMemo(() => calculateMonthlySheet(sheet), [sheet]);
+  const dailyReport = useMemo(
+    () => calculateDailyProductionReport(sheet, dailyReportDate),
+    [sheet, dailyReportDate],
+  );
+  const weekIndex = Math.min(selectedProductionWeek, sheet.weeks.length - 1);
+  const selectedWeekDays = sheet.production_days.filter((day) => day.week_index === weekIndex);
+  const selectedLegacyWeek = sheet.weeks[weekIndex];
+  const selectedWeekHasDailyEntries = selectedWeekDays.some((day) =>
+    MONTHLY_SHEET_BLOCKS.some(({ key }) =>
+      day[key].quantity !== "" || day[key].weight_kg !== ""));
+  const selectedWeekHasLegacyTotals = MONTHLY_SHEET_BLOCKS.some(({ key }) =>
+    selectedLegacyWeek[key].quantity !== "" || selectedLegacyWeek[key].weight_kg !== "");
   const updateSheet = (update) => setSheet((current) => ({ ...current, ...update }));
   const updateArrival = (key, value) => updateSheet({
     arrivals: { ...sheet.arrivals, [key]: value },
@@ -171,20 +211,26 @@ export default function MonthlyChemicalSheet() {
       [blockKey]: { ...sheet.formula_rates[blockKey], [chemicalKey]: value },
     },
   });
-  const updateProduction = (weekIndex, blockKey, field, value) => updateSheet({
-    weeks: sheet.weeks.map((week, index) => index !== weekIndex
-      ? week
-      : { ...week, [blockKey]: { ...week[blockKey], [field]: value } }),
+  const updateDailyProduction = (date, blockKey, field, value) => updateSheet({
+    production_days: sheet.production_days.map((day) => day.date !== date
+      ? day
+      : { ...day, [blockKey]: { ...day[blockKey], [field]: value } }),
   });
+
+  useEffect(() => {
+    setDailyReportDate(month === today().slice(0, 7) ? today() : `${month}-01`);
+  }, [month]);
 
   const save = async () => {
     if (!canEdit) {
-      toast.error("Only the primary owner can save SuperIQFoam company data.");
+      toast.error(isManufacturing
+        ? "Only a company owner can save IQFOAM Manufacturing data."
+        : "Only the primary owner can save SuperIQFOAM company data.");
       return;
     }
     setSaving(true);
     try {
-      const saved = await api.put("/production/monthly-chemical-sheet", monthlySheetPayload(sheet));
+      const saved = await api.put(apiPath, monthlySheetPayload(sheet));
       setSheet(hydrateSheet(month, saved));
       toast.success("Monthly production sheet saved");
     } catch (error) {
@@ -242,7 +288,7 @@ export default function MonthlyChemicalSheet() {
         ...createBlankMonthlySheet(month, sheet.formula_rates),
         minimums: sheet.minimums,
       };
-      const saved = await api.put("/production/monthly-chemical-sheet", monthlySheetPayload(resetSheet));
+      const saved = await api.put(apiPath, monthlySheetPayload(resetSheet));
       setSheet(hydrateSheet(month, saved));
       toast.success(`Monthly sheet ${month} reset`);
     } catch (error) {
@@ -260,15 +306,27 @@ export default function MonthlyChemicalSheet() {
     }
   };
 
-  if (companyId !== "superiqfoam") {
-    return <Card className="p-6"><p className="font-semibold text-red-700">This sheet is only available in the SUPERIQFOAM profile.</p></Card>;
+  const exportDailyReportPdf = async () => {
+    if (!dailyReport || downloadingDailyReport) return;
+    setDownloadingDailyReport(true);
+    try {
+      await downloadDailyChemicalAndBlockPdf(dailyReport);
+    } catch (error) {
+      toast.error(`Could not create daily chemical and block PDF: ${apiError(error)}`);
+    } finally {
+      setDownloadingDailyReport(false);
+    }
+  };
+
+  if (!["superiqfoam", "iqfoam-manufactoring"].includes(companyId)) {
+    return <Card className="p-6"><p className="font-semibold text-red-700">This sheet is only available in the SUPERIQFOAM and IQFOAM Manufacturing profiles.</p></Card>;
   }
 
   return (
     <div className="space-y-5" data-testid="monthly-chemical-sheet">
       <PageHeader
-        title="Monthly Production & Chemical Balance"
-        subtitle="Enter monthly chemical arrivals and weekly production totals. The number of weeks matches the selected calendar month."
+        title="Production Management & Chemical Balance"
+        subtitle="Enter monthly chemical arrivals and daily production. Switch between the calendar weeks in the selected month."
       >
         <div className="flex w-full flex-wrap items-end gap-2 sm:w-auto">
           <Input label="Month" type="month" value={month} onChange={(event) => setMonth(event.target.value)}
@@ -290,10 +348,31 @@ export default function MonthlyChemicalSheet() {
         The saved sheet could not be loaded. Editing is disabled until it can be loaded successfully, to avoid replacing saved data with blanks.
       </Card>}
       {!canEdit && <Card className="border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
-        This sheet is read-only for this account. The primary owner can enter and save data.
+        This sheet is read-only for this account. {isManufacturing ? "A company owner" : "The primary owner"} can enter and save data.
       </Card>}
 
-      <Card className="overflow-hidden">
+      <div className="flex gap-2 border-b border-border">
+        <button type="button" aria-pressed={section === "production"}
+          onClick={() => setSection("production")}
+          className={`border-b-2 px-3 py-2 text-sm font-semibold ${section === "production" ? "border-primary text-primary" : "border-transparent text-slate-500"}`}
+          data-testid="monthly-sheet-production-tab">
+          Production
+        </button>
+        <button type="button" aria-pressed={section === "details"}
+          onClick={() => setSection("details")}
+          className={`border-b-2 px-3 py-2 text-sm font-semibold ${section === "details" ? "border-primary text-primary" : "border-transparent text-slate-500"}`}
+          data-testid="monthly-sheet-details-tab">
+          Details
+        </button>
+        {isManufacturing && <button type="button" aria-pressed={section === "daily-report"}
+          onClick={() => setSection("daily-report")}
+          className={`border-b-2 px-3 py-2 text-sm font-semibold ${section === "daily-report" ? "border-primary text-primary" : "border-transparent text-slate-500"}`}
+          data-testid="monthly-sheet-daily-report-tab">
+          Daily Report
+        </button>}
+      </div>
+
+      <Card className="overflow-hidden" hidden={section !== "production"}>
         <h2 className="bg-[#171812] px-4 py-3 text-sm font-bold uppercase text-white">1. Chemical arrivals this month (kg)</h2>
         <div className="overflow-x-auto p-4">
           <table className="w-full min-w-[780px] border-collapse text-sm">
@@ -407,34 +486,37 @@ export default function MonthlyChemicalSheet() {
         </div>
       </Card>
 
-      <Card className="overflow-hidden" data-testid="monthly-sheet-container-tracking">
+      <Card className="overflow-hidden" hidden={section !== "details"} data-testid="monthly-sheet-container-tracking">
         <h2 className="bg-[#171812] px-4 py-3 text-sm font-bold uppercase text-white">
-          Chemical container tracking estimate
+          Chemical and container balance
         </h2>
         <p className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900">
-          Estimates use GRVs added to this month, verified kg-per-block formulas and weekly production. They do not measure actual drum levels, and exclude opening stock and manual arrivals without container details. Weekly consumption is assigned at week end because daily production dates are not recorded here.
+          Direct calculation: blocks made × formula (kg per block) = chemical used. That use is deducted from this month’s GRV containers, oldest receipt first. “Containers remaining” is calculated, not a physical drum check. Opening stock and manual arrivals without container details are not included.
         </p>
         {totals.containerTracking.every(({ containers }) => !containers.length) ? (
           <p className="p-4 text-sm text-slate-500">
-            Add a chemical GRV with container capacity in kg to estimate container usage.
+            Add a chemical GRV with container capacity in kg to calculate container balances.
           </p>
         ) : <div className="space-y-4 p-4">
           {totals.containerTracking.filter(({ containers }) => containers.length > 0).map((tracking) => (
             <section key={tracking.chemical_key} data-testid={`monthly-container-chemical-${tracking.chemical_key}`}>
               <h3 className="mb-2 text-sm font-semibold text-slate-800">{tracking.chemical_label}</h3>
               {tracking.missing_rates.length > 0 && <p className="mb-2 text-xs text-amber-800" role="status">
-                Add verified formula rates for {tracking.missing_rates.join(", ")} to estimate container depletion.
+                Add verified formula rates for {tracking.missing_rates.join(", ")} to calculate use and containers remaining.
               </p>}
               <div className="overflow-x-auto">
-                <table className="w-full min-w-[980px] border-collapse text-xs">
+                <table className="w-full min-w-[1600px] border-collapse text-xs">
                   <thead><tr>{[
-                    "GRV / received", "Container", "Capacity each", "Containers received",
-                    "Total received (kg)", "Estimated used (kg)", "Estimated remaining (kg)",
-                    "Empty containers", "Depletion estimate",
+                    "GRV / date", "Container type", "Size each", "Received",
+                    ...MONTHLY_SHEET_BLOCKS.map(({ label }) => `${label} used (kg)`),
+                    "GRV total (kg)", "Used (kg)", "Chemical left (kg)",
+                    "Containers left", "Empty", "Depletion",
                   ].map((heading) => <th key={heading} className="border bg-[#f7ead1] p-2 text-left">{heading}</th>)}</tr></thead>
                   <tbody>{tracking.containers.map((container) => {
                     const depletion = tracking.missing_rates.length
                       ? "Formula needed"
+                      : container.status === "container-data-mismatch"
+                        ? "Check GRV container details"
                       : container.depletion_week
                         ? `Week ${container.depletion_week}`
                         : container.status === "empty" ? "Emptied this month"
@@ -444,22 +526,34 @@ export default function MonthlyChemicalSheet() {
                       <td className="border p-2">{container.container_type || "Container"}</td>
                       <td className="border p-2 text-right">{displayQty(container.container_capacity)} {container.unit}</td>
                       <td className="border p-2 text-right">{displayQty(container.container_count)}</td>
+                      {MONTHLY_SHEET_BLOCKS.map(({ key }) => <td key={key} className="border p-2 text-right">
+                        {tracking.missing_rates.length ? "—" : displayQty(container.usage_by_block[key])}
+                      </td>)}
                       <td className="border p-2 text-right">{displayQty(container.total_quantity_kg)}</td>
-                      <td className="border p-2 text-right">{tracking.missing_rates.length ? "—" : displayQty(container.estimated_used_kg)}</td>
+                      <td className="border p-2 text-right">{tracking.missing_rates.length ? "—" : displayQty(container.actually_used_kg)}</td>
                       <td className="border p-2 text-right font-semibold">{tracking.missing_rates.length ? "—" : displayQty(container.remaining_quantity_kg)}</td>
-                      <td className="border p-2 text-right">{tracking.missing_rates.length ? "—" : displayQty(container.empty_container_count)}</td>
+                      <td className="border p-2 text-right">{tracking.missing_rates.length || !container.container_data_consistent
+                        ? "—" : displayQty(container.containers_with_stock)}</td>
+                      <td className="border p-2 text-right">{tracking.missing_rates.length || !container.container_data_consistent
+                        ? "—" : displayQty(container.empty_container_count)}</td>
                       <td className="border p-2">{depletion}</td>
                     </tr>;
                   })}</tbody>
                   {!tracking.missing_rates.length && <tfoot><tr className="bg-slate-50 font-semibold">
-                    <td className="border p-2" colSpan="4">Tracked GRV containers total</td>
+                    <td className="border p-2" colSpan={4 + MONTHLY_SHEET_BLOCKS.length}>Tracked GRV containers total</td>
                     <td className="border p-2 text-right">{displayQty(tracking.tracked_quantity_kg)}</td>
-                    <td className="border p-2 text-right">{displayQty(tracking.tracked_quantity_kg - tracking.tracked_remaining_kg)}</td>
+                    <td className="border p-2 text-right">{displayQty(tracking.containers.reduce((sum, container) => sum + container.actually_used_kg, 0))}</td>
                     <td className="border p-2 text-right">{displayQty(tracking.tracked_remaining_kg)}</td>
-                    <td className="border p-2" colSpan="2">
+                    <td className="border p-2 text-right">{tracking.containers.some((container) => !container.container_data_consistent)
+                      ? "—" : displayQty(tracking.containers.reduce((sum, container) =>
+                        sum + (container.containers_with_stock || 0), 0))}</td>
+                    <td className="border p-2 text-right">{tracking.containers.some((container) => !container.container_data_consistent)
+                      ? "—" : displayQty(tracking.containers.reduce((sum, container) =>
+                        sum + (container.empty_container_count || 0), 0))}</td>
+                    <td className="border p-2">
                       {tracking.untracked_consumption_kg > 0
-                        ? `${displayQty(tracking.untracked_consumption_kg)} kg consumption not matched to listed GRV containers`
-                        : "All estimated consumption matched to listed GRV containers"}
+                        ? `${displayQty(tracking.untracked_consumption_kg)} kg use not matched to listed GRV containers`
+                        : "All calculated use matched to listed GRV containers"}
                     </td>
                   </tr></tfoot>}
                 </table>
@@ -469,65 +563,105 @@ export default function MonthlyChemicalSheet() {
         </div>}
       </Card>
 
-      <Card className="overflow-hidden">
-        <h2 className="bg-[#171812] px-4 py-3 text-sm font-bold uppercase text-white">2. Weekly production (block count and weight in kg)</h2>
+      <Card className="overflow-hidden" hidden={section !== "production"} data-testid="monthly-daily-production">
+        <h2 className="bg-[#171812] px-4 py-3 text-sm font-bold uppercase text-white">
+          2. Daily production (block count and weight in kg)
+        </h2>
+        <div className="flex flex-wrap gap-2 border-b border-slate-200 px-4 pt-3" aria-label="Production week">
+          {Array.from({ length: sheet.weeks.length }, (_, index) => {
+            const days = sheet.production_days.filter((day) => day.week_index === index);
+            const first = days[0]?.date;
+            const last = days.at(-1)?.date;
+            const range = first && last
+              ? ` · ${Number(first.slice(-2))}-${Number(last.slice(-2))}`
+              : "";
+            return <button key={index} type="button" aria-pressed={weekIndex === index}
+              onClick={() => setSelectedProductionWeek(index)}
+              className={`rounded-t-md border-b-2 px-3 py-2 text-sm font-semibold ${weekIndex === index
+                ? "border-primary text-primary" : "border-transparent text-slate-500 hover:text-slate-800"}`}
+              data-testid={`monthly-production-week-${index + 1}`}>
+              Week {index + 1}{range}
+            </button>;
+          })}
+        </div>
+        {selectedWeekHasLegacyTotals && !selectedWeekHasDailyEntries && <p className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900" role="status">
+          This week has saved weekly totals from the previous format. They remain included in monthly calculations until you enter daily production for this week. Once you start, enter the complete daily records for this week; the old weekly totals are retained but no longer added again.
+        </p>}
+        {selectedWeekHasLegacyTotals && selectedWeekHasDailyEntries && <p className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900" role="status">
+          Daily entries are used for this week. The previous weekly totals are preserved in storage but are not added to avoid double counting.
+        </p>}
         <div className="overflow-x-auto p-3">
-          <table className="w-full min-w-[1150px] border-collapse text-xs">
+          <table className="w-full min-w-[1250px] border-collapse text-xs">
             <thead><tr>
-              <th rowSpan="2" className="border bg-[#f7ead1] p-2">Week</th>
+              <th rowSpan="2" className="border bg-[#f7ead1] p-2 text-left">Production date</th>
               {MONTHLY_SHEET_BLOCKS.map(({ key, label }) => <th key={key} colSpan="2" className="border bg-[#f7ead1] p-2">{label}</th>)}
-              <th rowSpan="2" className="border bg-[#f7ead1] p-2">Total blocks</th>
-              <th rowSpan="2" className="border bg-[#f7ead1] p-2">Total weight (kg)</th>
+              <th rowSpan="2" className="border bg-[#f7ead1] p-2">Daily blocks</th>
+              <th rowSpan="2" className="border bg-[#f7ead1] p-2">Daily weight (kg)</th>
             </tr><tr>
               {MONTHLY_SHEET_BLOCKS.map(({ key }) => <th key={`${key}-units`} className="border p-2">Qty (pcs)</th>)
                 .flatMap((quantityHeader, index) => [quantityHeader,
                   <th key={`${MONTHLY_SHEET_BLOCKS[index].key}-weight`} className="border p-2">Weight (kg)</th>])}
             </tr></thead>
-            <tbody>
-              {sheet.weeks.map((week, weekIndex) => {
-                const weekBlocks = MONTHLY_SHEET_BLOCKS.reduce((total, { key }) => ({
-                  quantity: total.quantity + (Number(week[key].quantity) || 0),
-                  weight: total.weight + (Number(week[key].weight_kg) || 0),
-                }), { quantity: 0, weight: 0 });
-                return <tr key={weekIndex}>
-                  <th className="border bg-slate-50 p-2 text-left">Week {weekIndex + 1}</th>
-                  {MONTHLY_SHEET_BLOCKS.flatMap(({ key, label }) => [
-                    <td key={`${key}-qty`} className="border p-1">
-                      <NumberCell label={`Week ${weekIndex + 1} ${label} quantity`} value={week[key].quantity}
-                        step="1" disabled={!canEdit || loading || !!loadError}
-                        onChange={(value) => updateProduction(weekIndex, key, "quantity", value)}
-                        testId={`monthly-week-${weekIndex + 1}-${key}-quantity`} />
-                    </td>,
-                    <td key={`${key}-weight`} className="border p-1">
-                      <NumberCell label={`Week ${weekIndex + 1} ${label} weight in kg`} value={week[key].weight_kg}
-                        disabled={!canEdit || loading || !!loadError}
-                        onChange={(value) => updateProduction(weekIndex, key, "weight_kg", value)}
-                        testId={`monthly-week-${weekIndex + 1}-${key}-weight`} />
-                    </td>,
-                  ])}
-                  <td className="border bg-slate-50 p-2 text-right font-semibold">{displayQty(weekBlocks.quantity)}</td>
-                  <td className="border bg-slate-50 p-2 text-right font-semibold">{displayQty(weekBlocks.weight)}</td>
-                </tr>;
-              })}
+            <tbody>{selectedWeekDays.map((day) => {
+              const dayTotals = MONTHLY_SHEET_BLOCKS.reduce((sum, { key }) => ({
+                quantity: sum.quantity + (Number(day[key].quantity) || 0),
+                weight: sum.weight + (Number(day[key].weight_kg) || 0),
+              }), { quantity: 0, weight: 0 });
+              const date = new Date(`${day.date}T00:00:00Z`);
+              const dateLabel = date.toLocaleDateString("en-GB", {
+                weekday: "short", day: "2-digit", month: "short", timeZone: "UTC",
+              });
+              return <tr key={day.date} data-testid={`monthly-production-day-${day.date}`}>
+                <th className="border bg-slate-50 p-2 text-left">{dateLabel}</th>
+                {MONTHLY_SHEET_BLOCKS.flatMap(({ key, label }) => [
+                  <td key={`${key}-qty`} className="border p-1">
+                    <NumberCell label={`${dateLabel} ${label} quantity`} value={day[key].quantity}
+                      step="1" disabled={!canEdit || loading || !!loadError}
+                      onChange={(value) => updateDailyProduction(day.date, key, "quantity", value)}
+                      testId={`monthly-day-${day.date}-${key}-quantity`} />
+                  </td>,
+                  <td key={`${key}-weight`} className="border p-1">
+                    <NumberCell label={`${dateLabel} ${label} weight in kg`} value={day[key].weight_kg}
+                      disabled={!canEdit || loading || !!loadError}
+                      onChange={(value) => updateDailyProduction(day.date, key, "weight_kg", value)}
+                      testId={`monthly-day-${day.date}-${key}-weight`} />
+                  </td>,
+                ])}
+                <td className="border bg-slate-50 p-2 text-right font-semibold">{displayQty(dayTotals.quantity)}</td>
+                <td className="border bg-slate-50 p-2 text-right font-semibold">{displayQty(dayTotals.weight)}</td>
+              </tr>;
+            })}</tbody>
+            <tfoot>
               <tr className="bg-[#f8ecd5] font-bold">
+                <th className="border p-2 text-left">WEEK {weekIndex + 1} TOTAL</th>
+                {MONTHLY_SHEET_BLOCKS.flatMap(({ key }) => [
+                  <td key={`${key}-qty-week`} className="border p-2 text-right">{displayQty(totals.productionByWeek[weekIndex][key].quantity)}</td>,
+                  <td key={`${key}-weight-week`} className="border p-2 text-right">{displayQty(totals.productionByWeek[weekIndex][key].weight_kg)}</td>,
+                ])}
+                <td className="border p-2 text-right">{displayQty(MONTHLY_SHEET_BLOCKS.reduce((sum, { key }) =>
+                  sum + totals.productionByWeek[weekIndex][key].quantity, 0))}</td>
+                <td className="border p-2 text-right">{displayQty(MONTHLY_SHEET_BLOCKS.reduce((sum, { key }) =>
+                  sum + totals.productionByWeek[weekIndex][key].weight_kg, 0))}</td>
+              </tr>
+              <tr className="bg-slate-100 font-bold">
                 <th className="border p-2 text-left">MONTH TOTAL</th>
                 {MONTHLY_SHEET_BLOCKS.flatMap(({ key }) => [
-                  <td key={`${key}-qty-total`} className="border p-2 text-right">{displayQty(totals.blockTotals[key].quantity)}</td>,
-                  <td key={`${key}-weight-total`} className="border p-2 text-right">{displayQty(totals.blockTotals[key].weight_kg)}</td>,
+                  <td key={`${key}-qty-month`} className="border p-2 text-right">{displayQty(totals.blockTotals[key].quantity)}</td>,
+                  <td key={`${key}-weight-month`} className="border p-2 text-right">{displayQty(totals.blockTotals[key].weight_kg)}</td>,
                 ])}
                 <td className="border p-2 text-right">{displayQty(totals.totalBlocks)}</td>
                 <td className="border p-2 text-right">{displayQty(totals.totalBlockWeight)}</td>
               </tr>
-            </tbody>
+            </tfoot>
           </table>
         </div>
       </Card>
 
-      <Card className="overflow-hidden">
-        <div className="bg-[#171812] px-4 py-3 text-sm font-bold uppercase text-white">3. SuperIQFoam chemical formula (kg per block)</div>
+      <Card className="overflow-hidden" hidden={section !== "production"}>
+        <div className="bg-[#171812] px-4 py-3 text-sm font-bold uppercase text-white">3. {companyLabel} chemical formula (kg per block)</div>
         <div className="flex items-start gap-2 border-b border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
           <AlertTriangle size={18} className="mt-0.5 shrink-0" />
-          Set the verified SuperIQFoam recipe rates below. No Manufacturing recipe is copied here. If a block was produced but a rate is blank, its consumption and final balance remain uncalculated.
+          Set the verified {companyLabel} recipe rates below. If a block was produced but a rate is blank, its consumption and final balance remain uncalculated.
         </div>
         <div className="overflow-x-auto p-3">
           <table className="w-full min-w-[1000px] border-collapse text-xs">
@@ -548,10 +682,10 @@ export default function MonthlyChemicalSheet() {
         </div>
       </Card>
 
-      <Card className="overflow-hidden">
+      <Card className="overflow-hidden" hidden={section !== "details"}>
         <h2 className="bg-[#171812] px-4 py-3 text-sm font-bold uppercase text-white">4. Chemical balance at month end</h2>
         <p className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900">
-          This worksheet balance is separate from Chemical Inventory and Chemical Usage records; it does not change inventory quantities.
+          This worksheet balance is separate from inventory stock records; it does not change physical stock quantities.
         </p>
         <div className="overflow-x-auto p-3">
           <table className="w-full min-w-[850px] border-collapse text-sm">
@@ -563,7 +697,8 @@ export default function MonthlyChemicalSheet() {
                 const balance = totals.chemicalBalances[key];
                 const status = balance.status === "ok"
                   ? <span className="inline-flex items-center gap-1 font-semibold text-emerald-700"><Check size={15} /> STOCK OK</span>
-                  : balance.status === "reorder" ? <span className="font-bold text-red-700">REORDER</span>
+                  : balance.status === "finished" ? <span className="font-bold text-red-800">FINISHED</span>
+                    : balance.status === "reorder" ? <span className="font-bold text-red-700">RE-ORDER AS SOON AS POSSIBLE</span>
                     : balance.status === "missing-formula" ? <span className="text-amber-800">Formula needed: {balance.missingRates.join(", ")}</span>
                       : balance.status === "missing-arrival" ? <span className="text-amber-800">Enter arrivals</span>
                         : <span className="text-slate-500">Set minimum</span>;
@@ -571,7 +706,7 @@ export default function MonthlyChemicalSheet() {
                   <th className="border p-2 text-left">{label}</th>
                   <td className="border p-2 text-right">{displayQty(balance.arrival)}</td>
                   <td className="border p-2 text-right">{displayQty(balance.consumption)}</td>
-                  <td className={`border p-2 text-right font-semibold ${balance.remaining != null && balance.remaining < 0 ? "text-red-700" : ""}`}>{displayQty(balance.remaining)}</td>
+                  <td className={`border p-2 text-right font-semibold ${balance.remaining != null && balance.remaining <= 0 ? "text-red-700" : ""}`}>{displayQty(balance.remaining)}</td>
                   <td className="border p-1"><NumberCell label={`${label} reorder threshold in kg`} value={sheet.minimums[key]}
                     disabled={!canEdit || loading || !!loadError}
                     onChange={(value) => updateMinimum(key, value)}
@@ -594,6 +729,117 @@ export default function MonthlyChemicalSheet() {
           </table>
         </div>
       </Card>
+
+      {isManufacturing && <Card className="overflow-hidden" hidden={section !== "daily-report"} data-testid="manufacturing-daily-production-report">
+        <h2 className="bg-[#171812] px-4 py-3 text-sm font-bold uppercase text-white">
+          Daily Production & Chemical Balance Report
+        </h2>
+        <div className="space-y-3 border-b border-slate-200 p-4">
+          <div className="flex flex-wrap items-end justify-between gap-3">
+            <Input
+              label="Report date"
+              type="date"
+              min={`${month}-01`}
+              max={`${month}-${String(new Date(Number(month.slice(0, 4)), Number(month.slice(5, 7)), 0).getDate()).padStart(2, "0")}`}
+              value={dailyReportDate}
+              onChange={(event) => setDailyReportDate(event.target.value)}
+              disabled={loading || !!loadError}
+              data-testid="manufacturing-daily-report-date"
+            />
+            <Btn
+              variant="outline"
+              onClick={exportDailyReportPdf}
+              disabled={!dailyReport || downloadingDailyReport || loading || !!loadError}
+              data-testid="manufacturing-daily-report-pdf"
+            >
+              <Download size={16} />
+              {downloadingDailyReport ? "Creating PDF..." : "Download Daily Chemical and Block PDF"}
+            </Btn>
+          </div>
+          <p className="text-xs text-slate-600">
+            Usage is calculated from this date’s block quantities and saved formula rates. Remaining chemical includes this month’s manual arrivals and confirmed GRVs received by this date; opening stock and weekly totals without daily dates are not included. Barrel counts and tracked kg use dated GRV container details only and are estimates, not physical stock counts.
+          </p>
+          {dailyReport?.undatedArrivalCount > 0 && <p className="text-xs text-amber-800" role="status">
+            {dailyReport.undatedArrivalCount} saved GRV receipt(s) have no receipt date and are excluded from this dated report.
+          </p>}
+        </div>
+        {!dailyReport ? (
+          <p className="p-4 text-sm text-slate-500">Choose a valid date in the selected month to view its report.</p>
+        ) : <>
+          <div className="grid gap-3 p-4 sm:grid-cols-2">
+            <div className="rounded-lg border border-emerald-100 bg-emerald-50/50 p-3">
+              <p className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Total blocks made</p>
+              <p className="mt-1 text-lg font-bold tabular-nums text-slate-800" data-testid="manufacturing-daily-report-total-blocks">
+                {displayQty(dailyReport.totalBlocks)}
+              </p>
+            </div>
+            <div className="rounded-lg border border-emerald-100 bg-emerald-50/50 p-3">
+              <p className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Total block weight</p>
+              <p className="mt-1 text-lg font-bold tabular-nums text-slate-800" data-testid="manufacturing-daily-report-total-weight">
+                {displayQty(dailyReport.totalWeightKg)} kg
+              </p>
+            </div>
+          </div>
+          <div className="space-y-5 p-4 pt-0">
+            <section>
+              <h3 className="mb-2 text-sm font-semibold text-slate-800">Blocks made by type</h3>
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[600px] border-collapse text-sm">
+                  <thead><tr>
+                    <th className="border bg-[#f7ead1] p-2 text-left">Block type</th>
+                    <th className="border bg-[#f7ead1] p-2 text-right">Blocks made</th>
+                    <th className="border bg-[#f7ead1] p-2 text-right">Weight (kg)</th>
+                  </tr></thead>
+                  <tbody>{dailyReport.blocks.map((block) => <tr key={block.key}>
+                    <th className="border p-2 text-left">{block.label}</th>
+                    <td className="border p-2 text-right tabular-nums">{displayQty(block.quantity)}</td>
+                    <td className="border p-2 text-right tabular-nums">{displayQty(block.weight_kg)}</td>
+                  </tr>)}</tbody>
+                  <tfoot><tr className="bg-[#f8ecd5] font-bold">
+                    <th className="border p-2 text-left">DAILY TOTAL</th>
+                    <td className="border p-2 text-right tabular-nums">{displayQty(dailyReport.totalBlocks)}</td>
+                    <td className="border p-2 text-right tabular-nums">{displayQty(dailyReport.totalWeightKg)}</td>
+                  </tr></tfoot>
+                </table>
+              </div>
+            </section>
+            <section>
+              <h3 className="mb-2 text-sm font-semibold text-slate-800">Chemical used today and remaining balance</h3>
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[1250px] border-collapse text-xs">
+                  <thead><tr>
+                    <th className="border bg-[#f7ead1] p-2 text-left">Chemical</th>
+                    {MONTHLY_SHEET_BLOCKS.map(({ key, label }) => <th key={key} className="border bg-[#f7ead1] p-2 text-right">{label} used (kg)</th>)}
+                    <th className="border bg-[#f7ead1] p-2 text-right">Used today (kg)</th>
+                    <th className="border bg-[#f7ead1] p-2 text-right">Chemical remaining (kg)</th>
+                    <th className="border bg-[#f7ead1] p-2 text-right">Barrels / containers with stock</th>
+                    <th className="border bg-[#f7ead1] p-2 text-right">GRV-tracked kg remaining</th>
+                  </tr></thead>
+                  <tbody>{dailyReport.chemicalUsage.map((usage) => {
+                    const balance = dailyReport.balances.find(({ key }) => key === usage.key);
+                    return <tr key={usage.key} data-testid={`manufacturing-daily-report-chemical-${usage.key}`}>
+                      <th className="border p-2 text-left">{usage.label}</th>
+                      {usage.byBlock.map((block) => <td key={block.block_key} className="border p-2 text-right tabular-nums">
+                        {displayQty(block.used_kg)}
+                      </td>)}
+                      <td className="border p-2 text-right font-semibold tabular-nums">{displayQty(usage.used_today_kg)}</td>
+                      <td className="border p-2 text-right font-semibold tabular-nums">{displayQty(balance.remaining_kg)}</td>
+                      <td className="border p-2 text-right tabular-nums">{displayQty(balance.barrels_remaining)}</td>
+                      <td className="border p-2 text-right tabular-nums">{displayQty(balance.tracked_remaining_kg)}</td>
+                    </tr>;
+                  })}</tbody>
+                </table>
+              </div>
+              {dailyReport.chemicalUsage.some(({ missingRates }) => missingRates.length > 0) && <p className="mt-2 text-xs text-amber-800" role="status">
+                Complete verified formula rates for the produced block types to calculate chemical use and the remaining balance.
+              </p>}
+              {dailyReport.balances.some(({ hasContainerMismatch }) => hasContainerMismatch) && <p className="mt-2 text-xs text-amber-800" role="status">
+                Barrel counts are not shown for GRV lines where accepted kg do not match container capacity × quantity. Review those GRV details.
+              </p>}
+            </section>
+          </div>
+        </>}
+      </Card>}
     </div>
   );
 }

@@ -118,6 +118,7 @@ function Protected({ children }) {
       ? user.company_id === "superiqfoam" ? "chemical-usage-log" : "warehouse-chemical"
       : warehousePath === "chemical-inventory"
         ? user.company_id === "superiqfoam" ? "chemicals-quantity" : "warehouse-chemical-inventory"
+        : warehousePath === "production-chemical-balance" ? "warehouse-a"
         : ["A", "B", "C"].includes(warehousePath) ? `warehouse-${warehousePath.toLowerCase()}`
           : null;
     const section = location.pathname.startsWith("/express-invoices") ? "express-invoices"
@@ -344,9 +345,14 @@ function OwnerWelcome({ children, user }) {
 
 function CompanyChemicalPage({ children }) {
   const { user } = useAuth();
-  return user?.company_id === "superiqfoam"
-    ? <Navigate to="/production/monthly-sheet" replace />
-    : children;
+  const companyId = user?._active_company_id || user?.company_id;
+  if (companyId === "superiqfoam") {
+    return <Navigate to="/production/monthly-sheet" replace />;
+  }
+  if (companyId === "iqfoam-manufactoring") {
+    return <Navigate to="/warehouses/production-chemical-balance" replace />;
+  }
+  return children;
 }
 
 function AppRouter() {
@@ -377,6 +383,7 @@ function AppRouter() {
             <Route path="/production" element={<Production />} />
             <Route path="/production/monthly-sheet" element={<MonthlyChemicalSheet />} />
             <Route path="/warehouses" element={<Warehouses />} />
+            <Route path="/warehouses/production-chemical-balance" element={<MonthlyChemicalSheet />} />
             <Route path="/warehouses/chemical" element={<CompanyChemicalPage><ChemicalStock /></CompanyChemicalPage>} />
             <Route path="/warehouses/chemical-inventory" element={<CompanyChemicalPage><ChemicalInventory /></CompanyChemicalPage>} />
             <Route path="/company-inventory" element={<CompanyInventory />} />

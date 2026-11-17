@@ -622,6 +622,8 @@ def worker_section_for_request(path, user):
         if len(parts) < 2:
             return "warehouses"
         warehouse = parts[1].lower()
+        if warehouse == "production-chemical-balance":
+            return "warehouse-a"
         if warehouse in {"a", "b", "c"}:
             return f"warehouse-{warehouse}"
         if warehouse == "chemical":
@@ -1815,10 +1817,16 @@ async def login(body: LoginIn, response: Response):
             company_id for company_id, assigned_role in (user.get("company_roles") or {}).items()
             if assigned_role in ("owner", "admin", "user")
         ]
-        if len(assigned_companies) != 1:
+        bound_company_id = user.get("personal_access_company_id")
+        if bound_company_id:
+            if bound_company_id not in assigned_companies:
+                raise HTTPException(403, "Worker no longer has access to this company")
+            company_id = bound_company_id
+        elif len(assigned_companies) == 1:
+            company_id = assigned_companies[0]
+        else:
             raise HTTPException(403, "Worker must be assigned to exactly one company")
         identifier = user.get("username") or user.get("email") or ""
-        company_id = assigned_companies[0]
     else:
         identifier = canonical_email(body.email or body.username)
         if not identifier:
@@ -2168,9 +2176,27 @@ async def worker_access_details(worker_id, company_id, user):
     if not profile:
         raise HTTPException(404, "Company profile not found")
     encrypted_token = worker.get("personal_access_token_encrypted")
-    token = decrypt_worker_access_token(encrypted_token) if encrypted_token else None
-    link_active = bool(token and not worker.get("personal_access_revoked", False)
-                       and worker.get("active", True))
+    try:
+        token = decrypt_worker_access_token(encrypted_token) if encrypted_token else None
+    except InvalidToken:
+        logging.warning(
+            "Worker access link for worker %s could not be decrypted; it can be regenerated",
+            worker_id,
+        )
+        token = None
+    assigned_companies = [
+        assigned_company for assigned_company, role in (worker.get("company_roles") or {}).items()
+        if role in ("owner", "admin", "user")
+    ]
+    token_company_id = worker.get("personal_access_company_id")
+    token_matches_company = token_company_id == company_id or (
+        not token_company_id and assigned_companies == [company_id]
+    )
+    link_active = bool(
+        token and token_matches_company
+        and not worker.get("personal_access_revoked", False)
+        and worker.get("active", True)
+    )
     return {
         "id": worker["id"],
         "name": worker.get("name", ""),
@@ -2220,6 +2246,7 @@ async def issue_worker_personal_link(worker_id, company_id, user, regenerate=Fal
     updates = {
         "personal_access_token_hash": worker_access_token_hash(token),
         "personal_access_token_encrypted": encrypt_worker_access_token(token),
+        "personal_access_company_id": company_id,
         "personal_access_revoked": False,
     }
     if worker.get("personal_access_revoked"):
@@ -2262,6 +2289,7 @@ async def revoke_worker_personal_link(
         "personal_access_revoked": True,
         "personal_access_token_hash": None,
         "personal_access_token_encrypted": None,
+        "personal_access_company_id": None,
     }})
     if result.matched_count != 1:
         raise HTTPException(404, "Worker not found")
@@ -2304,13 +2332,19 @@ async def worker_access_link_info(token: str, response: Response):
     worker = await find_worker_by_access_token(token)
     if not worker:
         raise HTTPException(404, "This worker access link is invalid or revoked")
+    bound_company_id = worker.get("personal_access_company_id")
     company_ids = [
         company_id for company_id, role in (worker.get("company_roles") or {}).items()
         if role in ("owner", "admin", "user")
     ]
-    if len(company_ids) != 1:
+    if bound_company_id:
+        if bound_company_id not in company_ids:
+            raise HTTPException(403, "Worker no longer has access to this company")
+        company_id = bound_company_id
+    elif len(company_ids) == 1:
+        company_id = company_ids[0]
+    else:
         raise HTTPException(403, "Worker must be assigned to exactly one company")
-    company_id = company_ids[0]
     profile = next((item for item in COMPANY_PROFILES if item["id"] == company_id), None)
     if not profile:
         raise HTTPException(403, "Worker company is unavailable")
@@ -3311,6 +3345,27 @@ class MonthlySheetWeekIn(BaseModel):
     small_blue_block: MonthlySheetProductionBlockIn = Field(default_factory=MonthlySheetProductionBlockIn)
 
 
+class MonthlySheetProductionDayIn(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    big_block: MonthlySheetProductionBlockIn = Field(default_factory=MonthlySheetProductionBlockIn)
+    big_blue_block: MonthlySheetProductionBlockIn = Field(default_factory=MonthlySheetProductionBlockIn)
+    medium_block: MonthlySheetProductionBlockIn = Field(default_factory=MonthlySheetProductionBlockIn)
+    small_block: MonthlySheetProductionBlockIn = Field(default_factory=MonthlySheetProductionBlockIn)
+    small_blue_block: MonthlySheetProductionBlockIn = Field(default_factory=MonthlySheetProductionBlockIn)
+
+    @field_validator("date")
+    @classmethod
+    def validate_production_date(cls, value):
+        try:
+            if date.fromisoformat(value).isoformat() != value:
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError("Production date must be a valid ISO date") from exc
+        return value
+
+
 class MonthlySheetArrivalLineIn(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -3342,6 +3397,7 @@ class MonthlyChemicalSheetIn(BaseModel):
     minimums: MonthlySheetChemicalValues
     formula_rates: Dict[str, MonthlySheetChemicalValues]
     weeks: List[MonthlySheetWeekIn]
+    production_days: List[MonthlySheetProductionDayIn] = Field(default_factory=list)
 
     @field_validator("formula_rates")
     @classmethod
@@ -3365,6 +3421,15 @@ class MonthlyChemicalSheetIn(BaseModel):
             raise ValueError("A GRV can only be added to the monthly sheet once")
         return self
 
+    @model_validator(mode="after")
+    def validate_production_days(self):
+        day_dates = [production_day.date for production_day in self.production_days]
+        if len(day_dates) != len(set(day_dates)):
+            raise ValueError("A production date can only be saved once")
+        if any(day[:7] != self.month for day in day_dates):
+            raise ValueError("Production dates must belong to the selected month")
+        return self
+
 
 CHEMICAL_COMPANY_IDS = {MANUFACTURING_COMPANY_ID, DEFAULT_COMPANY_ID}
 
@@ -3384,26 +3449,46 @@ def require_chemical_access(user):
         raise HTTPException(403, "This worker account cannot access the Chemical section")
 
 
-def require_superiqfoam_monthly_sheet_access(user):
-    if user.get("_active_company_id") != DEFAULT_COMPANY_ID:
-        raise HTTPException(403, "The monthly chemical sheet is only available in SUPERIQFOAM")
-    if worker_restrictions_apply(user) and (
-        not set(user.get("worker_allowed_sections", []))
-        .intersection({"superiqfoam-monthly-sheet", "chemicals-quantity", "chemical-usage-log"})
-    ):
+def require_monthly_chemical_sheet_access(user):
+    company_id = user.get("_active_company_id")
+    if company_id not in {DEFAULT_COMPANY_ID, MANUFACTURING_COMPANY_ID}:
+        raise HTTPException(403, "The monthly production and chemical balance is not available for this company")
+    if not worker_restrictions_apply(user):
+        return
+    allowed_sections = set(user.get("worker_allowed_sections", []))
+    company_sections = (
+        {"warehouse-a", "warehouses"}
+        if company_id == MANUFACTURING_COMPANY_ID
+        else {"superiqfoam-monthly-sheet", "chemicals-quantity", "chemical-usage-log"}
+    )
+    if not allowed_sections.intersection(company_sections):
         raise HTTPException(403, "This worker account cannot access the monthly chemical sheet")
 
 
+def monthly_chemical_sheet_id(company_id, month):
+    if company_id == DEFAULT_COMPANY_ID:
+        return f"monthly-chemical-sheet:{month}"
+    return f"monthly-chemical-sheet:{company_id}:{month}"
+
+
 @api.get("/production/monthly-chemical-sheet")
+@api.get("/warehouses/production-chemical-balance")
 async def get_monthly_chemical_sheet(month: str = Query(pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
                                      user=Depends(get_current_user)):
-    require_superiqfoam_monthly_sheet_access(user)
-    sheet_id = f"monthly-chemical-sheet:{month}"
+    require_monthly_chemical_sheet_access(user)
+    company_id = user.get("_active_company_id")
+    sheet_id = monthly_chemical_sheet_id(company_id, month)
     saved = await db.monthly_chemical_sheets.find_one({"id": sheet_id}, {"_id": 0})
     if saved:
         return saved
+    id_pattern = (
+        r"^monthly-chemical-sheet:\d{4}-\d{2}$"
+        if company_id == DEFAULT_COMPANY_ID
+        else f"^{re.escape(f'monthly-chemical-sheet:{company_id}:')}"
+    )
     previous = await db.monthly_chemical_sheets.find(
-        {"month": {"$lt": month}}, {"_id": 0, "formula_rates": 1},
+        {"month": {"$lt": month}, "id": {"$regex": id_pattern}},
+        {"_id": 0, "formula_rates": 1},
     ).sort("month", -1).limit(1).to_list(1)
     default_values = MonthlySheetChemicalValues().model_dump()
     return {
@@ -3421,16 +3506,18 @@ async def get_monthly_chemical_sheet(month: str = Query(pattern=r"^\d{4}-(0[1-9]
                 int(month[:4]), int(month[5:7]),
             )
         ],
+        "production_days": [],
         "arrival_sources": [],
     }
 
 
 @api.get("/production/monthly-chemical-sheet/grvs")
+@api.get("/warehouses/production-chemical-balance/grvs")
 async def get_monthly_chemical_sheet_grvs(
     month: str = Query(pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
     user=Depends(get_current_user),
 ):
-    require_superiqfoam_monthly_sheet_access(user)
+    require_monthly_chemical_sheet_access(user)
     start = f"{month}-01"
     end = f"{month}-{calendar.monthrange(int(month[:4]), int(month[5:7]))[1]:02d}"
     records = await db.grvs.find(
@@ -3514,10 +3601,15 @@ async def validate_monthly_sheet_arrival_sources(month, sources):
 
 
 @api.put("/production/monthly-chemical-sheet")
+@api.put("/warehouses/production-chemical-balance")
 async def save_monthly_chemical_sheet(body: MonthlyChemicalSheetIn, user=Depends(get_current_user)):
-    require_superiqfoam_monthly_sheet_access(user)
-    require_global_owner(user)
-    sheet_id = f"monthly-chemical-sheet:{body.month}"
+    require_monthly_chemical_sheet_access(user)
+    company_id = user.get("_active_company_id")
+    if company_id == DEFAULT_COMPANY_ID:
+        require_global_owner(user)
+    else:
+        require_profile_owner(user)
+    sheet_id = monthly_chemical_sheet_id(company_id, body.month)
     timestamp = now_iso()
     values = body.model_dump()
     values["arrival_sources"] = await validate_monthly_sheet_arrival_sources(
@@ -7409,6 +7501,7 @@ def product_sku(company_id, product_id):
         "superiqfoam": "SFO",
         "iqfoam-manufactoring": "MFG",
         "iqfoam-whole-sallers": "WHL",
+        IMRAAN_PLASTICS_COMPANY_ID: "IMP",
     }
     prefix = prefixes.get(company_id)
     if not prefix or not product_id:
@@ -8726,6 +8819,16 @@ class DepartmentIn(BaseModel):
 @api.get("/departments")
 async def get_departments(user=Depends(get_current_user)):
     saved = await listall("departments", sort=("name", 1))
+    company_id = user.get("_active_company_id") or user.get("company_id")
+    if company_id == IMRAAN_PLASTICS_COMPANY_ID:
+        return sorted(
+            {
+                str(item.get("name") or "").strip()
+                for item in saved
+                if item.get("worker_department") and str(item.get("name") or "").strip()
+            },
+            key=str.casefold,
+        )
     employees = await listall("employees")
     names = {
         str(item.get("name") or "").strip()
@@ -8742,6 +8845,7 @@ async def get_departments(user=Depends(get_current_user)):
 @api.post("/departments")
 async def add_department(body: DepartmentIn, user=Depends(get_current_user)):
     require_admin(user)
+    company_id = user.get("_active_company_id") or user.get("company_id")
     name = body.name
     existing = await listall("departments")
     match = next(
@@ -8749,8 +8853,13 @@ async def add_department(body: DepartmentIn, user=Depends(get_current_user)):
         None,
     )
     if match:
+        if company_id == IMRAAN_PLASTICS_COMPANY_ID and not match.get("worker_department"):
+            return await update_doc("departments", match["id"], {"worker_department": True})
         return match
-    return await insert("departments", {"name": name})
+    return await insert("departments", {
+        "name": name,
+        **({"worker_department": True} if company_id == IMRAAN_PLASTICS_COMPANY_ID else {}),
+    })
 
 @api.get("/employees")
 async def get_employees(user=Depends(get_current_user)):
@@ -8767,11 +8876,12 @@ def validate_payroll_roster_company(user):
 
 def validate_employee_worker_type(body, user):
     company_id = user.get("_active_company_id") or user.get("company_id")
-    if company_id != "iqfoam-whole-sallers":
-        if body.is_general_worker:
-            raise HTTPException(400, "General workers are only available for IQ Foam Wholesalers")
-        if body.is_plastic_cleaning or body.is_machine_work or body.is_plastic_cutting:
-            raise HTTPException(400, "Plastic work categories are only available for IQ Foam Wholesalers")
+    if company_id != "iqfoam-whole-sallers" and body.is_general_worker:
+        raise HTTPException(400, "General workers are only available for IQ Foam Wholesalers")
+    if company_id != "imraan-plastics" and (
+        body.is_plastic_cleaning or body.is_machine_work or body.is_plastic_cutting
+    ):
+        raise HTTPException(400, "Plastic work categories are only available for Imraan Plastics")
 
 @api.post("/employees/import-roster")
 async def import_employee_roster(user=Depends(get_current_user)):
@@ -11539,13 +11649,16 @@ INTERFACE_NAV_GROUPS = {
     "operations": ("stock", "fleet"),
     "company-inventory": ("company-inventory",),
     "production": ("production", "superiqfoam-monthly-sheet"),
-    "warehouses": ("warehouse-a", "warehouse-b", "warehouse-c", "warehouse-chemical", "warehouse-chemical-inventory"),
+    "warehouses": ("warehouse-a", "warehouse-b", "warehouse-c"),
     "finance-team": ("expenses", "daily-report", "attendance"),
     "administration": ("settings",),
 }
 INTERFACE_SECTIONS = {
     section for sections in INTERFACE_NAV_GROUPS.values() for section in sections
-} | {"chemicals-quantity", "chemical-usage-log"}
+} | {
+    "chemicals-quantity", "chemical-usage-log",
+    "warehouse-chemical", "warehouse-chemical-inventory",
+}
 INTERFACE_CUSTOM_LINKS = {
     "/": "dashboard",
     "/customers": "customers",
@@ -11563,6 +11676,7 @@ INTERFACE_CUSTOM_LINKS = {
     "/company-inventory": "company-inventory",
     "/production": "production",
     "/production/monthly-sheet": "superiqfoam-monthly-sheet",
+    "/warehouses/production-chemical-balance": "warehouse-a",
     "/warehouses/chemical-inventory": "chemicals-quantity",
     "/warehouses/chemical": "chemical-usage-log",
     "/warehouses/A": "warehouse-a",
@@ -11576,6 +11690,9 @@ INTERFACE_CUSTOM_LINKS = {
 INTERFACE_CUSTOM_LINK_COMPANIES = {
     "/production": {"superiqfoam"},
     "/production/monthly-sheet": {"superiqfoam"},
+    "/warehouses/production-chemical-balance": {"iqfoam-manufactoring"},
+    "/warehouses/chemical-inventory": {"superiqfoam"},
+    "/warehouses/chemical": {"superiqfoam"},
     "/warehouses/A": {"iqfoam-manufactoring"},
     "/warehouses/B": {"iqfoam-manufactoring"},
     "/warehouses/C": {"iqfoam-manufactoring"},
@@ -11643,6 +11760,11 @@ def normalize_interface_config(config, company_id=None, allow_legacy_fields=Fals
                     min(first_legacy_index, len(custom_order)),
                     "superiqfoam-monthly-sheet",
                 )
+        if group == "warehouses" and isinstance(custom_order, list):
+            removed_chemical_sections = {"warehouse-chemical", "warehouse-chemical-inventory"}
+            custom_order = [
+                section for section in custom_order if section not in removed_chemical_sections
+            ]
         if not isinstance(custom_order, list) or any(
             not isinstance(section, str) or section not in sections
             for section in custom_order
@@ -18027,13 +18149,19 @@ async def seed():
             logging.warning(f"Index on {coll} not created: {e}")
     await db.audit_log.create_index([("company_id", 1), ("entity", 1), ("entity_id", 1)])
 
-async def initialize_multi_company():
+async def initialize_company_profiles():
     for profile in COMPANY_PROFILES:
         await base_db.companies.update_one(
             {"id": profile["id"]},
-            {"$setOnInsert": {**profile, "active": True, "created_at": now_iso()}},
+            {
+                "$set": {"active": True},
+                "$setOnInsert": {**profile, "created_at": now_iso()},
+            },
             upsert=True,
         )
+
+async def initialize_multi_company():
+    await initialize_company_profiles()
 
     owner_email = canonical_email(os.environ["ADMIN_EMAIL"])
     owner = await base_db.users.find_one({"email": owner_email}, {"_id": 0})
