@@ -8567,6 +8567,17 @@ def right_stock_canonical_product(product):
     return " ".join(str(product or "").split())
 
 
+def validate_right_stock_matches(stock_items):
+    matches = []
+    for product, size, target_quantity in RIGHT_STOCK_UPDATE_ITEMS:
+        found = [
+            item for item in stock_items
+            if match_right_stock_item(item, product, size)
+        ]
+        matches.append((product, size, target_quantity, found))
+    return matches
+
+
 def daily_stock_identity_key(product, size):
     return f"{right_stock_product_key(right_stock_canonical_product(product))}|{right_stock_size_key(size)}"
 
@@ -14692,7 +14703,6 @@ async def _grv_items_from_request(
         raise HTTPException(400, "Add at least one product to the GRV")
 
     result = []
-    new_product_keys = set()
     for line in requested_items:
         data = line.model_dump() if isinstance(line, GRVLineIn) else dict(line)
         po_index = data.get("purchase_order_item_index")
@@ -14737,11 +14747,6 @@ async def _grv_items_from_request(
                 if stock:
                     is_new_product = False
                     stock_id = stock["id"]
-                else:
-                    new_product_key = (product.casefold(), canonical_price_size(size).casefold())
-                    if new_product_key in new_product_keys:
-                        raise HTTPException(400, "A new product and size can appear only once in the GRV")
-                    new_product_keys.add(new_product_key)
             else:
                 stock = await db.stock.find_one({"id": stock_id}, {"_id": 0}) if stock_id else None
             if not is_new_product and not stock and product and size:
