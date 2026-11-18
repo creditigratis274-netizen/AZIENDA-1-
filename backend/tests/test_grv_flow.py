@@ -284,6 +284,127 @@ def test_partial_grvs_update_po_and_stock_once_without_creating_buyings(monkeypa
     asyncio.run(scenario())
 
 
+def test_intercompany_invoice_grv_creates_new_stock_without_inventing_sale_prices(monkeypatch):
+    fake_db = FakeDatabase()
+    _install_fake_grv_dependencies(monkeypatch, fake_db)
+    monkeypatch.setattr(server, "base_db", type("SharedDatabase", (), {
+        "intercompany_order_requests": FakeCollection([{
+            "id": "request-1",
+            "invoice_id": "invoice-1",
+            "requesting_company_id": "test-company",
+            "invoice_sent": True,
+        }]),
+    })())
+    user = {
+        "email": "receiver@example.test",
+        "name": "Receiver",
+        "_active_company_id": "test-company",
+    }
+
+    async def scenario():
+        draft = await server.create_grv(server.GRVIn(
+            purpose="selling",
+            supplier_name="Intercompany supplier",
+            source_intercompany_invoice_id="invoice-1",
+            source_intercompany_category="selling_product",
+            received_date="2026-10-29",
+            items=[server.GRVLineIn(
+                new_product=True,
+                product="New foam",
+                size="900x50",
+                actual_received_quantity=3,
+                accepted_quantity=3,
+                unit_cost=85,
+            )],
+        ), user)
+        assert draft["status"] == "draft"
+        assert draft["source_intercompany_invoice_id"] == "invoice-1"
+        assert draft["source_intercompany_category"] == "selling_product"
+
+        confirmed = await server.confirm_grv(draft["id"], user)
+        assert confirmed["status"] == "completed"
+        assert any(
+            item["product"] == "New foam" and item["size"] == "900x50"
+            for item in fake_db.stock.documents
+        )
+        assert fake_db.prices.documents == []
+        assert sum(item["quantity"] for item in fake_db.stock_movements.documents) == 3
+
+        duplicate = await server.create_grv(server.GRVIn(
+            purpose="selling",
+            supplier_name="Intercompany supplier",
+            source_intercompany_invoice_id="invoice-1",
+            source_intercompany_category="selling_product",
+            received_date="2026-10-29",
+            items=[],
+        ), user)
+        assert duplicate["id"] == draft["id"]
+        assert len(fake_db.grvs.documents) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("category", "is_chemical", "line", "target_collection", "target_field"),
+    [
+        (
+            "raw_material", False,
+            {"product": "Glue", "size": "25", "unit": "kg", "category": "Glue"},
+            "company_inventory", "loose_units",
+        ),
+        (
+            "chemical", True,
+            {"product": "Resin", "size": "25", "unit": "L", "container_type": "Barrel"},
+            "chemical_inventory", "count",
+        ),
+    ],
+)
+def test_intercompany_invoice_raw_and_chemical_grvs_post_to_their_inventory(
+    monkeypatch, category, is_chemical, line, target_collection, target_field,
+):
+    fake_db = FakeDatabase()
+    _install_fake_grv_dependencies(monkeypatch, fake_db)
+    monkeypatch.setattr(server, "base_db", type("SharedDatabase", (), {
+        "intercompany_order_requests": FakeCollection([{
+            "id": "request-1",
+            "invoice_id": "invoice-1",
+            "requesting_company_id": "superiqfoam",
+            "invoice_sent": True,
+        }]),
+    })())
+    user = {
+        "email": "receiver@example.test",
+        "name": "Receiver",
+        "_active_company_id": "superiqfoam",
+    }
+
+    async def scenario():
+        company_context = server.active_company_id.set("superiqfoam")
+        try:
+            draft = await server.create_grv(server.GRVIn(
+                purpose="raw_material",
+                is_chemical=is_chemical,
+                supplier_name="Intercompany supplier",
+                source_intercompany_invoice_id="invoice-1",
+                source_intercompany_category=category,
+                received_date="2026-10-29",
+                items=[server.GRVLineIn(
+                    **line,
+                    actual_received_quantity=4,
+                    accepted_quantity=4,
+                    unit_cost=12,
+                )],
+            ), user)
+            confirmed = await server.confirm_grv(draft["id"], user)
+            assert confirmed["status"] == "completed"
+            target = fake_db[target_collection].documents[0]
+            assert target[target_field] == 4
+        finally:
+            server.active_company_id.reset(company_context)
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("initial_status", ["completed", "reversing"])
 def test_grv_reversal_batches_stock_history_reads_and_retries_interrupted_reversals(
     monkeypatch, initial_status,

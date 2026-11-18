@@ -605,7 +605,10 @@ export default function GRV() {
     try {
       if (action === "confirm") {
         await api.post(`/grvs/${grv.id}/confirm`, {});
-        toast.success("GRV confirmed and accepted quantities added to Stock");
+        const destination = grv.purpose === "raw_material"
+          ? grv.is_chemical ? "Chemical Inventory" : "Company Inventory"
+          : "Stock";
+        toast.success(`GRV confirmed and accepted quantities added to ${destination}`);
         try {
           setStock(await api.getUncached("/stock"));
         } catch (error) {
@@ -664,7 +667,7 @@ export default function GRV() {
 
   return (
     <div className="space-y-5" data-testid="grv-page">
-      <PageHeader title="Goods Received Vouchers" subtitle="Inspect supplier deliveries and post accepted quantities to Stock">
+      <PageHeader title="Goods Received Vouchers" subtitle="Inspect supplier deliveries and post accepted quantities to the correct inventory">
         <Btn variant="outline" onClick={refresh} disabled={records === null} data-testid="grv-refresh"><RefreshCw size={16} /> Refresh</Btn>
         <Btn onClick={() => {
           setScanReceivingMode(false);
@@ -1037,7 +1040,7 @@ export default function GRV() {
             <p><span className="font-semibold">Supplier:</span> {viewTarget.supplier_name || "-"}</p>
             <p><span className="font-semibold">Received:</span> {fmtDate(viewTarget.received_date)}</p>
             <p><span className="font-semibold">Status:</span> {statusLabel(viewTarget.status)}</p>
-            <p><span className="font-semibold">Type:</span> {viewTarget.purpose === "raw_material" ? "Company Inventory" : "Selling / Stock"}</p>
+            <p><span className="font-semibold">Type:</span> {viewTarget.purpose === "raw_material" ? viewTarget.is_chemical ? "Chemical Inventory" : "Company Inventory" : "Selling / Stock"}</p>
           </div>
           <div
             className="grv-horizontal-scroll min-w-0 max-w-full overflow-x-auto overscroll-x-contain touch-pan-x rounded border border-border"

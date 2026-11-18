@@ -229,6 +229,20 @@ export default function Layout() {
     }
   };
   useEffect(() => { if (user?.company_id) loadNotifications(); }, [user?.company_id]);
+  useEffect(() => {
+    if (!user?.company_id) return undefined;
+    const refreshVisibleNotifications = () => {
+      if (document.visibilityState === "visible") loadNotifications(true);
+    };
+    const interval = window.setInterval(refreshVisibleNotifications, 30000);
+    window.addEventListener("focus", refreshVisibleNotifications);
+    document.addEventListener("visibilitychange", refreshVisibleNotifications);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", refreshVisibleNotifications);
+      document.removeEventListener("visibilitychange", refreshVisibleNotifications);
+    };
+  }, [user?.company_id]);
   const dismissNotification = async (event, notification) => {
     event.stopPropagation();
     if (dismissingNotificationIds.includes(notification.id)) return;

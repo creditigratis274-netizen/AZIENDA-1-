@@ -10303,7 +10303,7 @@ async def notify_intercompany_company(company_id, event_key, title, message, act
     ).to_list(None)
     recipients = {
         account["id"]: account
-        for account in fleet_notification_recipients(accounts, company_id)
+        for account in intercompany_notification_recipients(accounts, company_id)
     }
     for user_id in extra_user_ids:
         account = next((item for item in accounts if item.get("id") == user_id), None)
@@ -10375,6 +10375,14 @@ def public_intercompany_request(request, company_id):
         for key in ("invoice_id", "invoice_number", "invoice_total", "invoice_date", "sent_at"):
             result.pop(key, None)
     return result
+
+def intercompany_notification_recipients(accounts, company_id):
+    return [
+        account for account in accounts
+        if account.get("active", True) is not False
+        and not account.get("is_worker")
+        and company_role(account, company_id) in ("owner", "admin")
+    ]
 
 @api.get("/intercompany/products")
 async def get_intercompany_products(
@@ -12950,6 +12958,8 @@ class GRVLineIn(BaseModel):
 class GRVIn(BaseModel):
     purpose: str = "selling"
     is_chemical: bool = False
+    source_intercompany_invoice_id: Optional[str] = ""
+    source_intercompany_category: Optional[str] = ""
     vat_rate: float = Field(default=0, ge=0, le=100)
     supplier_id: Optional[str] = ""
     supplier_name: Optional[str] = ""
@@ -14003,6 +14013,27 @@ async def get_grvs(
 @api.post("/grvs")
 async def create_grv(body: GRVIn, user=Depends(get_current_user)):
     _validate_grv_date(body.received_date)
+    source_intercompany_invoice_id = (body.source_intercompany_invoice_id or "").strip()
+    source_intercompany_category = (body.source_intercompany_category or "").strip()
+    if source_intercompany_invoice_id and source_intercompany_category not in (
+        "selling_product", "raw_material", "chemical",
+    ):
+        raise HTTPException(400, "Choose a valid intercompany GRV category")
+    if source_intercompany_invoice_id:
+        company_id = active_company_id.get() or user.get("_active_company_id")
+        invoice_request = await base_db.intercompany_order_requests.find_one({
+            "invoice_id": source_intercompany_invoice_id,
+            "requesting_company_id": company_id,
+            "invoice_sent": True,
+        }, {"_id": 0})
+        if not invoice_request:
+            raise HTTPException(404, "Sent intercompany invoice not found for the active company")
+        existing = await db.grvs.find_one({
+            "source_intercompany_invoice_id": source_intercompany_invoice_id,
+            "source_intercompany_category": source_intercompany_category,
+        }, {"_id": 0})
+        if existing:
+            return existing
     purchase_order_id = (body.purchase_order_id or "").strip()
     purchase_order = None
     if purchase_order_id:
@@ -14046,6 +14077,8 @@ async def create_grv(body: GRVIn, user=Depends(get_current_user)):
         "vat_rate": body.vat_rate,
         "purpose": purpose,
         "is_chemical": bool(body.is_chemical) if purpose == "raw_material" else False,
+        "source_intercompany_invoice_id": source_intercompany_invoice_id,
+        "source_intercompany_category": source_intercompany_category,
         "status": "draft",
         "created_by": user["email"],
         "edited_by": user["email"],
@@ -14101,6 +14134,14 @@ async def edit_grv(grv_id: str, body: GRVIn, user=Depends(get_current_user)):
         "vat_rate": body.vat_rate,
         "purpose": purpose,
         "is_chemical": bool(body.is_chemical) if purpose == "raw_material" else False,
+        "source_intercompany_invoice_id": (
+            (body.source_intercompany_invoice_id or "").strip()
+            or before.get("source_intercompany_invoice_id", "")
+        ),
+        "source_intercompany_category": (
+            (body.source_intercompany_category or "").strip()
+            or before.get("source_intercompany_category", "")
+        ),
         "edited_by": user["email"],
         "audit": audit,
     }
@@ -14163,7 +14204,9 @@ async def confirm_grv(grv_id: str, user=Depends(get_current_user)):
         _grv_sale_price_updates(
             price_check_items,
             user,
-            require_new_product_prices=not bool(grv.get("source_buying_id")),
+            require_new_product_prices=not bool(
+                grv.get("source_buying_id") or grv.get("source_intercompany_invoice_id")
+            ),
         )
         if grv.get("purpose") != "raw_material" else []
     )

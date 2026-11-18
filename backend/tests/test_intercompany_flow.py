@@ -213,6 +213,33 @@ def test_request_access_is_company_scoped_and_invoice_details_are_hidden_until_s
     assert server.public_intercompany_request(request, "superiqfoam")["invoice_id"] == "invoice-1"
 
 
+def test_intercompany_notifications_reach_admins_authorized_for_the_supplier_company():
+    accounts = [
+        {"id": "manufacturing-admin", "company_roles": {"iqfoam-manufactoring": "admin"}},
+        {"id": "manufacturing-user", "company_roles": {"iqfoam-manufactoring": "user"}},
+        {"id": "other-company-admin", "company_roles": {"superiqfoam": "admin"}},
+        {"id": "wholesaler-admin", "company_roles": {"iqfoam-whole-sallers": "admin"}},
+        {
+            "id": "manufacturing-worker",
+            "company_roles": {"iqfoam-manufactoring": "admin"},
+            "is_worker": True,
+        },
+        {
+            "id": "inactive-admin",
+            "company_roles": {"iqfoam-manufactoring": "admin"},
+            "active": False,
+        },
+    ]
+
+    recipients = server.intercompany_notification_recipients(
+        accounts, "iqfoam-manufactoring",
+    )
+
+    assert {account["id"] for account in recipients} == {
+        "manufacturing-admin", "wholesaler-admin",
+    }
+
+
 def test_acceptance_rejects_unreviewed_or_insufficient_stock_without_mutation(monkeypatch):
     request = {
         "id": "ICR-2",
