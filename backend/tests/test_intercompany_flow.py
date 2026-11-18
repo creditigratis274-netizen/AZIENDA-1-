@@ -85,7 +85,14 @@ class Database:
         return self.collections[name]
 
 
-def test_request_creation_snapshots_only_supplier_stock_and_rejects_duplicate_lines(monkeypatch):
+@pytest.mark.parametrize(
+    "user",
+    [
+        {"id": "requester", "role": "owner"},
+        {"id": "requester-admin", "company_roles": {"superiqfoam": "admin"}},
+    ],
+)
+def test_request_creation_snapshots_only_supplier_stock_and_rejects_duplicate_lines(monkeypatch, user):
     supplier_db = Database(stock=Collection([{
         "id": "supplier-stock-1",
         "company_id": "iqfoam-whole-sallers",
@@ -105,7 +112,6 @@ def test_request_creation_snapshots_only_supplier_stock_and_rejects_duplicate_li
     )
     monkeypatch.setattr(server, "notify_intercompany_company", lambda *_args, **_kwargs: asyncio.sleep(0))
     company_token = server.active_company_id.set("superiqfoam")
-    user = {"id": "requester", "role": "owner"}
     try:
         body = server.IntercompanyOrderRequestIn(
             supplying_company_id="iqfoam-whole-sallers",
@@ -191,7 +197,7 @@ def test_request_access_is_company_scoped_and_invoice_details_are_hidden_until_s
     }
     shared_db = Database(intercompany_order_requests=Collection([request]))
     monkeypatch.setattr(server, "base_db", shared_db)
-    user = {"id": "owner", "role": "owner"}
+    user = {"id": "requester-admin", "company_roles": {"superiqfoam": "admin"}}
     company_token = server.active_company_id.set("superiqfoam")
     try:
         visible = asyncio.run(server.get_intercompany_request("ICR-1", user))
@@ -205,7 +211,7 @@ def test_request_access_is_company_scoped_and_invoice_details_are_hidden_until_s
     try:
         with pytest.raises(HTTPException) as error:
             asyncio.run(server.get_intercompany_request("ICR-1", user))
-        assert error.value.status_code == 404
+        assert error.value.status_code == 403
     finally:
         server.active_company_id.reset(company_token)
 
