@@ -33,6 +33,12 @@ function companyName(id) {
 
 function intercompanyError(error) {
   const detail = error.response?.data?.detail;
+  if (detail?.code === "INSUFFICIENT_STOCK" && Array.isArray(detail.items)) {
+    const shortages = detail.items.map((item) =>
+      `${item.product} ${item.size}: ${item.available} available, ${item.requested} requested`,
+    );
+    return ["Insufficient stock to create the invoice.", ...shortages].join(" ");
+  }
   if (!detail || typeof detail !== "object" || typeof detail.message !== "string") {
     return apiError(error);
   }
@@ -120,7 +126,9 @@ export default function Intercompany() {
   useEffect(() => {
     if (!companyId) return undefined;
     const refreshVisibleRequests = () => {
-      if (document.visibilityState === "visible") loadRequests(requestPage);
+      if (document.visibilityState === "visible") {
+        loadRequests(requestPage);
+      }
     };
     const interval = window.setInterval(refreshVisibleRequests, 30000);
     window.addEventListener("focus", refreshVisibleRequests);
@@ -463,9 +471,14 @@ export default function Intercompany() {
             Request products from another company. The supplier reviews each request, and invoices use the supplier's saved price list.
           </p>
         </div>
-        <button type="button" onClick={() => loadRequests()} disabled={loading} className="inline-flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-sm font-semibold text-foreground shadow-sm hover:bg-muted disabled:opacity-50" data-testid="intercompany-refresh">
-          <RefreshCw size={16} /> Refresh
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <button type="button" onClick={() => navigate("/invoices/new?sendToCompany=1")} className="inline-flex items-center gap-2 rounded-lg bg-emerald-700 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-emerald-800" data-testid="intercompany-send-without-request">
+            <Send size={16} /> No request? Create and send an invoice
+          </button>
+          <button type="button" onClick={() => loadRequests()} disabled={loading} className="inline-flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-sm font-semibold text-foreground shadow-sm hover:bg-muted disabled:opacity-50" data-testid="intercompany-refresh">
+            <RefreshCw size={16} /> Refresh
+          </button>
+        </div>
       </header>
 
       <div className="grid min-w-0 items-start gap-6 xl:grid-cols-[minmax(20rem,0.88fr)_minmax(0,1.62fr)]">
@@ -598,7 +611,7 @@ export default function Intercompany() {
       {selectedRequest && <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/50 p-4" role="dialog" aria-modal="true" aria-labelledby="intercompany-detail-title">
         <div className="max-h-[90vh] w-full max-w-5xl overflow-auto rounded-xl bg-white p-5 shadow-xl">
           <div className="flex items-start justify-between gap-3">
-            <div><h2 id="intercompany-detail-title" className="text-lg font-bold">{selectedRequest.invoice_details ? `Intercompany invoice ${selectedRequest.invoice_details.invoice.number || ""}` : "Request details"}</h2><p className="mt-1 text-sm text-slate-500">{companyName(selectedRequest.requesting_company_id)} → {companyName(selectedRequest.supplying_company_id)}</p></div>
+            <div><h2 id="intercompany-detail-title" className="text-lg font-bold">{selectedRequest.invoice_details ? `Intercompany invoice ${selectedRequest.invoice_details.invoice.number || ""}` : "Request details"}</h2><p className="mt-1 text-sm text-slate-500">{selectedRequest.source === "direct" ? `${companyName(selectedRequest.supplying_company_id)} → ${companyName(selectedRequest.requesting_company_id)}` : `${companyName(selectedRequest.requesting_company_id)} → ${companyName(selectedRequest.supplying_company_id)}`}</p></div>
             <button type="button" onClick={() => { setSelectedRequest(null); setGrvAssignments(null); }} className="rounded-md border px-3 py-1.5 text-sm">Close</button>
           </div>
           {!selectedRequest.invoice_details && <>

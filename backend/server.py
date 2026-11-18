@@ -213,6 +213,12 @@ def worker_restrictions_apply(user):
     return user.get("is_worker") and user.get("_active_role") not in ("admin", "owner")
 
 
+def worker_display_name(user):
+    return str(
+        user.get("name") or user.get("username") or user.get("email") or ""
+    ).strip()
+
+
 def can_view_stock_costs(user):
     return user.get("role") == "owner" or user.get("_active_role") == "owner"
 
@@ -6448,7 +6454,11 @@ async def _prepare_invoice(body: InvoiceIn, user=None, existing=None):
             if existing.get("made_by_user_id"):
                 inv["made_by_user_id"] = existing["made_by_user_id"]
     else:
-        made_by = (body.made_by or "").strip()
+        made_by = (
+            worker_display_name(user)
+            if user and user.get("is_worker")
+            else (body.made_by or "").strip()
+        )
         if not made_by:
             raise HTTPException(400, "Made By is required")
         inv["made_by"] = made_by
@@ -7392,6 +7402,82 @@ class StockIn(BaseModel):
         return value
 
 
+RIGHT_STOCK_UPDATE_ITEMS = [
+    ("Simple", "760x50", 150),
+    ("Simple", "760x75", 305),
+    ("Simple", "760x100", 200),
+    ("Simple", "760x120", 410),
+    ("Simple", "760x150", 120),
+    ("Simple", "910x50", 345),
+    ("Simple", "910x75", 535),
+    ("Simple", "910x100", 420),
+    ("Simple", "910x120", 340),
+    ("Simple", "910x150", 170),
+    ("Simple", "1070x50", 175),
+    ("Simple", "1070x75", 340),
+    ("Simple", "1070x100", 320),
+    ("Simple", "1070x120", 335),
+    ("Simple", "1070x150", 80),
+    ("Simple", "1370x50", 110),
+    ("Simple", "1370x75", 99),
+    ("Simple", "1370x100", 185),
+    ("Simple", "1370x120", 5),
+    ("Simple", "1370x150", 105),
+    ("Ribbon Black", "760x100", 25),
+    ("Ribbon Black", "760x120", 0),
+    ("Ribbon Black", "760x150", 0),
+    ("Ribbon Black", "910x100", 0),
+    ("Ribbon Black", "910x120", 45),
+    ("Ribbon Black", "910x150", 0),
+    ("Ribbon Black", "1070x100", 115),
+    ("Ribbon Black", "1070x120", 85),
+    ("Ribbon Black", "1070x150", -20),
+    ("Ribbon Black", "1370x100", 0),
+    ("Ribbon Black", "1370x120", -10),
+    ("Ribbon Black", "1370x150", 0),
+    ("Ribbon Pink", "760x100", 20),
+    ("Ribbon Pink", "760x120", 0),
+    ("Ribbon Pink", "760x150", 0),
+    ("Ribbon Pink", "910x100", 55),
+    ("Ribbon Pink", "910x120", 10),
+    ("Ribbon Pink", "910x150", 0),
+    ("Ribbon Pink", "1070x100", 25),
+    ("Ribbon Pink", "1070x120", 52),
+    ("Ribbon Pink", "1070x150", 0),
+    ("Ribbon Pink", "1370x100", 25),
+    ("Ribbon Pink", "1370x120", 35),
+    ("Ribbon Pink", "1370x150", 0),
+    ("Candy", "760x100", 10),
+    ("Candy", "760x120", 0),
+    ("Candy", "760x150", 0),
+    ("Candy", "910x100", 5),
+    ("Candy", "910x120", 0),
+    ("Candy", "910x150", 0),
+    ("Candy", "1070x100", 0),
+    ("Candy", "1070x120", 10),
+    ("Candy", "1070x150", 0),
+    ("Candy", "1370x100", 0),
+    ("Candy", "1370x120", 0),
+    ("Candy", "1370x150", 0),
+    ("Strong Boy", "760x125", 0),
+    ("Strong Boy", "910x125", 0),
+    ("Strong Boy", "1070x125", 0),
+    ("Strong Boy", "1370x125", 15),
+    ("Uncovered", "910x100", 0),
+    ("Uncovered", "1070x100", 0),
+    ("White Drum", "1000L", -12),
+]
+RIGHT_STOCK_PRODUCT_ALIASES = {
+    "simple": {"simple", "standard", "simplemixcolor", "mixcolor"},
+    "ribbon black": {"ribbon black", "ribbon balck", "black"},
+    "ribbon pink": {"ribbon pink", "ribbon"},
+    "strong boy": {"strong boy"},
+    "uncovered": {"uncovered", "uncovered blue 16 density", "uncovered (blue 16 density)"},
+    "white drum": {"white drum"},
+    "candy": {"candy"},
+}
+
+
 def valid_ean13(value):
     if not isinstance(value, str) or not re.fullmatch(r"[0-9]{13}", value):
         return False
@@ -8219,36 +8305,75 @@ def invoice_stock_size_key(value):
 
 async def invoice_stock_deductions(invoice, allow_empty=False):
     stock_items = await listall("stock")
-    stock_by_product_size = {
-        (
-            invoice_stock_text_key(item.get("product")),
-            invoice_stock_size_key(item.get("size")),
-        ): item
-        for item in stock_items
-    }
+    stock_by_product_size = {}
+    for stock in stock_items:
+        key = (
+            invoice_stock_text_key(stock.get("product")),
+            invoice_stock_size_key(stock.get("size")),
+        )
+        stock_by_product_size.setdefault(key, []).append(stock)
     quantities = {}
+    current_by_stock = {}
     for index, item in enumerate(invoice.get("items", []), 1):
         products = invoice_stock_product_aliases(item)
         size = (item.get("size") or "").strip()
         if not products[0] or not size:
             continue
         normalized_size = invoice_stock_size_key(size)
-        stock = next(
-            (
-                stock_by_product_size.get((invoice_stock_text_key(product), normalized_size))
-                for product in products
-                if stock_by_product_size.get((invoice_stock_text_key(product), normalized_size))
-            ),
-            None,
-        )
-        if not stock:
+        candidates = []
+        seen_stock_ids = set()
+        for product in products:
+            for stock in stock_by_product_size.get(
+                (invoice_stock_text_key(product), normalized_size), [],
+            ):
+                if stock["id"] not in seen_stock_ids:
+                    candidates.append(stock)
+                    seen_stock_ids.add(stock["id"])
+        if not candidates:
             raise HTTPException(400, f"Stock item not found for invoice line {index}: {products[0]} {size}")
         quantity = D(item.get("qty", 0))
         if quantity <= 0:
             raise HTTPException(400, f"Invoice line {index} quantity must be greater than 0")
-        entry = quantities.setdefault(stock["id"], {"stock_id": stock["id"], "product": stock["product"],
-                                                     "size": stock["size"], "quantity": Decimal("0")})
-        entry["quantity"] += quantity
+        if len(candidates) == 1:
+            stock = candidates[0]
+            entry = quantities.setdefault(stock["id"], {
+                "stock_id": stock["id"],
+                "product": stock["product"],
+                "size": stock["size"],
+                "quantity": Decimal("0"),
+            })
+            entry["quantity"] += quantity
+            continue
+        for stock in candidates:
+            if stock["id"] not in current_by_stock:
+                await stock_current(stock)
+                current_by_stock[stock["id"]] = D(stock["current"])
+        candidates.sort(
+            key=lambda stock: current_by_stock[stock["id"]]
+            - quantities.get(stock["id"], {}).get("quantity", Decimal("0")),
+            reverse=True,
+        )
+        remaining = quantity
+        for stock in candidates:
+            entry = quantities.setdefault(stock["id"], {
+                "stock_id": stock["id"],
+                "product": stock["product"],
+                "size": stock["size"],
+                "quantity": Decimal("0"),
+            })
+            available = max(
+                Decimal("0"),
+                current_by_stock[stock["id"]] - entry["quantity"],
+            )
+            allocated = min(remaining, available)
+            if allocated > 0:
+                entry["quantity"] += allocated
+                remaining -= allocated
+            if remaining <= 0:
+                break
+        if remaining > 0:
+            stock = candidates[0]
+            quantities[stock["id"]]["quantity"] += remaining
     if not quantities and not allow_empty:
         raise HTTPException(400, "No invoice products match stock items to deduct")
     return list(quantities.values())
@@ -8375,6 +8500,551 @@ async def get_stock(user=Depends(get_current_user)):
     return [stock_for_user(item, user) for item in items]
 
 
+def right_stock_product_key(product):
+    return re.sub(r"[^a-z0-9]", "", str(product or "").casefold())
+
+
+def right_stock_size_key(size):
+    return re.sub(r"\s+", "", str(size or "")).casefold().replace("×", "x").replace("/", "x")
+
+
+def match_right_stock_item(stock, product, size):
+    aliases = RIGHT_STOCK_PRODUCT_ALIASES[product.casefold()]
+    return (
+        right_stock_product_key(stock.get("product")) in {
+            right_stock_product_key(alias) for alias in aliases
+        }
+        and right_stock_size_key(stock.get("size")) == right_stock_size_key(size)
+    )
+
+
+def right_stock_products_equivalent(left, right):
+    left_key = right_stock_product_key(left)
+    right_key = right_stock_product_key(right)
+    if left_key == right_key:
+        return True
+    for aliases in RIGHT_STOCK_PRODUCT_ALIASES.values():
+        alias_keys = {right_stock_product_key(alias) for alias in aliases}
+        if left_key in alias_keys and right_key in alias_keys:
+            return True
+    return False
+
+
+def same_stock_identity(stock, product, size, company_id):
+    if company_id == DEFAULT_COMPANY_ID:
+        return (
+            right_stock_products_equivalent(stock.get("product"), product)
+            and right_stock_size_key(stock.get("size")) == right_stock_size_key(size)
+        )
+    return (
+        str(stock.get("product", "")).strip().casefold() == str(product or "").strip().casefold()
+        and str(stock.get("size", "")).strip().casefold() == str(size or "").strip().casefold()
+    )
+
+
+async def find_stock_by_identity(product, size, company_id, *, exclude_id=None):
+    matches = [
+        item for item in await listall("stock")
+        if item.get("id") != exclude_id
+        and same_stock_identity(item, product, size, company_id)
+    ]
+    return max(matches, key=lambda item: str(item.get("created_at") or ""), default=None)
+
+
+def right_stock_canonical_product(product):
+    product_key = right_stock_product_key(product)
+    for canonical, aliases in RIGHT_STOCK_PRODUCT_ALIASES.items():
+        if product_key in {right_stock_product_key(alias) for alias in aliases}:
+            return {
+                "simple": "Simple",
+                "ribbon black": "Ribbon Black",
+                "ribbon pink": "Ribbon Pink",
+                "strong boy": "Strong Boy",
+                "uncovered": "Uncovered",
+                "white drum": "White Drum",
+                "candy": "Candy",
+            }[canonical]
+    return " ".join(str(product or "").split())
+
+
+def daily_stock_identity_key(product, size):
+    return f"{right_stock_product_key(right_stock_canonical_product(product))}|{right_stock_size_key(size)}"
+
+
+class DailyStockCountLine(BaseModel):
+    product: str = Field(min_length=1, max_length=120)
+    size: str = Field(min_length=1, max_length=80)
+    made_today: int = Field(default=0, ge=0)
+    quantity: Optional[float] = Field(default=None, ge=0)
+
+    @field_validator("made_today", "quantity")
+    @classmethod
+    def finite_count_quantity(cls, value):
+        if value is not None and not math.isfinite(value):
+            raise ValueError("Stock counts must be finite numbers")
+        return value
+
+
+class DailyStockReconciliationIn(BaseModel):
+    report_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    counts: List[DailyStockCountLine] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def unique_count_rows(self):
+        keys = [
+            daily_stock_identity_key(line.product, line.size)
+            for line in self.counts
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError("Each stock category and size can only be counted once")
+        return self
+
+
+def daily_stock_count_specs(stock_items):
+    specs = {}
+    for product, size, _quantity in RIGHT_STOCK_UPDATE_ITEMS:
+        canonical_product = right_stock_canonical_product(product)
+        key = daily_stock_identity_key(canonical_product, size)
+        specs.setdefault(key, {"product": canonical_product, "size": size, "records": []})
+    for stock in stock_items:
+        product = right_stock_canonical_product(stock.get("product"))
+        size = str(stock.get("size") or "").strip()
+        if not product or not size:
+            continue
+        key = daily_stock_identity_key(product, size)
+        specs.setdefault(key, {"product": product, "size": size, "records": []})
+        specs[key]["records"].append(stock)
+    return list(specs.values())
+
+
+def daily_stock_movement_summary(movements):
+    summary = {
+        "invoice_out": 0.0,
+        "dispatch_out": 0.0,
+        "other_out": 0.0,
+        "received_in": 0.0,
+        "production_in": 0.0,
+    }
+    for movement in movements:
+        quantity = float(movement.get("quantity") or 0)
+        direction = mov_sign(movement)
+        if movement.get("type") == "invoice" and direction < 0:
+            summary["invoice_out"] += quantity
+        elif movement.get("type") == "dispatch" and direction < 0:
+            summary["dispatch_out"] += quantity
+        elif movement.get("type") == "production":
+            summary["production_in"] += quantity * direction
+        elif direction > 0:
+            summary["received_in"] += quantity
+        else:
+            summary["other_out"] += quantity
+    return {key: r2(value) for key, value in summary.items()}
+
+
+async def daily_stock_reconciliation_data(report_date):
+    stock_items = await listall("stock")
+    specs = daily_stock_count_specs(stock_items)
+    stock_ids = [
+        stock["id"]
+        for spec in specs
+        for stock in spec["records"]
+    ]
+    movements_by_stock = await stock_movements_for_stock_ids(stock_ids)
+    movements_today = await listall("stock_movements", {"date": report_date})
+    movements_today_by_stock = {}
+    for movement in movements_today:
+        movements_today_by_stock.setdefault(movement.get("stock_id"), []).append(movement)
+
+    document_id = f"daily-stock-reconciliation:{report_date}"
+    saved = await db.stock_daily_reconciliations.find_one({"id": document_id}, {"_id": 0})
+    saved_counts = {
+        daily_stock_identity_key(line.get("product"), line.get("size")): line.get("quantity")
+        for line in (saved or {}).get("counts", [])
+    }
+    saved_production = {
+        daily_stock_identity_key(line.get("product"), line.get("size")): line.get("made_today", 0)
+        for line in (saved or {}).get("counts", [])
+    }
+    rows = []
+    summary_movements = []
+    for spec in specs:
+        row_movements = []
+        book_quantity = 0.0
+        for stock in spec["records"]:
+            stock_movements = movements_by_stock.get(stock["id"], [])
+            book_quantity += float(apply_stock_movements(dict(stock), stock_movements)["current"])
+            row_movements.extend(movements_today_by_stock.get(stock["id"], []))
+        summary_movements.extend(row_movements)
+        activity = daily_stock_movement_summary(row_movements)
+        key = daily_stock_identity_key(spec["product"], spec["size"])
+        rows.append({
+            "key": key,
+            "product": spec["product"],
+            "size": spec["size"],
+            "product_id": next(
+                (stock.get("product_id") or stock.get("code") for stock in spec["records"]
+                 if stock.get("product_id") or stock.get("code")),
+                "",
+            ),
+            "book_quantity": r2(book_quantity),
+            "quantity": saved_counts.get(key),
+            "made_today": saved_production.get(key, 0),
+            "invoice_out": activity["invoice_out"],
+            "dispatch_out": activity["dispatch_out"],
+            "other_out": activity["other_out"],
+            "received_in": activity["received_in"],
+        })
+    return {
+        "report_date": report_date,
+        "already_submitted": bool(saved),
+        "rows": rows,
+        "activity": daily_stock_movement_summary(summary_movements),
+    }
+
+
+async def get_daily_stock_reconciliation(user, report_date=None):
+    company_id = user.get("_active_company_id") or user.get("company_id")
+    if company_id != DEFAULT_COMPANY_ID:
+        raise HTTPException(403, "Daily stock reconciliation is only available in SuperIQFoam")
+    require_global_owner(user)
+    company_context = active_company_id.set(DEFAULT_COMPANY_ID)
+    try:
+        selected_date = report_date or today_str()
+        _validate_grv_date(selected_date)
+        if selected_date != today_str():
+            raise HTTPException(400, "Daily stock reconciliation is available for today only")
+        return await daily_stock_reconciliation_data(selected_date)
+    finally:
+        active_company_id.reset(company_context)
+
+
+@api.get("/stock/daily-reconciliation")
+async def get_daily_stock_reconciliation_route(
+    report_date: Optional[str] = None,
+    user=Depends(get_current_user),
+):
+    return await get_daily_stock_reconciliation(user, report_date)
+
+
+@api.post("/stock/update-right-stock")
+async def update_right_stock(user=Depends(get_current_user)):
+    company_id = user.get("_active_company_id") or user.get("company_id")
+    if company_id != DEFAULT_COMPANY_ID:
+        raise HTTPException(403, "Right stock update is only available in SuperIQFoam")
+    require_global_owner(user)
+
+    company_context = active_company_id.set(DEFAULT_COMPANY_ID)
+    try:
+        initial_stocks = await listall("stock")
+        initial_matches = {
+            (product, size): [
+                stock for stock in initial_stocks
+                if match_right_stock_item(stock, product, size)
+            ]
+            for product, size, _quantity in RIGHT_STOCK_UPDATE_ITEMS
+        }
+        initial_ids = sorted({
+            stock["id"]
+            for records in initial_matches.values()
+            for stock in records
+        })
+        async with StockLock(initial_ids):
+            stocks = await listall("stock")
+            matches = {
+                (product, size): [
+                    stock for stock in stocks
+                    if match_right_stock_item(stock, product, size)
+                ]
+                for product, size, _quantity in RIGHT_STOCK_UPDATE_ITEMS
+            }
+            current_ids = sorted({
+                stock["id"]
+                for records in matches.values()
+                for stock in records
+            })
+            if current_ids != initial_ids:
+                raise HTTPException(409, "Stock products changed while preparing the update. Reload and retry.")
+
+            movements_by_stock = await stock_movements_for_stock_ids(current_ids)
+            created_count = 0
+            adjusted_count = 0
+            duplicate_records_zeroed = 0
+            for product, size, target_quantity in RIGHT_STOCK_UPDATE_ITEMS:
+                records = matches[(product, size)]
+                if records:
+                    primary = max(
+                        records,
+                        key=lambda item: (
+                            str(item.get("created_at") or ""),
+                            str(item.get("id") or ""),
+                        ),
+                    )
+                else:
+                    primary = await insert("stock", {
+                        "product": product,
+                        "size": size,
+                        "opening": 0,
+                        "threshold": 0,
+                    })
+                    created_count += 1
+                    records = [primary]
+                    movements_by_stock[primary["id"]] = []
+
+                duplicate_records_zeroed += len(records) - 1
+                for stock in [primary, *(candidate for candidate in records if candidate is not primary)]:
+                    desired_quantity = target_quantity if stock is primary else 0
+                    current_quantity = float(apply_stock_movements(
+                        dict(stock), movements_by_stock.get(stock["id"], []),
+                    )["current"])
+                    delta = r2(desired_quantity - current_quantity)
+                    if not delta:
+                        continue
+                    movement = await post_movement(
+                        stock,
+                        "adjustment_in" if delta > 0 else "adjustment_out",
+                        abs(delta),
+                        user,
+                        reason="UPDATE RIGHT STOCK",
+                        reference="SuperIQFoam supplied stock count",
+                        notes=f"Set {product} {size} to the supplied quantity {target_quantity}.",
+                        allow_negative=True,
+                    )
+                    await log_audit(
+                        "stock_movement",
+                        movement["id"],
+                        "posted",
+                        user,
+                        after=movement,
+                        reason="UPDATE RIGHT STOCK",
+                    )
+                    movements_by_stock.setdefault(stock["id"], []).append(movement)
+                    adjusted_count += 1
+
+            totals_by_product = {}
+            for product, _size, quantity in RIGHT_STOCK_UPDATE_ITEMS:
+                totals_by_product[product] = totals_by_product.get(product, 0) + quantity
+            return {
+                "updated_items": len(RIGHT_STOCK_UPDATE_ITEMS),
+                "created_items": created_count,
+                "adjusted_items": adjusted_count,
+                "duplicate_records_zeroed": duplicate_records_zeroed,
+                "totals_by_product": totals_by_product,
+                "net_mattress_stock": sum(
+                    quantity
+                    for product, _size, quantity in RIGHT_STOCK_UPDATE_ITEMS
+                    if product != "White Drum"
+                ),
+            }
+    finally:
+        active_company_id.reset(company_context)
+
+
+@api.post("/stock/daily-reconciliation")
+async def update_daily_stock_reconciliation(
+    body: DailyStockReconciliationIn,
+    user=Depends(get_current_user),
+):
+    company_id = user.get("_active_company_id") or user.get("company_id")
+    if company_id != DEFAULT_COMPANY_ID:
+        raise HTTPException(403, "Daily stock reconciliation is only available in SuperIQFoam")
+    require_global_owner(user)
+    _validate_grv_date(body.report_date)
+    if body.report_date != today_str():
+        raise HTTPException(400, "Daily stock reconciliation is available for today only")
+
+    company_context = active_company_id.set(DEFAULT_COMPANY_ID)
+    try:
+        initial = await daily_stock_reconciliation_data(body.report_date)
+        expected = {row["key"]: row for row in initial["rows"]}
+        submitted = {
+            daily_stock_identity_key(line.product, line.size): line
+            for line in body.counts
+        }
+        missing = sorted(set(expected) - set(submitted))
+        unexpected = sorted(set(submitted) - set(expected))
+        if missing or unexpected:
+            raise HTTPException(422, {
+                "message": "Submit a daily entry for every listed stock category and size.",
+                "missing_count": len(missing),
+                "unexpected_count": len(unexpected),
+            })
+
+        initial_stock_specs = daily_stock_count_specs(await listall("stock"))
+        existing_ids = sorted(
+            stock["id"]
+            for spec in initial_stock_specs
+            for stock in spec["records"]
+        )
+        async with StockLock(existing_ids):
+            specs = daily_stock_count_specs(await listall("stock"))
+            current_ids = sorted(
+                stock["id"]
+                for spec in specs
+                for stock in spec["records"]
+            )
+            if current_ids != existing_ids:
+                raise HTTPException(409, "Stock products changed while preparing the count sheet. Reload and retry.")
+            if {daily_stock_identity_key(spec["product"], spec["size"]) for spec in specs} != set(submitted):
+                raise HTTPException(409, "Stock categories or sizes changed while preparing the count sheet. Reload and retry.")
+
+            movements_by_stock = await stock_movements_for_stock_ids(current_ids)
+            reconciliation_id = f"daily-stock-reconciliation:{body.report_date}"
+            before_record = await db.stock_daily_reconciliations.find_one(
+                {"id": reconciliation_id}, {"_id": 0},
+            )
+            previous_made_today = {
+                daily_stock_identity_key(line.get("product"), line.get("size")):
+                    float(line.get("made_today") or 0)
+                for line in (before_record or {}).get("counts", [])
+            }
+            changed_count = 0
+            duplicate_records_zeroed = 0
+            created_count = 0
+            saved_counts = []
+            for spec in specs:
+                key = daily_stock_identity_key(spec["product"], spec["size"])
+                target_quantity = (
+                    r2(submitted[key].quantity)
+                    if submitted[key].quantity is not None else None
+                )
+                target_made_today = r2(submitted[key].made_today)
+                records = spec["records"]
+                before_quantity = sum(
+                    float(apply_stock_movements(
+                        dict(stock), movements_by_stock.get(stock["id"], []),
+                    )["current"])
+                    for stock in records
+                )
+                if records:
+                    primary = max(
+                        records,
+                        key=lambda item: (
+                            str(item.get("created_at") or ""),
+                            str(item.get("id") or ""),
+                        ),
+                    )
+                elif target_made_today > 0 or (target_quantity is not None and target_quantity > 0):
+                    primary = await insert("stock", {
+                        "product": spec["product"],
+                        "size": spec["size"],
+                        "opening": 0,
+                        "threshold": 0,
+                    })
+                    created_count += 1
+                    movements_by_stock[primary["id"]] = []
+                else:
+                    primary = None
+
+                movement_ids = []
+                production_delta = r2(target_made_today - previous_made_today.get(key, 0))
+                if primary and production_delta:
+                    movement = await post_movement(
+                        primary,
+                        "production",
+                        abs(production_delta),
+                        user,
+                        reason="Daily production count",
+                        reference=body.report_date,
+                        notes=f"Daily production count updated to {target_made_today} for {spec['product']} {spec['size']}.",
+                        direction=1 if production_delta > 0 else -1,
+                        allow_negative=True,
+                    )
+                    await log_audit(
+                        "stock_movement",
+                        movement["id"],
+                        "posted",
+                        user,
+                        after=movement,
+                        reason="Daily production count",
+                    )
+                    movements_by_stock.setdefault(primary["id"], []).append(movement)
+                    movement_ids.append(movement["id"])
+                    changed_count += 1
+
+                physical_adjustment = 0.0
+                if target_quantity is not None:
+                    stock_targets = (
+                        [(primary, target_quantity)]
+                        + [(stock, 0) for stock in records if stock is not primary]
+                    ) if primary else []
+                    duplicate_records_zeroed += max(0, len(records) - 1)
+                    for stock, desired_quantity in stock_targets:
+                        current_quantity = float(apply_stock_movements(
+                            dict(stock), movements_by_stock.get(stock["id"], []),
+                        )["current"])
+                        delta = r2(desired_quantity - current_quantity)
+                        if not delta:
+                            continue
+                        movement = await post_movement(
+                            stock,
+                            "adjustment_in" if delta > 0 else "adjustment_out",
+                            abs(delta),
+                            user,
+                            reason="Daily physical stock reconciliation",
+                            reference=body.report_date,
+                            notes=(
+                                f"Physical count set to {desired_quantity} for {spec['product']} {spec['size']}."
+                                if desired_quantity else
+                                "Duplicate stock row set to zero without deleting the row or its movement history."
+                            ),
+                            allow_negative=True,
+                        )
+                        await log_audit(
+                            "stock_movement",
+                            movement["id"],
+                            "posted",
+                            user,
+                            after=movement,
+                            reason="Daily physical stock reconciliation",
+                        )
+                        movements_by_stock.setdefault(stock["id"], []).append(movement)
+                        movement_ids.append(movement["id"])
+                        changed_count += 1
+                        physical_adjustment = r2(physical_adjustment + delta)
+
+                saved_counts.append({
+                    "product": spec["product"],
+                    "size": spec["size"],
+                    "made_today": target_made_today,
+                    "quantity": target_quantity,
+                    "book_quantity_before": r2(before_quantity),
+                    "adjustment": physical_adjustment,
+                    "movement_ids": movement_ids,
+                })
+
+            record_data = {
+                "report_date": body.report_date,
+                "counts": saved_counts,
+                "adjusted_items": changed_count,
+                "created_items": created_count,
+                "duplicate_records_zeroed": duplicate_records_zeroed,
+                "submitted_by": worker_display_name(user),
+                "submitted_by_user_id": user.get("id", ""),
+                "submitted_at": now_iso(),
+            }
+            if before_record:
+                saved_record = await update_doc(
+                    "stock_daily_reconciliations", reconciliation_id, record_data,
+                )
+            else:
+                saved_record = await insert(
+                    "stock_daily_reconciliations",
+                    {"id": reconciliation_id, **record_data},
+                )
+            await log_audit(
+                "stock_daily_reconciliation",
+                reconciliation_id,
+                "submitted",
+                user,
+                before=before_record,
+                after=saved_record,
+                reason="Daily physical stock reconciliation",
+            )
+        return await daily_stock_reconciliation_data(body.report_date)
+    finally:
+        active_company_id.reset(company_context)
+
+
 @api.post("/stock")
 async def add_stock(body: StockIn, user=Depends(get_current_user)):
     data = body.model_dump()
@@ -8389,11 +9059,10 @@ async def add_stock(body: StockIn, user=Depends(get_current_user)):
         raise HTTPException(400, "Product and size are required")
     if not can_view_stock_costs(user):
         data.pop("unit_cost", None)
-    for item in await listall("stock"):
-        if (str(item.get("product", "")).strip().casefold() == data["product"].casefold()
-                and str(item.get("size", "")).strip().casefold() == data["size"].casefold()):
-            raise HTTPException(400, "This product and size already exist in stock")
-    unified = uses_unified_price_list(active_company_id.get())
+    company_id = user.get("_active_company_id") or DEFAULT_COMPANY_ID
+    if await find_stock_by_identity(data["product"], data["size"], company_id):
+        raise HTTPException(400, "This product and size already exist in stock")
+    unified = uses_unified_price_list(company_id)
     category, price_zone, existing_price = None, None, None
     if selling_price is not None:
         category = data["product"]
@@ -8463,11 +9132,10 @@ async def edit_stock(sid: str, body: StockIn, user=Depends(get_current_user)):
     d["size"] = d["size"].strip()
     if not d["product"] or not d["size"]:
         raise HTTPException(400, "Product and size are required")
-    clash = await db.stock.find_one({
-        "id": {"$ne": sid},
-        "product": {"$regex": f"^\\s*{re.escape(d['product'])}\\s*$", "$options": "i"},
-        "size": {"$regex": f"^\\s*{re.escape(d['size'])}\\s*$", "$options": "i"},
-    }, {"_id": 0})
+    company_id = user.get("_active_company_id") or DEFAULT_COMPANY_ID
+    clash = await find_stock_by_identity(
+        d["product"], d["size"], company_id, exclude_id=sid,
+    )
     if clash and clash.get("id") != sid:
         raise HTTPException(400, "This product and size already exist in stock")
     if not can_view_stock_costs(user):
@@ -10279,6 +10947,10 @@ class IntercompanyCreateInvoiceIn(BaseModel):
     assigned_driver_id: Optional[str] = ""
     items: Optional[List[IntercompanyInvoiceLineIn]] = Field(default=None, min_length=1, max_length=100)
 
+class IntercompanyInvoiceSendIn(BaseModel):
+    invoice_id: str = Field(min_length=1, max_length=100)
+    recipient_company_id: str = Field(min_length=1, max_length=100)
+
 def require_intercompany_company_access(user, company_id, *, administrator=False):
     if company_id not in {profile["id"] for profile in COMPANY_PROFILES}:
         raise HTTPException(404, "Company not found")
@@ -10361,6 +11033,54 @@ async def intercompany_available_stock(company_db, company_id, stock_ids):
         stock["id"]: r2(D(stock.get("opening", 0)) + D(movement_totals.get(stock["id"], 0)))
         for stock in stocks
     }
+
+async def resolve_intercompany_request_stock(company_db, company_id, items, available):
+    resolved_items = [dict(item) for item in items]
+    available = dict(available)
+    relinked = []
+    for item in resolved_items:
+        if D(available.get(item["stock_id"], 0)) >= D(item["quantity"]):
+            continue
+        product = str(item.get("product") or "").strip()
+        dimensions = str(item.get("dimensions") or "").strip()
+        if not product or not dimensions:
+            continue
+        candidates = await company_db.stock.find(
+            {
+                "product": {"$regex": f"^{re.escape(product)}$", "$options": "i"},
+                "size": {"$regex": f"^{re.escape(dimensions)}$", "$options": "i"},
+                "archived": {"$ne": True},
+            },
+            {"_id": 0, "id": 1, "product": 1, "size": 1},
+        ).to_list(None)
+        candidate_ids = [
+            stock["id"]
+            for stock in candidates
+            if stock.get("id") != item["stock_id"]
+            and same_stock_identity(stock, product, dimensions, company_id)
+        ]
+        if not candidate_ids:
+            continue
+        candidate_available = await intercompany_available_stock(
+            company_db, company_id, candidate_ids,
+        )
+        usable = [
+            (stock_id, D(candidate_available.get(stock_id, 0)))
+            for stock_id in candidate_ids
+            if D(candidate_available.get(stock_id, 0)) >= D(item["quantity"])
+        ]
+        if not usable:
+            continue
+        replacement_id, quantity = max(usable, key=lambda pair: pair[1])
+        previous_id = item["stock_id"]
+        item["stock_id"] = replacement_id
+        available[replacement_id] = quantity
+        relinked.append({
+            "item_id": item["id"],
+            "previous_stock_id": previous_id,
+            "stock_id": replacement_id,
+        })
+    return resolved_items, available, relinked
 
 def intercompany_price_zone(supplying_company_id, requesting_company_id, customer=None):
     if supplying_company_id != DEFAULT_COMPANY_ID:
@@ -10694,6 +11414,9 @@ async def accept_intercompany_request(request_id: str, user=Depends(get_current_
     supplier_db = tenant_database(client, base_db, company_id)
     stock_ids = [item["stock_id"] for item in request["items"]]
     available = await intercompany_available_stock(supplier_db, company_id, stock_ids)
+    resolved_items, available, relinked = await resolve_intercompany_request_stock(
+        supplier_db, company_id, request["items"], available,
+    )
     shortages = [
         {
             "product": item["product"],
@@ -10701,7 +11424,7 @@ async def accept_intercompany_request(request_id: str, user=Depends(get_current_
             "available": available.get(item["stock_id"], 0),
             "requested": item["quantity"],
         }
-        for item in request["items"]
+        for item in resolved_items
         if D(available.get(item["stock_id"], 0)) < D(item["quantity"])
     ]
     if shortages:
@@ -10719,9 +11442,11 @@ async def accept_intercompany_request(request_id: str, user=Depends(get_current_
                 "accepted_by": user["id"],
                 "accepted_at": now,
                 "updated_at": now,
+                "items": resolved_items,
             },
             "$push": {"audit": {
                 "action": "accepted", "at": now, "by": user["id"], "company_id": company_id,
+                "stock_relinked_items": relinked,
             }},
         },
         projection={"_id": 0},
@@ -10928,17 +11653,17 @@ async def create_intercompany_invoice(
             },
             {"_id": 0},
         )
+        requesting_profile = next(
+            profile for profile in COMPANY_PROFILES
+            if profile["id"] == request["requesting_company_id"]
+        )
         customer = None
         if mapping:
             customer = await company_db.customers.find_one(
                 {"id": mapping["customer_id"], "company_id": company_id, "active": {"$ne": False}},
                 {"_id": 0},
             )
-        else:
-            requesting_profile = next(
-                profile for profile in COMPANY_PROFILES
-                if profile["id"] == request["requesting_company_id"]
-            )
+        if not customer:
             customer_names = {requesting_profile["name"], requesting_profile["username"]}
             customer = await company_db.customers.find_one(
                 {
@@ -10947,11 +11672,6 @@ async def create_intercompany_invoice(
                     "active": {"$ne": False},
                 },
                 {"_id": 0},
-            )
-        if not customer:
-            raise HTTPException(
-                409,
-                "Add an active customer record for the requesting company before creating its invoice",
             )
         stock_ids = [item["stock_id"] for item in request["items"]]
         zone = intercompany_price_zone(
@@ -11021,9 +11741,7 @@ async def create_intercompany_invoice(
             if not driver:
                 raise HTTPException(400, "Assigned driver is not active in the supplying company")
         invoice_body = InvoiceIn(
-            customer_id=customer["id"],
-            customer_name=customer["name"],
-            client_number=customer.get("client_number", ""),
+            customer_name=requesting_profile["name"],
             zone=zone,
             reference=f"Intercompany {request_id}",
             notes=f"Generated from intercompany order request {request_id}",
@@ -11128,15 +11846,49 @@ async def get_intercompany_request_invoice(request_id: str, user=Depends(get_cur
     is_supplier = request["supplying_company_id"] == company_id
     if not is_supplier and not request.get("invoice_sent"):
         raise HTTPException(404, "Invoice has not been sent to the requesting company")
-    if not request.get("invoice_id"):
-        raise HTTPException(404, "Invoice has not been created")
     supplier_db = tenant_database(client, base_db, request["supplying_company_id"])
-    invoice = await supplier_db.invoices.find_one(
-        {"id": request["invoice_id"], "intercompany_request_id": request_id},
-        {"_id": 0},
-    )
+    invoice = None
+    if request.get("invoice_id"):
+        invoice = await supplier_db.invoices.find_one(
+            {"id": request["invoice_id"], "intercompany_request_id": request_id},
+            {"_id": 0},
+        )
+        if not invoice:
+            candidate = await supplier_db.invoices.find_one(
+                {"id": request["invoice_id"]},
+                {"_id": 0},
+            )
+            if candidate and candidate.get("intercompany_request_id") in (None, "", request_id):
+                invoice = candidate
+    if not invoice:
+        candidate = await supplier_db.invoices.find_one(
+            {"idempotency_key": f"intercompany:{request_id}"},
+            {"_id": 0},
+        )
+        if candidate and candidate.get("intercompany_request_id") in (None, "", request_id):
+            invoice = candidate
     if not invoice:
         raise HTTPException(404, "Linked invoice not found")
+    if not invoice.get("intercompany_request_id"):
+        await supplier_db.invoices.update_one(
+            {"id": invoice["id"]},
+            {"$set": {"intercompany_request_id": request_id}},
+        )
+    if request.get("invoice_id") != invoice["id"]:
+        await base_db.intercompany_order_requests.update_one(
+            {"id": request_id},
+            {"$set": {
+                "invoice_id": invoice["id"],
+                "invoice_number": invoice.get("number"),
+                "invoice_date": invoice.get("date"),
+                "invoice_total": invoice.get("total"),
+                "updated_at": now_iso(),
+            }},
+        )
+    return await intercompany_invoice_details(invoice, request["supplying_company_id"])
+
+async def intercompany_invoice_details(invoice, supplier_company_id):
+    supplier_db = tenant_database(client, base_db, supplier_company_id)
     invoice.pop("audit", None)
     payments = await supplier_db.payments.find(
         {
@@ -11155,7 +11907,7 @@ async def get_intercompany_request_invoice(request_id: str, user=Depends(get_cur
     ) or {}
     settings_defaults = {
         **seed_data.DEFAULT_SETTINGS,
-        **COMPANY_INVOICE_DETAILS.get(request["supplying_company_id"], {}),
+        **COMPANY_INVOICE_DETAILS.get(supplier_company_id, {}),
     }
     settings = {
         key: stored_settings.get(key, settings_defaults.get(key, ""))
@@ -11164,17 +11916,171 @@ async def get_intercompany_request_invoice(request_id: str, user=Depends(get_cur
             "tax_number", "banking_details",
         )
     }
-    settings["unified_price_list"] = uses_unified_price_list(request["supplying_company_id"])
-    settings["price_zones_enabled"] = uses_price_zones(request["supplying_company_id"])
-    settings["freeform_invoice_items"] = uses_freeform_invoice_items(request["supplying_company_id"])
+    settings["unified_price_list"] = uses_unified_price_list(supplier_company_id)
+    settings["price_zones_enabled"] = uses_price_zones(supplier_company_id)
+    settings["freeform_invoice_items"] = uses_freeform_invoice_items(supplier_company_id)
     customer = await supplier_db.customers.find_one(
         {
             "id": invoice.get("customer_id"),
-            "company_id": request["supplying_company_id"],
+            "company_id": supplier_company_id,
         },
         {"_id": 0, "id": 1, "address": 1, "city": 1, "phone": 1, "email": 1},
     ) if invoice.get("customer_id") else None
     return {"invoice": invoice, "settings": settings, "customer": customer or {}}
+
+@api.post("/intercompany/invoices/send")
+async def send_intercompany_invoice(
+    body: IntercompanyInvoiceSendIn,
+    user=Depends(get_current_user),
+):
+    company_id = active_company_id.get()
+    require_intercompany_company_access(user, company_id)
+    if body.recipient_company_id == company_id:
+        raise HTTPException(400, "Choose a different company to receive this invoice")
+    if body.recipient_company_id not in {profile["id"] for profile in COMPANY_PROFILES}:
+        raise HTTPException(400, "Invalid recipient company")
+    company_db = tenant_database(client, base_db, company_id)
+    invoice = await company_db.invoices.find_one(
+        {"id": body.invoice_id, "archived": {"$ne": True}},
+        {"_id": 0},
+    )
+    if not invoice:
+        raise HTTPException(404, "Invoice not found in the active company")
+    if derive_status(invoice) in ("draft", "void"):
+        raise HTTPException(409, "Only active, issued invoices can be sent to another company")
+    if invoice.get("intercompany_request_id"):
+        raise HTTPException(409, "This invoice is already linked to an intercompany request")
+    linked_request = await base_db.intercompany_order_requests.find_one(
+        {"invoice_id": body.invoice_id, "supplying_company_id": company_id},
+        {"_id": 0, "id": 1},
+    )
+    if linked_request:
+        raise HTTPException(409, "This invoice has already been sent through an intercompany request")
+    delivery_id = f"{company_id}:{body.recipient_company_id}:{body.invoice_id}"
+    sent_at = now_iso()
+    await base_db.intercompany_invoice_deliveries.update_one(
+        {"id": delivery_id},
+        {"$set": {
+            "sender_company_id": company_id,
+            "recipient_company_id": body.recipient_company_id,
+            "invoice_id": body.invoice_id,
+            "invoice_number": invoice.get("number"),
+            "sent_at": sent_at,
+            "sent_by": user.get("id", ""),
+        }, "$setOnInsert": {"id": delivery_id, "created_at": sent_at}},
+        upsert=True,
+    )
+    await notify_intercompany_company(
+        body.recipient_company_id,
+        f"intercompany-invoice:{delivery_id}",
+        "Intercompany Invoice Received",
+        f"Invoice {invoice.get('number') or '—'} was sent by {company_id}.",
+        "/intercompany",
+    )
+    return {
+        "id": delivery_id,
+        "invoice_id": body.invoice_id,
+        "invoice_number": invoice.get("number"),
+        "sender_company_id": company_id,
+        "recipient_company_id": body.recipient_company_id,
+        "sent_at": sent_at,
+    }
+
+@api.get("/intercompany/invoices/received")
+async def list_received_intercompany_invoices(user=Depends(get_current_user)):
+    company_id = active_company_id.get()
+    require_intercompany_company_access(user, company_id)
+    request_invoices = await base_db.intercompany_order_requests.find(
+        {"requesting_company_id": company_id, "invoice_sent": True},
+        {"_id": 0},
+    ).sort("sent_at", -1).to_list(100)
+    direct_deliveries = await base_db.intercompany_invoice_deliveries.find(
+        {"recipient_company_id": company_id},
+        {"_id": 0},
+    ).sort("sent_at", -1).to_list(100)
+    received = [{
+        "id": f"request:{request['id']}",
+        "source": "request",
+        "requesting_company_id": company_id,
+        "supplying_company_id": request["supplying_company_id"],
+        "invoice_id": request.get("invoice_id"),
+        "invoice_number": request.get("invoice_number"),
+        "invoice_total": request.get("invoice_total"),
+        "sent_at": request.get("sent_at"),
+    } for request in request_invoices if request.get("invoice_id")]
+    for delivery in direct_deliveries:
+        sender_company_id = delivery.get("sender_company_id")
+        if sender_company_id not in {profile["id"] for profile in COMPANY_PROFILES}:
+            continue
+        supplier_db = tenant_database(client, base_db, sender_company_id)
+        invoice = await supplier_db.invoices.find_one(
+            {"id": delivery.get("invoice_id")},
+            {"_id": 0, "number": 1, "total": 1, "customer_name": 1},
+        )
+        if not invoice:
+            continue
+        received.append({
+            "id": f"direct:{delivery['id']}",
+            "source": "direct",
+            "requesting_company_id": company_id,
+            "supplying_company_id": sender_company_id,
+            "invoice_id": delivery["invoice_id"],
+            "invoice_number": invoice.get("number") or delivery.get("invoice_number"),
+            "invoice_total": invoice.get("total"),
+            "customer_name": invoice.get("customer_name", ""),
+            "sent_at": delivery.get("sent_at"),
+        })
+    received.sort(key=lambda item: item.get("sent_at") or "", reverse=True)
+    return received
+
+@api.get("/intercompany/invoices/received/{receipt_id}")
+async def get_received_intercompany_invoice(receipt_id: str, user=Depends(get_current_user)):
+    company_id = active_company_id.get()
+    require_intercompany_company_access(user, company_id)
+    receipt_type, separator, identifier = receipt_id.partition(":")
+    if not separator or not identifier:
+        raise HTTPException(404, "Received intercompany invoice not found")
+    if receipt_type == "request":
+        request = await base_db.intercompany_order_requests.find_one(
+            {
+                "id": identifier,
+                "requesting_company_id": company_id,
+                "invoice_sent": True,
+            },
+            {"_id": 0},
+        )
+        if not request or not request.get("invoice_id"):
+            raise HTTPException(404, "Received intercompany invoice not found")
+        details = await get_intercompany_request_invoice(identifier, user)
+        return {
+            "source": "request",
+            "requesting_company_id": company_id,
+            "supplying_company_id": request["supplying_company_id"],
+            "invoice_details": details,
+        }
+    if receipt_type != "direct":
+        raise HTTPException(404, "Received intercompany invoice not found")
+    delivery = await base_db.intercompany_invoice_deliveries.find_one(
+        {"id": identifier, "recipient_company_id": company_id},
+        {"_id": 0},
+    )
+    if not delivery:
+        raise HTTPException(404, "Received intercompany invoice not found")
+    if delivery.get("sender_company_id") not in {profile["id"] for profile in COMPANY_PROFILES}:
+        raise HTTPException(404, "Received intercompany invoice not found")
+    supplier_db = tenant_database(client, base_db, delivery["sender_company_id"])
+    invoice = await supplier_db.invoices.find_one(
+        {"id": delivery["invoice_id"]},
+        {"_id": 0},
+    )
+    if not invoice:
+        raise HTTPException(404, "Linked invoice not found")
+    return {
+        "source": "direct",
+        "requesting_company_id": company_id,
+        "supplying_company_id": delivery["sender_company_id"],
+        "invoice_details": await intercompany_invoice_details(invoice, delivery["sender_company_id"]),
+    }
 
 @api.get("/vehicles")
 async def get_vehicles(user=Depends(get_current_user)):
@@ -13042,10 +13948,15 @@ async def _purchase_order_data(body):
         elif line.stock_id:
             raise HTTPException(400, "A selected stock item no longer exists")
         else:
-            stock = await db.stock.find_one({
-                "product": {"$regex": f"^{re.escape(product)}$", "$options": "i"},
-                "size": {"$regex": f"^{re.escape(size)}$", "$options": "i"},
-            }, {"_id": 0})
+            company_id = active_company_id.get() or DEFAULT_COMPANY_ID
+            stock = (
+                await find_stock_by_identity(product, size, company_id)
+                if company_id == DEFAULT_COMPANY_ID else
+                await db.stock.find_one({
+                    "product": {"$regex": f"^{re.escape(product)}$", "$options": "i"},
+                    "size": {"$regex": f"^{re.escape(size)}$", "$options": "i"},
+                }, {"_id": 0})
+            )
             if not stock:
                 stock = await insert("stock", {"product": product, "size": size, "opening": 0, "threshold": 5})
         items.append({
@@ -13814,23 +14725,35 @@ async def _grv_items_from_request(
             ):
                 raise HTTPException(400, "Enter a category/product name and size for every new product")
             if is_new_product:
-                new_product_key = (product.casefold(), canonical_price_size(size).casefold())
-                if new_product_key in new_product_keys:
-                    raise HTTPException(400, "A new product and size can appear only once in the GRV")
-                new_product_keys.add(new_product_key)
-                stock = await db.stock.find_one({
-                    "product": {"$regex": f"^{re.escape(product)}$", "$options": "i"},
-                    "size": {"$regex": f"^{re.escape(size)}$", "$options": "i"},
-                }, {"_id": 0})
+                company_id = active_company_id.get() or DEFAULT_COMPANY_ID
+                stock = (
+                    await find_stock_by_identity(product, size, company_id)
+                    if company_id == DEFAULT_COMPANY_ID else
+                    await db.stock.find_one({
+                        "product": {"$regex": f"^{re.escape(product)}$", "$options": "i"},
+                        "size": {"$regex": f"^{re.escape(size)}$", "$options": "i"},
+                    }, {"_id": 0})
+                )
                 if stock:
-                    raise HTTPException(400, "This product and size already exist in stock; select the existing product")
+                    is_new_product = False
+                    stock_id = stock["id"]
+                else:
+                    new_product_key = (product.casefold(), canonical_price_size(size).casefold())
+                    if new_product_key in new_product_keys:
+                        raise HTTPException(400, "A new product and size can appear only once in the GRV")
+                    new_product_keys.add(new_product_key)
             else:
                 stock = await db.stock.find_one({"id": stock_id}, {"_id": 0}) if stock_id else None
             if not is_new_product and not stock and product and size:
-                stock = await db.stock.find_one({
-                    "product": {"$regex": f"^{re.escape(product)}$", "$options": "i"},
-                    "size": {"$regex": f"^{re.escape(size)}$", "$options": "i"},
-                }, {"_id": 0})
+                company_id = active_company_id.get() or DEFAULT_COMPANY_ID
+                stock = (
+                    await find_stock_by_identity(product, size, company_id)
+                    if company_id == DEFAULT_COMPANY_ID else
+                    await db.stock.find_one({
+                        "product": {"$regex": f"^{re.escape(product)}$", "$options": "i"},
+                        "size": {"$regex": f"^{re.escape(size)}$", "$options": "i"},
+                    }, {"_id": 0})
+                )
             if not is_new_product and not stock:
                 raise HTTPException(400, "Select a valid stock product for every GRV line")
             if stock:
@@ -13864,7 +14787,7 @@ async def _grv_items_from_request(
             "product_code": (
                 data.get("product_code") or (stock or {}).get("code") or stock_id
             ),
-            "new_product": bool(data.get("new_product")),
+            "new_product": bool(data.get("new_product")) and not bool(stock),
             "product": product,
             "size": size,
             "purchase_order_item_index": po_index,
@@ -13892,10 +14815,15 @@ async def _materialize_grv_new_products(grv, user):
             {"_id": 0},
         )
         if not existing:
-            duplicate = await db.stock.find_one({
-                "product": {"$regex": f"^{re.escape(product)}$", "$options": "i"},
-                "size": {"$regex": f"^{re.escape(size)}$", "$options": "i"},
-            }, {"_id": 0})
+            company_id = user.get("_active_company_id") or DEFAULT_COMPANY_ID
+            duplicate = (
+                await find_stock_by_identity(product, size, company_id)
+                if company_id == DEFAULT_COMPANY_ID else
+                await db.stock.find_one({
+                    "product": {"$regex": f"^{re.escape(product)}$", "$options": "i"},
+                    "size": {"$regex": f"^{re.escape(size)}$", "$options": "i"},
+                }, {"_id": 0})
+            )
             if duplicate:
                 raise HTTPException(
                     409,
@@ -14027,6 +14955,11 @@ async def create_grv(body: GRVIn, user=Depends(get_current_user)):
             "invoice_sent": True,
         }, {"_id": 0})
         if not invoice_request:
+            invoice_request = await base_db.intercompany_invoice_deliveries.find_one({
+                "invoice_id": source_intercompany_invoice_id,
+                "recipient_company_id": company_id,
+            }, {"_id": 0})
+        if not invoice_request:
             raise HTTPException(404, "Sent intercompany invoice not found for the active company")
         existing = await db.grvs.find_one({
             "source_intercompany_invoice_id": source_intercompany_invoice_id,
@@ -14070,7 +15003,11 @@ async def create_grv(body: GRVIn, user=Depends(get_current_user)):
         "purchase_order_reference": purchase_order.get("reference", "") if purchase_order else "",
         "delivery_note_number": (body.delivery_note_number or "").strip(),
         "received_date": body.received_date,
-        "received_by": (body.received_by or user.get("name") or user["email"]).strip(),
+        "received_by": (
+            worker_display_name(user)
+            if user.get("is_worker")
+            else (body.received_by or user.get("name") or user["email"]).strip()
+        ),
         "warehouse": (body.warehouse or "").strip(),
         "notes": (body.notes or "").strip(),
         "items": items,
@@ -14127,7 +15064,11 @@ async def edit_grv(grv_id: str, body: GRVIn, user=Depends(get_current_user)):
         "purchase_order_reference": purchase_order.get("reference", "") if purchase_order else "",
         "delivery_note_number": (body.delivery_note_number or "").strip(),
         "received_date": body.received_date,
-        "received_by": (body.received_by or user.get("name") or user["email"]).strip(),
+        "received_by": (
+            worker_display_name(user)
+            if user.get("is_worker")
+            else (body.received_by or user.get("name") or user["email"]).strip()
+        ),
         "warehouse": (body.warehouse or "").strip(),
         "notes": (body.notes or "").strip(),
         "items": items,
@@ -18731,6 +19672,15 @@ async def create_startup_feed_indexes():
     await base_db.intercompany_order_requests.create_index(
         [("supplying_company_id", 1), ("created_at", -1)],
         name="intercompany_supplier_feed",
+    )
+    await base_db.intercompany_invoice_deliveries.create_index(
+        "id",
+        unique=True,
+        name="intercompany_invoice_delivery_id",
+    )
+    await base_db.intercompany_invoice_deliveries.create_index(
+        [("recipient_company_id", 1), ("sent_at", -1)],
+        name="intercompany_invoice_recipient_feed",
     )
 
 app.include_router(api)

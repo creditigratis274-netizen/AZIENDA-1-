@@ -344,6 +344,41 @@ def test_intercompany_invoice_grv_creates_new_stock_without_inventing_sale_price
     asyncio.run(scenario())
 
 
+def test_intercompany_grv_automatically_uses_existing_stock_product(monkeypatch):
+    fake_db = FakeDatabase()
+    _install_fake_grv_dependencies(monkeypatch, fake_db)
+    existing_stock = fake_db.stock.documents[0]
+
+    async def find_existing_stock(product, size, company_id):
+        assert product == "Simple"
+        assert size == "910x100"
+        assert company_id == "superiqfoam"
+        return deepcopy(existing_stock)
+
+    monkeypatch.setattr(server, "find_stock_by_identity", find_existing_stock)
+    token = server.active_company_id.set("superiqfoam")
+    try:
+        items = asyncio.run(server._grv_items_from_request([
+            server.GRVLineIn(
+                new_product=True,
+                product="Simple",
+                size="910x100",
+                actual_received_quantity=4,
+                accepted_quantity=4,
+                unit_cost=85,
+            ),
+        ]))
+        assert len(items) == 1
+        assert items[0]["stock_id"] == existing_stock["id"]
+        assert items[0]["product"] == existing_stock["product"]
+        assert items[0]["size"] == existing_stock["size"]
+        assert items[0]["new_product"] is False
+        assert items[0]["actual_received_quantity"] == 4
+        assert items[0]["accepted_quantity"] == 4
+    finally:
+        server.active_company_id.reset(token)
+
+
 @pytest.mark.parametrize(
     ("category", "is_chemical", "line", "target_collection", "target_field"),
     [
