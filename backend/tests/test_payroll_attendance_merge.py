@@ -203,6 +203,35 @@ def test_attendance_endpoint_updates_the_existing_employee_day(monkeypatch):
     assert len(database.attendance.records) == 1
 
 
+def test_attendance_overtime_clears_stale_weekly_salary_override(monkeypatch):
+    database = FakeDailyDatabase()
+    database.attendance.records.append({
+        "id": "attendance-old",
+        "employee_id": "employee-1",
+        "date": "2026-10-26",
+        "status": "Present",
+        "overtime_hours": 1,
+        "salary_overtime_override": 4,
+        "salary_overtime_rate_override": 12,
+    })
+    monkeypatch.setattr(server, "db", database)
+    monkeypatch.setattr(server, "emit_workflow_event", lambda *args: asyncio.sleep(0))
+
+    saved = asyncio.run(server.add_attendance(
+        server.AttendanceIn(
+            employee_id="employee-1",
+            date="2026-10-26",
+            status="Present",
+            overtime_hours=3,
+        ),
+        {"id": "admin"},
+    ))
+
+    assert saved["overtime_hours"] == 3
+    assert saved["salary_overtime_override"] is None
+    assert saved["salary_overtime_rate_override"] is None
+
+
 def test_bulk_attendance_saves_unique_employees_concurrently(monkeypatch):
     database = FakeDailyDatabase()
     monkeypatch.setattr(server, "db", database)
@@ -265,6 +294,11 @@ def test_piecework_endpoint_saves_asive_tailor_even_without_piece_pay_flag(monke
     assert created["id"] == updated["id"]
     assert updated["pieces"] == 80
     assert [record["employee_name"] for record in database.piece_production.records] == ["Asive Tailor"]
+    attendance = database.attendance.records
+    assert len(attendance) == 1
+    assert attendance[0]["employee_id"] == "employee-1"
+    assert attendance[0]["date"] == "2026-10-26"
+    assert attendance[0]["status"] == "Present"
     assert audit_actions == [
         "created_weekly_payroll_calculated",
         "updated_weekly_payroll_recalculated",

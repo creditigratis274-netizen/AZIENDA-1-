@@ -52,9 +52,21 @@ def calculate_attendance(attendance_values, half_day_hours=5):
 
 
 def calculate_standard_salary(weekly_salary, worked_hours, overtime_amount=0, divisor=48):
+    if d(divisor) <= 0:
+        raise ValueError("Salary divisor must be greater than zero")
     base = d(weekly_salary) / d(divisor) * d(worked_hours)
     gross = money(base + d(overtime_amount))
     return float(gross)
+
+
+def calculate_salary_rule(weekly_salary, worked_hours, overtime_amount=0, divisor=48):
+    return {
+        "rule": "weekly_salary/divisor*worked_hours + overtime",
+        "divisor": float(d(divisor)),
+        "regular_pay": float(money(d(weekly_salary) / d(divisor) * d(worked_hours))),
+        "overtime_amount": float(money(d(overtime_amount))),
+        "gross": calculate_standard_salary(weekly_salary, worked_hours, overtime_amount, divisor),
+    }
 
 
 def calculate_overtime(overtime_hours, overtime_rate):
@@ -78,7 +90,7 @@ def calculate_piecework_formula(daily_quantities, formula="A", overtime_amount=0
         "G": ((n + o + p, high_rate), (q, low_rate), (r, high_rate), (s, low_rate)),
         "H": ((n + o + p + q + r, high_rate), (s, low_rate)),
         "I": ((o + p + q + r, high_rate), (n, low_rate), (s, low_rate)),
-        "J": ((o + p, high_rate), (r, low_rate), (n, low_rate), (s, low_rate)),
+        "J": ((o + p + q, high_rate), (r, low_rate), (n, low_rate), (s, low_rate)),
         "K": ((p + q, high_rate), (r, low_rate), (n, low_rate), (o, low_rate), (s, low_rate)),
         "L": ((n + o + p, high_rate), (q, low_rate), (r, high_rate), (s, low_rate)),
         "M": ((n + o + p + q + r, high_rate), (s, low_rate)),
@@ -90,6 +102,40 @@ def calculate_piecework_formula(daily_quantities, formula="A", overtime_amount=0
     pieces_pay = sum((quantity * d(rate) for quantity, rate in ranges[key]), Decimal("0"))
     gross = money(pieces_pay + d(overtime_amount))
     return {"piece_pay": float(money(pieces_pay)), "overtime_amount": float(money(d(overtime_amount))), "gross": float(gross)}
+
+
+def calculate_net_and_balance(gross_pay, balance_cut=0, opening_balance=0, other_adjustment=0):
+    gross = d(gross_pay)
+    cut = d(balance_cut)
+    opening = d(opening_balance)
+    adjustment = d(other_adjustment)
+    return {
+        "net_pay": float(money(gross - cut - adjustment)),
+        "remaining_balance": float(money(opening - cut)),
+        "balance_cut": float(money(cut)),
+        "other_adjustment": float(money(adjustment)),
+    }
+
+
+def calculate_period_totals(rows):
+    totals = {key: Decimal("0") for key in (
+        "weekly_salary", "overtime_hours", "overtime_pay", "opening_balance",
+        "gross_salary", "balance_cut", "net_salary", "remaining_balance",
+    )}
+    field_map = {
+        "weekly_salary": "weekly_salary",
+        "overtime_hours": "overtime_hours",
+        "overtime_pay": "overtime_pay",
+        "opening_balance": "balance_before_period",
+        "gross_salary": "gross_salary",
+        "balance_cut": "cut",
+        "net_salary": "net_salary",
+        "remaining_balance": "balance_after_period",
+    }
+    for row in rows:
+        for total_key, row_key in field_map.items():
+            totals[total_key] += d(row.get(row_key, 0))
+    return {key: float(money(value)) for key, value in totals.items()}
 
 
 def calculate_salary_hours(records, *, half_day_hours=5):

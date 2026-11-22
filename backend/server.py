@@ -35,6 +35,8 @@ from salary_math import (
     STANDARD_WEEKLY_HOURS,
     calculate_salary_hours,
     calculate_piecework_formula,
+    calculate_salary_rule,
+    calculate_net_and_balance,
 )
 from grv_math import (
     aggregate_accepted_stock_lines,
@@ -10061,6 +10063,10 @@ async def add_attendance(body: AttendanceIn, user=Depends(get_current_user)):
         raise HTTPException(400, "Invalid attendance status")
     existing = await db.attendance.find_one({"employee_id": body.employee_id, "date": body.date})
     data = body.model_dump()
+    data.pop("salary_overtime_override", None)
+    data.pop("salary_overtime_rate_override", None)
+    data["salary_overtime_override"] = None
+    data["salary_overtime_rate_override"] = None
     if data["overtime_hours"] is None:
         data["overtime_hours"] = (existing or {}).get("overtime_hours", 0) if body.status in ("Present", "Half Day") else 0
     time_fields_set = body.model_fields_set.intersection({"start_time", "end_time"})
@@ -10230,6 +10236,26 @@ async def save_piece_production(body: PieceProductionIn, user=Depends(get_curren
     existing, saved = await _save_employee_day_record(
         "piece_production", body.employee_id, body.date, data,
     )
+    if body.pieces > 0:
+        attendance_record = await db.attendance.find_one(
+            {"employee_id": body.employee_id, "date": body.date},
+            {"_id": 0},
+        )
+        attendance_status = (attendance_record or {}).get("status")
+        if attendance_status not in ("Present", "Half Day"):
+            await _save_employee_day_record(
+                "attendance", body.employee_id, body.date,
+                {
+                    "employee_id": body.employee_id,
+                    "employee_name": employee.get("name", ""),
+                    "department": employee.get("department", ""),
+                    "date": body.date,
+                    "status": "Present",
+                    "overtime_hours": (attendance_record or {}).get("overtime_hours", 0),
+                    "salary_overtime_override": None,
+                    "salary_overtime_rate_override": None,
+                },
+            )
     next_calculation = await piecework_week_snapshot(body.employee_id, work_date, employee.get("name", ""))
     if existing:
         await log_audit(
@@ -10377,7 +10403,13 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
                 day["overtime_pay"] = 0
             else:
                 pay_divisor = D(employee.get("pay_divisor", 48))
-                day["regular_pay"] = r2(D(weekly_salary or 0) * D(day["worked_hours"]) / pay_divisor)
+                salary_rule = calculate_salary_rule(
+                    weekly_salary or 0,
+                    day["worked_hours"],
+                    overtime_amount=0,
+                    divisor=float(pay_divisor),
+                )
+                day["regular_pay"] = r2(salary_rule["regular_pay"])
                 configured_overtime_rate = employee.get("overtime_rate")
                 if configured_overtime_rate is not None:
                     day["overtime_pay"] = r2(D(day["overtime_hours"]) * D(configured_overtime_rate))
@@ -10546,6 +10578,19 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
             running_balance += amount if transaction["type"] == "advance" else -amount
             transaction["balance_after"] = r2(running_balance)
             transaction.pop("_sort_at")
+        net_and_balance = calculate_net_and_balance(
+            gross,
+            cut,
+            opening_balance=balance_before_period,
+        )
+        standard_salary_detail = None
+        if not is_piece_paid and not is_monthly_fixed:
+            standard_salary_detail = calculate_salary_rule(
+                weekly_salary or 0,
+                worked_hours,
+                overtime_amount=overtime_pay,
+                divisor=float(employee.get("pay_divisor", 48)),
+            )
         result.append({
             "employee_id": employee["id"], "name": employee.get("name", ""),
             "department": employee.get("department", ""), "active": employee.get("active", True),
@@ -10580,7 +10625,11 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
             "balance": r2(balance),
             "available_balance": r2(balance_through_period + D(cut)),
             "balance_history": balance_history,
-            "cut": cut, "net_salary": r2(gross - cut),
+            "cut": cut,
+            "net_salary": r2(net_and_balance["net_pay"]),
+            "period_opening_balance": r2(balance_before_period),
+            "period_remaining_balance": r2(net_and_balance["remaining_balance"]),
+            "standard_salary_detail": standard_salary_detail,
         })
     return {
         "start_date": start_date,
@@ -10690,6 +10739,7 @@ def salary_calculation_snapshot(employee):
         "piecework_formula", "worked_hours", "worked_days", "regular_hours",
         "overtime_hours", "regular_pay", "overtime_pay", "piece_pay",
         "piece_formula_details", "piece_days", "days", "gross_salary",
+        "standard_salary_detail", "period_opening_balance", "period_remaining_balance",
         "cut", "net_salary", "balance_before_period", "balance_after_period",
     )
     return {

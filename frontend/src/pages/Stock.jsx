@@ -50,6 +50,7 @@ export default function Stock() {
   const [busy, setBusy] = useState(false);
   const [updatingRightStock, setUpdatingRightStock] = useState(false);
   const [dailyCountSheet, setDailyCountSheet] = useState(null);
+  const [dailyEntryMode, setDailyEntryMode] = useState("pieces_made");
   const [loadingDailyCount, setLoadingDailyCount] = useState(false);
   const [downloadingRangeReport, setDownloadingRangeReport] = useState(false);
   const [valueZone, setValueZone] = useState(1);
@@ -118,6 +119,7 @@ export default function Stock() {
     setLoadingDailyCount(true);
     try {
       const report = await api.get("/stock/daily-reconciliation");
+      setDailyEntryMode("pieces_made");
       setDailyCountSheet({
         ...report,
         rows: report.rows.map((row) => ({
@@ -134,13 +136,62 @@ export default function Stock() {
     }
   };
 
+  const downloadPiecesMadeToday = async () => {
+    try {
+      const report = dailyCountSheet || await api.get("/stock/daily-reconciliation");
+      const rows = (report?.rows || []).filter((row) => Number(row.made_today || 0) > 0);
+      if (!rows.length) {
+        toast.error("No pieces made are recorded for this date.");
+        return;
+      }
+      const { jsPDF } = await import("jspdf");
+      const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
+      pdf.setFillColor(88, 45, 180);
+      pdf.rect(0, 0, 210, 24, "F");
+      pdf.setTextColor(255, 255, 255);
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(16);
+      pdf.text("PIECES MADE TODAY", 12, 15);
+      pdf.setTextColor(30, 41, 59);
+      pdf.setFontSize(10);
+      pdf.text(`Date: ${report.report_date}`, 12, 32);
+      let y = 42;
+      pdf.setFillColor(243, 244, 246);
+      pdf.rect(12, y - 6, 186, 9, "F");
+      pdf.setFont("helvetica", "bold");
+      pdf.text("CATEGORY", 15, y);
+      pdf.text("SIZE", 105, y);
+      pdf.text("PIECES", 175, y);
+      y += 10;
+      pdf.setFont("helvetica", "normal");
+      rows.forEach((row) => {
+        if (y > 278) {
+          pdf.addPage();
+          y = 20;
+        }
+        pdf.text(String(row.product), 15, y);
+        pdf.text(String(row.size), 105, y);
+        pdf.text(String(row.made_today), 175, y);
+        y += 7;
+      });
+      pdf.save(`pieces-made-${report.report_date}.pdf`);
+      toast.success("Pieces made report downloaded.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not download pieces made report.");
+    }
+  };
+
   const submitDailyCountSheet = async () => {
     if (!dailyCountSheet || updatingRightStock) return;
     const counts = dailyCountSheet.rows.map((row) => ({
       product: row.product,
       size: row.size,
-      made_today: row.made_today_input === "" ? 0 : Number(row.made_today_input),
-      quantity: row.physical_count === "" ? null : Number(row.physical_count),
+      made_today: dailyEntryMode === "pieces_made"
+        ? (row.made_today_input === "" ? 0 : Number(row.made_today_input))
+        : 0,
+      quantity: dailyEntryMode === "stock_only"
+        ? (row.physical_count === "" ? null : Number(row.physical_count))
+        : null,
     }));
     if (counts.some((line) =>
       !Number.isFinite(line.made_today) || line.made_today < 0
@@ -150,13 +201,16 @@ export default function Stock() {
       return;
     }
     const confirmed = window.confirm(
-      "Compile today's production quantities? Production will be recorded in the stock ledger. Physical counts are optional; if entered, differences will be recorded as audited adjustments.",
+      dailyEntryMode === "pieces_made"
+        ? "Record pieces made today? This updates the production movement only; physical stock counts will not be changed."
+        : "Update stock by physical count only? This will not add pieces made today.",
     );
     if (!confirmed) return;
     setUpdatingRightStock(true);
     try {
       const report = await api.post("/stock/daily-reconciliation", {
         report_date: dailyCountSheet.report_date,
+        entry_mode: dailyEntryMode,
         counts,
       });
       setDailyCountSheet({
@@ -167,7 +221,9 @@ export default function Stock() {
           physical_count: row.quantity == null ? "" : String(row.quantity),
         })),
       });
-      toast.success("Today's production and stock update were compiled");
+      toast.success(dailyEntryMode === "pieces_made"
+        ? "Pieces made today were compiled."
+        : "Physical stock update was compiled.");
       load();
     } catch (error) {
       toast.error(`Could not reconcile today's stock: ${apiError(error)}`);
@@ -351,6 +407,16 @@ export default function Stock() {
           )}
           {productIdsAction}
           {ledgerAction}
+          {isSuperIqFoam && user?.is_primary_owner && user?.is_owner && (
+            <Btn
+              type="button"
+              className="!border-violet-700 !bg-violet-700 !text-white hover:!bg-violet-800"
+              onClick={downloadPiecesMadeToday}
+              data-testid="download-pieces-made-today"
+            >
+              <Download size={16} /> Download Pieces Made Today
+            </Btn>
+          )}
           <Btn
             type="button"
             variant="outline"
@@ -412,8 +478,32 @@ export default function Stock() {
           <div className="flex min-h-0 flex-col">
             <div className="shrink-0 space-y-3 border-b border-border/70 px-4 py-4 sm:px-6">
               <p className="text-sm text-slate-600">
-                Enter the number of pieces made today for each product and size. The stock ID and book balance are shown alongside today's invoices, dispatches, other movements, and receipts. Physical count is optional; when entered, it reconciles the ledger to the actual count.
+                Choose what this submission represents, then enter the values for each product and size.
               </p>
+              <div className="grid gap-2 sm:grid-cols-2" role="radiogroup" aria-label="Daily stock entry type">
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={dailyEntryMode === "pieces_made"}
+                  onClick={() => setDailyEntryMode("pieces_made")}
+                  className={"rounded-lg border p-3 text-left " + (dailyEntryMode === "pieces_made" ? "border-violet-600 bg-violet-50 text-violet-950" : "border-slate-200 bg-white text-slate-700")}
+                  data-testid="daily-entry-pieces-made"
+                >
+                  <span className="block text-sm font-bold">This is the pieces made today</span>
+                  <span className="mt-1 block text-xs">Add or update real production quantities.</span>
+                </button>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={dailyEntryMode === "stock_only"}
+                  onClick={() => setDailyEntryMode("stock_only")}
+                  className={"rounded-lg border p-3 text-left " + (dailyEntryMode === "stock_only" ? "border-violet-600 bg-violet-50 text-violet-950" : "border-slate-200 bg-white text-slate-700")}
+                  data-testid="daily-entry-stock-only"
+                >
+                  <span className="block text-sm font-bold">These pieces are only to update the stock</span>
+                  <span className="mt-1 block text-xs">Set the physical stock count without recording production.</span>
+                </button>
+              </div>
               {dailyCountSheet.already_submitted && (
                 <p className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800">
                   A production update has already been saved today. Saving again adjusts the production entry to the new total instead of double-counting it.
@@ -435,12 +525,12 @@ export default function Stock() {
                     <th className="p-2">Size</th>
                     <th className="p-2">Product ID</th>
                     <th className="p-2 text-right">Book balance</th>
-                    <th className="p-2">Pieces made today</th>
+                    {dailyEntryMode === "pieces_made" && <th className="p-2">Pieces made today</th>}
                     <th className="p-2 text-right">Invoice out</th>
                     <th className="p-2 text-right">Dispatched</th>
                     <th className="p-2 text-right">Other out</th>
                     <th className="p-2 text-right">Received in</th>
-                    <th className="p-2">Physical count (optional)</th>
+                    {dailyEntryMode === "stock_only" && <th className="p-2">Physical count</th>}
                   </tr>
                 </thead>
                 <tbody>
@@ -450,7 +540,7 @@ export default function Stock() {
                       <td className="p-2">{row.size}</td>
                       <td className="p-2 font-mono">{row.product_id || "—"}</td>
                       <td className="p-2 text-right font-mono">{row.book_quantity}</td>
-                      <td className="p-2">
+                      {dailyEntryMode === "pieces_made" && <td className="p-2">
                         <Input
                           type="number"
                           min="0"
@@ -466,12 +556,12 @@ export default function Stock() {
                           data-testid={`made-today-${row.key}`}
                           className="min-w-24 px-2 py-1.5 text-right"
                         />
-                      </td>
+                      </td>}
                       <td className="p-2 text-right font-mono">{row.invoice_out}</td>
                       <td className="p-2 text-right font-mono">{row.dispatch_out}</td>
                       <td className="p-2 text-right font-mono">{row.other_out}</td>
                       <td className="p-2 text-right font-mono">{row.received_in}</td>
-                      <td className="p-2">
+                      {dailyEntryMode === "stock_only" && <td className="p-2">
                         <Input
                           type="number"
                           min="0"
@@ -483,11 +573,11 @@ export default function Stock() {
                               ? { ...item, physical_count: event.target.value }
                               : item),
                           }))}
-                          aria-label={`Optional physical count for ${row.product} ${row.size}`}
+                          aria-label={`Physical count for ${row.product} ${row.size}`}
                           data-testid={`physical-count-${row.key}`}
                           className="min-w-24 px-2 py-1.5 text-right"
                         />
-                      </td>
+                      </td>}
                     </tr>
                   ))}
                 </tbody>

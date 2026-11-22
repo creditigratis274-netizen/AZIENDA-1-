@@ -246,6 +246,21 @@ def test_daily_count_catalog_includes_all_sizes_and_extra_stock():
     assert server.daily_stock_identity_key("Custom Item", "Large") in keyed_specs
 
 
+def test_daily_count_supports_explicit_entry_modes():
+    default_mode = server.DailyStockReconciliationIn(
+        report_date=server.today_str(),
+        counts=[{"product": "Ribbon Black", "size": "760x100", "made_today": 3}],
+    )
+    stock_only = server.DailyStockReconciliationIn(
+        report_date=server.today_str(),
+        entry_mode="stock_only",
+        counts=[{"product": "Ribbon Black", "size": "760x100", "quantity": 3}],
+    )
+
+    assert default_mode.entry_mode == "pieces_made"
+    assert stock_only.entry_mode == "stock_only"
+
+
 def test_daily_count_input_rejects_duplicate_category_and_size():
     with pytest.raises(ValidationError, match="only be counted once"):
         server.DailyStockReconciliationIn(

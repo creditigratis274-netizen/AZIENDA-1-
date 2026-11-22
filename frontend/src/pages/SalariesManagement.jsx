@@ -33,6 +33,27 @@ const monthRange = (month) => {
   return { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) };
 };
 
+const monthSalaryWeeks = (month) => {
+  if (!/^\d{4}-\d{2}$/.test(String(month || ""))) return [];
+  const monthStart = new Date(month + "-01T00:00:00Z");
+  if (!Number.isFinite(monthStart.getTime())) return [];
+  const monthEnd = new Date(Date.UTC(monthStart.getUTCFullYear(), monthStart.getUTCMonth() + 1, 0));
+  const firstMonday = new Date(monthStart);
+  const offsetToMonday = (firstMonday.getUTCDay() + 6) % 7;
+  firstMonday.setUTCDate(firstMonday.getUTCDate() + ((7 - offsetToMonday) % 7));
+  const weeks = [];
+  for (let monday = new Date(firstMonday); monday <= monthEnd; monday.setUTCDate(monday.getUTCDate() + 7)) {
+    const saturday = new Date(monday);
+    saturday.setUTCDate(saturday.getUTCDate() + 5);
+    if (saturday > monthEnd) break;
+    weeks.push({
+      start: monday.toISOString().slice(0, 10),
+      end: saturday.toISOString().slice(0, 10),
+    });
+  }
+  return weeks;
+};
+
 const addDays = (value, days) => {
   const date = new Date(String(value || "") + "T00:00:00Z");
   date.setUTCDate(date.getUTCDate() + days);
@@ -82,6 +103,18 @@ const payrollConfigFromEmployee = (employee) => ({
   piecework_formula: employee?.piecework_formula || "",
 });
 const employeeDepartment = (employee) => employee?.department || (employee?.is_general_worker ? "General Worker" : "Other");
+const excelAttendanceValues = (employee, period) => Array.from({ length: 7 }, (_, index) => {
+  const date = addDays(period.start, index);
+  if (isPieceworkTailor(employee)) {
+    const pieceDay = (employee.piece_days || []).find((day) => day.date === date);
+    return pieceDay ? Number(pieceDay.pieces || 0) : "";
+  }
+  const attendanceDay = (employee.days || []).find((day) => day.date === date);
+  if (!attendanceDay) return "";
+  if (attendanceDay.status === "Present") return 1;
+  if (attendanceDay.status === "Half Day") return 0.5;
+  return 0;
+});
 const salaryDepartment = (employee) => employee?.is_general_worker ? "General Worker" : employeeDepartment(employee);
 const periodKey = (type, start) => type === "monthly" ? "monthly:" + start.slice(0, 7) : "weekly:" + start;
 
@@ -300,7 +333,7 @@ function PayrollEmployeeCard({
               Piecework formula for this employee
               <select value={configuration.piecework_formula} onChange={(event) => onConfigurationChange("piecework_formula", event.target.value)} disabled={saving || !!payment} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-normal">
                 <option value="">Existing tiered production rules</option>
-                {"ABCDEFGHIJKLMN".split("").map((formula) => <option key={formula} value={formula}>Formula {formula}</option>)}
+                {"ABCDEFGHIJKLMN".split("").map((formula, index) => <option key={formula} value={formula}>Profile {index + 1} ({formula})</option>)}
               </select>
             </label>}
             <p className="text-[11px] leading-5 text-slate-500">{payment
@@ -311,8 +344,8 @@ function PayrollEmployeeCard({
           </div>
           <Btn className="w-full rounded-lg" disabled={saving || !!payment} onClick={onSaveRate}>Save rate &amp; calculation settings</Btn>
           <div className="grid grid-cols-2 gap-2 rounded-xl bg-slate-50 p-3 text-xs">
-            <div><p className="text-slate-500">Balance at period start</p><p className="mt-1 font-mono font-semibold">{fmtMoney(employee.balance_before_period || 0)}</p></div>
-            <div><p className="text-slate-500">Balance remaining</p><p className="mt-1 font-mono font-semibold">{fmtMoney(employee.balance ?? employee.balance_after_period ?? 0)}</p></div>
+            <div><p className="text-slate-500">Balance at period start</p><p className="mt-1 font-mono font-semibold">{fmtMoney((employee.period_opening_balance ?? employee.balance_before_period) || 0)}</p></div>
+            <div><p className="text-slate-500">Balance remaining after cut</p><p className="mt-1 font-mono font-semibold">{fmtMoney((employee.period_remaining_balance ?? employee.balance ?? employee.balance_after_period) || 0)}</p></div>
           </div>
           <div className="rounded-xl border border-slate-200 p-3 text-xs text-slate-600">
             <p className="font-semibold text-slate-800">Calculation rule</p>
@@ -359,6 +392,12 @@ export default function SalariesManagement() {
   const [periodType, setPeriodType] = useState("weekly");
   const [weekStart, setWeekStart] = useState(() => mondayOf(today()));
   const [monthValue, setMonthValue] = useState(() => today().slice(0, 7));
+  const [monthWeekIndex, setMonthWeekIndex] = useState(() => {
+    const month = today().slice(0, 7);
+    const weeks = monthSalaryWeeks(month);
+    const index = weeks.findIndex((week) => today() >= week.start && today() <= week.end);
+    return index >= 0 ? index : 0;
+  });
   const [report, setReport] = useState(null);
   const [payments, setPayments] = useState([]);
   const [weeklyPlan, setWeeklyPlan] = useState(null);
@@ -382,6 +421,7 @@ export default function SalariesManagement() {
   const [configurationDrafts, setConfigurationDrafts] = useState({});
   const [paymentDates, setPaymentDates] = useState({});
   const [savingIds, setSavingIds] = useState({});
+  const [tableDrafts, setTableDrafts] = useState({});
   const [totalWasRecalculated, setTotalWasRecalculated] = useState(false);
   const [advanceModal, setAdvanceModal] = useState(null);
   const [cutModal, setCutModal] = useState(null);
@@ -390,15 +430,23 @@ export default function SalariesManagement() {
   const [calendarMonth, setCalendarMonth] = useState(() => today().slice(0, 7));
   const [filtersOpen, setFiltersOpen] = useState(false);
 
-  const period = useMemo(
-    () => periodType === "monthly" ? monthRange(monthValue) : weekRange(weekStart),
-    [periodType, monthValue, weekStart],
-  );
+  const monthWeeks = useMemo(() => monthSalaryWeeks(monthValue), [monthValue]);
+  const period = useMemo(() => {
+    if (periodType === "monthly") return monthRange(monthValue);
+    const selectedMonthWeek = monthWeeks[monthWeekIndex];
+    return selectedMonthWeek ? weekRange(selectedMonthWeek.start) : weekRange(weekStart);
+  }, [periodType, monthValue, monthWeekIndex, monthWeeks, weekStart]);
   const payrollKey = period ? periodKey(periodType, period.start) : "";
-  const weeklySplitView = isSuperIqFoam && periodType === "weekly";
+  useEffect(() => {
+    if (periodType === "weekly" && monthWeeks[monthWeekIndex]) {
+      setWeekStart(monthWeeks[monthWeekIndex].start);
+    }
+  }, [periodType, monthWeekIndex, monthWeeks]);
+  const weeklySplitView = false;
   const calendarGrid = useMemo(() => calendarDays(calendarMonth), [calendarMonth]);
   const selectedSunday = addDays(weekStart, 6);
-  const selectedWeekNumber = isoWeek(weekStart);
+  const selectedMonthWeekNumber = periodType === "weekly" ? monthWeekIndex + 1 : 0;
+  const selectedWeekNumber = selectedMonthWeekNumber || isoWeek(weekStart);
   const selectedWeekYear = isoWeekYear(weekStart);
 
   const openCalendar = () => {
@@ -406,8 +454,16 @@ export default function SalariesManagement() {
     setCalendarOpen((current) => !current);
   };
   const selectCalendarDate = (value) => {
-    if (periodType === "weekly") setWeekStart(mondayOf(value));
-    else setMonthValue(value.slice(0, 7));
+    if (periodType === "weekly") {
+      const month = value.slice(0, 7);
+      const weeks = monthSalaryWeeks(month);
+      const index = weeks.findIndex((week) => value >= week.start && value <= week.end);
+      setMonthValue(month);
+      setMonthWeekIndex(index >= 0 ? index : 0);
+      setWeekStart(index >= 0 ? mondayOf(weeks[index].start) : mondayOf(value));
+    } else {
+      setMonthValue(value.slice(0, 7));
+    }
     setCalendarOpen(false);
   };
 
@@ -619,6 +675,11 @@ export default function SalariesManagement() {
 
   const changePeriodType = (nextType) => {
     setPeriodType(nextType);
+    if (nextType === "weekly") {
+      const weeks = monthSalaryWeeks(monthValue);
+      const index = weeks.findIndex((week) => today() >= week.start && today() <= week.end);
+      setMonthWeekIndex(index >= 0 ? index : 0);
+    }
     setView("payroll");
     setSearch("");
     setDepartment("");
@@ -713,6 +774,93 @@ export default function SalariesManagement() {
         overtime_rate: rate,
       });
       toast.success("Overtime saved and payroll recalculated for " + employee.employee_name);
+      await reload({ showLoading: false, resetExpanded: false });
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setSavingIds((current) => ({ ...current, [employee.employee_id]: false }));
+    }
+  };
+
+  const saveTableSalary = async (employee, value) => {
+    const salary = Number(value);
+    if (!Number.isFinite(salary) || salary <= 0) return toast.error("Enter a salary greater than zero.");
+    setSavingIds((current) => ({ ...current, [employee.employee_id]: true }));
+    try {
+      await api.put("/salaries/rates/" + employee.employee_id, { weekly_salary: salary });
+      await reload({ showLoading: false, resetExpanded: false });
+      toast.success("Weekly salary saved.");
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setSavingIds((current) => ({ ...current, [employee.employee_id]: false }));
+    }
+  };
+
+  const saveTableOvertime = async (employee, _hoursValue, rateValue) => {
+    const overtimeRate = Number(rateValue);
+    if (!Number.isFinite(overtimeRate) || overtimeRate < 0) return toast.error("Overtime rate must be zero or greater.");
+    setSavingIds((current) => ({ ...current, [employee.employee_id]: true }));
+    try {
+      await api.put("/salaries/rates/" + employee.employee_id, { overtime_rate: overtimeRate });
+      await reload({ showLoading: false, resetExpanded: false });
+      toast.success("Overtime rate saved.");
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setSavingIds((current) => ({ ...current, [employee.employee_id]: false }));
+    }
+  };
+
+  const saveTableAttendance = async (employee, date, value) => {
+    const normalized = String(value ?? "").trim().toLowerCase();
+    const status = normalized === "1" || normalized === "x" ? "Present"
+      : normalized === "0.5" ? "Half Day"
+        : normalized === "0" ? "Absent"
+          : "";
+    if (!status) return toast.error("Use 1, 0.5, x or 0 for attendance.");
+    setSavingIds((current) => ({ ...current, [employee.employee_id]: true }));
+    try {
+      await api.post("/attendance", {
+        employee_id: employee.employee_id,
+        date,
+        status,
+        overtime_hours: normalized === "0" ? 0 : undefined,
+      });
+      await reload({ showLoading: false, resetExpanded: false });
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setSavingIds((current) => ({ ...current, [employee.employee_id]: false }));
+    }
+  };
+
+  const saveTableProduction = async (employee, date, value) => {
+    const pieces = Number(value);
+    if (!Number.isInteger(pieces) || pieces < 0) return toast.error("Pieces must be a whole number of zero or more.");
+    setSavingIds((current) => ({ ...current, [employee.employee_id]: true }));
+    try {
+      await api.post("/piece-production", { employee_id: employee.employee_id, date, pieces });
+      await reload({ showLoading: false, resetExpanded: false });
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setSavingIds((current) => ({ ...current, [employee.employee_id]: false }));
+    }
+  };
+
+  const saveTableCut = async (employee, value) => {
+    const amount = Number(value);
+    if (!Number.isFinite(amount) || amount < 0) return toast.error("Balance cut must be zero or greater.");
+    setSavingIds((current) => ({ ...current, [employee.employee_id]: true }));
+    try {
+      await api.post("/salaries/cuts", {
+        employee_id: employee.employee_id,
+        start_date: period.start,
+        end_date: period.end,
+        amount,
+        notes: "Entered in Salary table",
+      });
       await reload({ showLoading: false, resetExpanded: false });
     } catch (error) {
       toast.error(apiError(error));
@@ -1040,33 +1188,45 @@ export default function SalariesManagement() {
       {view === "payroll" ? <>
         <section className="relative rounded-3xl border border-slate-200/80 bg-white p-4 shadow-[0_8px_32px_rgba(15,23,42,0.045)] sm:p-6" aria-label="Pay period selector">
           <div className="flex flex-wrap items-center justify-between gap-4">
-            <div className="inline-flex w-full rounded-xl bg-slate-100 p-1 sm:w-auto">
-              <button type="button" onClick={() => changePeriodType("weekly")} className={"flex-1 rounded-lg px-5 py-2.5 text-xs font-bold tracking-[0.12em] transition-all sm:flex-none " + (periodType === "weekly" ? "bg-white text-slate-950 shadow-sm" : "text-slate-500 hover:text-slate-900")} data-testid="salary-weekly-mode">Week</button>
-              <button type="button" onClick={() => changePeriodType("monthly")} className={"flex-1 rounded-lg px-5 py-2.5 text-xs font-bold tracking-[0.12em] transition-all sm:flex-none " + (periodType === "monthly" ? "bg-white text-slate-950 shadow-sm" : "text-slate-500 hover:text-slate-900")} data-testid="salary-monthly-mode">Month</button>
-            </div>
-            <button type="button" onClick={() => periodType === "weekly" ? setWeekStart(mondayOf(today())) : setMonthValue(today().slice(0, 7))} className="rounded-lg px-3 py-2 text-xs font-semibold text-[#34725c] transition-colors hover:bg-[#eff9f4]" data-testid="salary-today">Today</button>
+            <button type="button" onClick={() => {
+              const month = today().slice(0, 7);
+              const weeks = monthSalaryWeeks(month);
+              const index = weeks.findIndex((week) => today() >= week.start && today() <= week.end);
+              setMonthValue(month);
+              setMonthWeekIndex(index >= 0 ? index : 0);
+              setWeekStart(index >= 0 ? weeks[index].start : mondayOf(today()));
+              if (periodType === "monthly") setMonthValue(month);
+            }} className="hidden rounded-lg px-3 py-2 text-xs font-semibold text-[#34725c] transition-colors hover:bg-[#eff9f4]" data-testid="salary-today">Today</button>
           </div>
 
           <div className="mt-5 flex items-center justify-center gap-2 sm:mt-6 sm:gap-4">
             <button
               type="button"
-              onClick={() => periodType === "weekly" ? setWeekStart(addDays(weekStart, -7)) : setMonthValue(shiftMonth(monthValue, -1))}
+              onClick={() => periodType === "weekly"
+                ? monthWeekIndex > 0
+                  ? setMonthWeekIndex((current) => current - 1)
+                  : (() => { const month = shiftMonth(monthValue, -1); setMonthValue(month); setMonthWeekIndex(Math.max(0, monthSalaryWeeks(month).length - 1)); })()
+                : setMonthValue(shiftMonth(monthValue, -1))}
               aria-label={periodType === "weekly" ? "Previous week" : "Previous month"}
               className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-slate-200 text-slate-600 transition-colors hover:border-[#cbe7db] hover:bg-[#f1faf6] hover:text-[#286a56]"
             ><ChevronLeft size={18} /></button>
             <div className="min-w-0 flex-1 text-center sm:flex-none sm:min-w-[280px]">
               <p className="truncate text-lg font-semibold tracking-tight text-slate-950 sm:text-2xl" data-testid="salary-period-label">
                 {periodType === "weekly"
-                  ? `${displayDate(weekStart)} – ${displayDate(selectedSunday)}`
+                  ? `${displayDate(period?.start)} – ${displayDate(period?.end)}`
                   : displayMonth(monthValue)}
               </p>
               <p className="mt-1 text-xs font-medium text-slate-500">
-                {periodType === "weekly" ? `Week ${selectedWeekNumber} · ${selectedWeekYear} · Payroll runs Monday–Saturday` : "Full calendar month"}
+                {periodType === "weekly" ? `Settimana ${selectedMonthWeekNumber} di ${displayMonth(monthValue)} · Payroll runs Monday–Saturday` : "Full calendar month"}
               </p>
             </div>
             <button
               type="button"
-              onClick={() => periodType === "weekly" ? setWeekStart(addDays(weekStart, 7)) : setMonthValue(shiftMonth(monthValue, 1))}
+              onClick={() => periodType === "weekly"
+                ? monthWeekIndex < monthWeeks.length - 1
+                  ? setMonthWeekIndex((current) => current + 1)
+                  : (() => { const month = shiftMonth(monthValue, 1); setMonthValue(month); setMonthWeekIndex(0); })()
+                : setMonthValue(shiftMonth(monthValue, 1))}
               aria-label={periodType === "weekly" ? "Next week" : "Next month"}
               className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-slate-200 text-slate-600 transition-colors hover:border-[#cbe7db] hover:bg-[#f1faf6] hover:text-[#286a56]"
             ><ChevronRight size={18} /></button>
@@ -1111,7 +1271,20 @@ export default function SalariesManagement() {
             </div>
           </div>
 
-          {periodType === "weekly" && <div className="mt-5 grid grid-cols-7 gap-1.5 sm:mt-6 sm:gap-2" aria-label="Selected week days">
+          {periodType === "weekly" && <div className="mt-5 flex flex-wrap gap-2" aria-label="Month salary weeks">
+            {monthWeeks.map((week, index) => <button
+              type="button"
+              key={week.start}
+              onClick={() => { setMonthWeekIndex(index); setWeekStart(week.start); }}
+              aria-pressed={monthWeekIndex === index}
+              className={"rounded-lg border px-3 py-2 text-xs font-semibold transition-colors " + (monthWeekIndex === index
+                ? "border-[#34725c] bg-[#34725c] text-white"
+                : "border-slate-200 bg-white text-slate-600 hover:border-[#cbe7db] hover:bg-[#f1faf6]")}
+              data-testid={`salary-month-week-${index + 1}`}
+            >Settimana {index + 1}</button>)}
+          </div>}
+
+          {periodType === "weekly" && <div className="mt-3 grid grid-cols-7 gap-1.5 sm:mt-4 sm:gap-2" aria-label="Selected week days">
             {Array.from({ length: 7 }, (_, index) => {
               const date = addDays(weekStart, index);
               return <button type="button" key={date} onClick={() => { setCalendarMonth(date.slice(0, 7)); setCalendarOpen(true); }} className="min-w-0 rounded-xl bg-[#eff8f3] px-1 py-2 text-center transition-colors hover:bg-[#dff2e9] sm:px-2 sm:py-2.5" data-testid={"salary-week-day-" + date}>
@@ -1121,6 +1294,178 @@ export default function SalariesManagement() {
             })}
           </div>}
         </section>
+
+        {period && <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5" aria-label="Salary period KPIs">
+          <div className="rounded-lg border border-slate-200 bg-white px-4 py-3 shadow-[0_5px_16px_rgba(15,23,42,0.06)]"><p className="text-[10px] font-bold uppercase text-slate-500">Period</p><p className="mt-1 text-sm font-bold text-slate-950">{displayDate(period.start)} – {displayDate(period.end)}</p></div>
+          <div className="rounded-lg border border-slate-200 bg-white px-4 py-3 shadow-[0_5px_16px_rgba(15,23,42,0.06)]"><p className="text-[10px] font-bold uppercase text-slate-500">Total employees</p><p className="mt-1 text-2xl font-bold tabular-nums text-slate-950">{rows.length}</p></div>
+          <div className="rounded-lg border border-slate-200 bg-white px-4 py-3 shadow-[0_5px_16px_rgba(15,23,42,0.06)]"><p className="text-[10px] font-bold uppercase text-slate-500">Total output</p><p className="mt-1 text-2xl font-bold tabular-nums text-slate-950">{fmtMoney(totals.grossCents / 100)}</p></div>
+          <div className="rounded-lg border border-slate-200 bg-white px-4 py-3 shadow-[0_5px_16px_rgba(15,23,42,0.06)]"><p className="text-[10px] font-bold uppercase text-slate-500">Final payment made</p><p className="mt-1 text-2xl font-bold tabular-nums text-slate-950">{fmtMoney(paidCents / 100)}</p></div>
+          <div className="rounded-lg border border-slate-200 bg-[#f5f7ff] px-4 py-3 shadow-[0_5px_16px_rgba(15,23,42,0.06)]"><p className="text-[10px] font-bold uppercase text-[#314b8f]">Payment progress</p><p className="mt-1 text-2xl font-bold tabular-nums text-[#1d3477]">{rows.length ? Math.round(includedPaidRows.length / rows.length * 100) : 0}%</p></div>
+        </section>}
+
+        {period && <section className="overflow-hidden rounded-lg border border-slate-300 bg-white shadow-[0_8px_24px_rgba(15,23,42,0.08)]" aria-label="Excel salary table">
+          <div className="overflow-x-auto">
+            <table className="min-w-[1500px] border-collapse text-[11px] text-slate-950" data-testid="salary-excel-table">
+              <thead>
+                <tr className="bg-[#dce8ff] text-center font-bold">
+                  <th className="w-12 border border-slate-400 px-2 py-2">S/N</th>
+                  <th className="w-44 border border-slate-400 px-2 py-2">EMPLOYEE NAME</th>
+                  <th className="w-44 border border-slate-400 px-2 py-2">DEPARTMENTS</th>
+                  <th className="w-20 border border-slate-400 px-2 py-2">SALARY R</th>
+                  <th className="w-20 border border-slate-400 px-2 py-2">OVERTIME HOURS</th>
+                  <th className="w-20 border border-slate-400 px-2 py-2">OVERTIME RATE</th>
+                  <th className="w-20 border border-slate-400 px-2 py-2">BALANCE</th>
+                  <th className="w-20 border border-slate-400 px-2 py-2">WORKING HOURS</th>
+                  <th className="w-20 border border-slate-400 px-2 py-2">WORKING DAYS</th>
+                  <th className="w-20 border border-slate-400 px-2 py-2">TOTAL</th>
+                  <th className="w-20 border border-slate-400 px-2 py-2">BALANCE CUT</th>
+                  <th className="w-24 border border-slate-400 px-2 py-2">FINAL PAYMENT MADE</th>
+                  {["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"].map((day) => <th key={day} className="w-16 border border-slate-400 px-2 py-2">{day}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row, index) => {
+                  const employee = row.employee;
+                  const salaryCents = cents(employee.weekly_salary || employee.monthly_salary || 0);
+                  const automaticOvertimeHours = (employee.days || []).reduce(
+                    (sum, day) => sum + Number(day.overtime_hours || 0),
+                    0,
+                  );
+                  const values = excelAttendanceValues(employee, period);
+                  return <tr key={employee.employee_id} className="text-center">
+                    <td className="border border-slate-300 px-2 py-1 tabular-nums">{index + 1}</td>
+                    <td className="border border-slate-300 px-2 py-1 text-left font-bold text-[#2633a0]">{employee.name}</td>
+                    <td className="border border-slate-300 px-2 py-1 font-bold text-[#2633a0]">{salaryDepartment(employee)}</td>
+                    <td className="border border-slate-300 px-1 py-1 font-mono">
+                      <input
+                        type="number" min="0.01" step="0.01"
+                        value={tableDrafts[employee.employee_id + ":salary"] ?? (salaryCents / 100 || "")}
+                        onChange={(event) => setTableDrafts((current) => ({ ...current, [employee.employee_id + ":salary"]: event.target.value }))}
+                        onBlur={(event) => saveTableSalary(employee, event.target.value)}
+                        disabled={!!row.payment || !!savingIds[employee.employee_id]}
+                        className="w-16 bg-transparent px-1 text-center outline-none"
+                        aria-label={`Salary for ${employee.name}`}
+                      />
+                    </td>
+                    <td className="border border-slate-300 px-1 py-1 bg-[#f4f8f5] font-mono text-slate-700" title="Calculated automatically from Attendance">
+                      <span className="block px-1 py-1 text-center" aria-label={`Automatic overtime hours for ${employee.name}: ${automaticOvertimeHours}`}>
+                        {automaticOvertimeHours}
+                      </span>
+                      <span className="block text-[8px] font-bold uppercase text-[#34725c]">AUTO</span>
+                    </td>
+                    <td className="border border-slate-300 px-1 py-1 font-mono">
+                      <input
+                        type="number" min="0" step="0.01"
+                        value={tableDrafts[employee.employee_id + ":overtime_rate"] ?? (employee.overtime_rate ?? 20)}
+                        onChange={(event) => setTableDrafts((current) => ({ ...current, [employee.employee_id + ":overtime_rate"]: event.target.value }))}
+                        onBlur={(event) => saveTableOvertime(employee, automaticOvertimeHours, event.target.value)}
+                        disabled={!!row.payment || !!savingIds[employee.employee_id]}
+                        className="w-16 bg-transparent px-1 text-center outline-none"
+                        aria-label={`Overtime rate for ${employee.name}`}
+                      />
+                    </td>
+                    <td className="border border-slate-300 px-1 py-1 font-mono">
+                      <button
+                        type="button"
+                        onClick={() => setAdvanceModal({ employee_id: employee.employee_id, employee_name: employee.name, amount: "", date: today(), notes: "" })}
+                        className="w-full px-1 py-1 text-center text-[#2633a0] hover:underline"
+                        title="Add balance"
+                      >{employee.balance_before_period || 0}</button>
+                    </td>
+                    <td className="border border-slate-300 px-2 py-1 font-mono">{employee.worked_hours || 0}</td>
+                    <td className="border border-slate-300 px-2 py-1 font-mono">{Number(employee.present_days || 0) + Number(employee.half_days || 0) * 0.5}</td>
+                    <td className="border border-slate-300 px-2 py-1 font-mono font-bold">{employee.gross_salary || 0}</td>
+                    <td className="border border-slate-300 px-1 py-1 font-mono text-red-700">
+                      <input
+                        type="number" min="0" step="0.01"
+                        value={tableDrafts[employee.employee_id + ":cut"] ?? (employee.cut || 0)}
+                        onChange={(event) => setTableDrafts((current) => ({ ...current, [employee.employee_id + ":cut"]: event.target.value }))}
+                        onBlur={(event) => saveTableCut(employee, event.target.value)}
+                        disabled={!!row.payment || !!savingIds[employee.employee_id]}
+                        className="w-16 bg-transparent px-1 text-center text-red-700 outline-none"
+                        aria-label={`Balance cut for ${employee.name}`}
+                      />
+                    </td>
+                    <td className="border border-slate-300 px-1 py-1 font-mono font-bold">
+                      {row.payment
+                        ? fmtMoney(row.payment.net_amount)
+                        : <button
+                            type="button"
+                            onClick={() => {
+                              if (isSuperIqFoam) {
+                                const dueCents = cents(employee.net_salary) * 1;
+                                setWeeklyPaymentModal({
+                                  employee: {
+                                    employee_id: employee.employee_id,
+                                    employee_name: employee.name,
+                                    due_cents: dueCents,
+                                    remaining_cents: dueCents,
+                                  },
+                                  paymentDate: period.start ? addDays(period.start, 5) : today(),
+                                  amount: String(dueCents / 100),
+                                  notes: "",
+                                });
+                              } else {
+                                markPaid(row);
+                              }
+                            }}
+                            disabled={!!savingIds[employee.employee_id] || Number(employee.net_salary || 0) <= 0}
+                            className="w-full rounded bg-slate-950 px-2 py-1 text-[10px] font-bold text-white disabled:cursor-not-allowed disabled:opacity-40"
+                          >PAY</button>}
+                    </td>
+                    {values.map((value, dayIndex) => {
+                      const date = addDays(period.start, dayIndex);
+                      const draftKey = employee.employee_id + ":day:" + date;
+                      return <td key={dayIndex} className="border border-slate-300 px-1 py-1 font-mono">
+                        {isPieceworkTailor(employee)
+                          ? <input
+                              type="number" min="0" step="1"
+                              value={tableDrafts[draftKey] ?? (value === "" ? 0 : value)}
+                              onChange={(event) => setTableDrafts((current) => ({ ...current, [draftKey]: event.target.value }))}
+                              onBlur={(event) => saveTableProduction(employee, date, event.target.value)}
+                              disabled={!!row.payment || !!savingIds[employee.employee_id]}
+                              className="w-12 bg-transparent px-1 text-center outline-none"
+                              aria-label={`Pieces for ${employee.name} on ${date}`}
+                            />
+                          : <select
+                              value={tableDrafts[draftKey] ?? (value === 1 ? "1" : value === 0.5 ? "0.5" : value === 0 ? "0" : "")}
+                              onChange={(event) => {
+                                setTableDrafts((current) => ({ ...current, [draftKey]: event.target.value }))
+                                saveTableAttendance(employee, date, event.target.value);
+                              }}
+                              disabled={!!row.payment || !!savingIds[employee.employee_id]}
+                              className="w-12 bg-transparent text-center outline-none"
+                              aria-label={`Attendance for ${employee.name} on ${date}`}
+                            >
+                              <option value="">-</option>
+                              <option value="1">1</option>
+                              <option value="0.5">0.5</option>
+                              <option value="x">x</option>
+                              <option value="0">0</option>
+                            </select>}
+                      </td>;
+                    })}
+                  </tr>;
+                })}
+              </tbody>
+              <tfoot>
+                <tr className="bg-[#0f5b87] text-center font-bold text-white">
+                  <td className="border border-slate-300 px-2 py-2" colSpan={3}>TOTALS</td>
+                  <td className="border border-slate-300 px-2 py-2 font-mono">{fmtMoney(rows.reduce((sum, row) => sum + cents(row.employee.weekly_salary || row.employee.monthly_salary || 0), 0) / 100)}</td>
+                  <td className="border border-slate-300 px-2 py-2">{rows.reduce((sum, row) => sum + Number(row.employee.overtime_hours || 0), 0)}</td>
+                  <td className="border border-slate-300 px-2 py-2 font-mono">{fmtMoney(rows.reduce((sum, row) => sum + cents(row.employee.overtime_pay), 0) / 100)}</td>
+                  <td className="border border-slate-300 px-2 py-2 font-mono">{fmtMoney(rows.reduce((sum, row) => sum + cents(row.employee.balance_before_period), 0) / 100)}</td>
+                  <td className="border border-slate-300 px-2 py-2">{rows.reduce((sum, row) => sum + Number(row.employee.worked_hours || 0), 0)}</td>
+                  <td className="border border-slate-300 px-2 py-2">{rows.reduce((sum, row) => sum + Number(row.employee.present_days || 0) + Number(row.employee.half_days || 0) * 0.5, 0)}</td>
+                  <td className="border border-slate-300 px-2 py-2 font-mono">{fmtMoney(totals.grossCents / 100)}</td>
+                  <td className="border border-slate-300 px-2 py-2 font-mono">{fmtMoney(totals.cutCents / 100)}</td>
+                  <td className="border border-slate-300 px-2 py-2 font-mono">{fmtMoney(totals.netCents / 100)}</td>
+                  {[0, 1, 2, 3, 4, 5, 6].map((day) => <td key={day} className="border border-slate-300 px-2 py-2">—</td>)}
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </section>}
 
         {weeklySplitView ? weeklyPlan ? <section className="space-y-4" aria-label="Weekly salary payment summary" data-testid="weekly-salary-payment-summary">
           <div>
@@ -1145,7 +1490,7 @@ export default function SalariesManagement() {
           </div>
         </section> : <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900" role="alert">
           Weekly payment assignments are unavailable. Reload the payroll before recording a payment.
-        </div> : <section className="overflow-hidden rounded-3xl bg-[#111312] p-5 text-white shadow-[0_16px_40px_rgba(15,23,42,0.16)] sm:p-7" aria-label="Payroll summary">
+        </div> : <section className="hidden overflow-hidden rounded-3xl bg-[#111312] p-5 text-white shadow-[0_16px_40px_rgba(15,23,42,0.16)] sm:p-7" aria-label="Payroll summary">
           <div className="grid gap-5 sm:grid-cols-3 sm:gap-0">
             <div className="sm:px-5 sm:first:pl-0">
               <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-white/55">Total salaries</p>
@@ -1169,7 +1514,7 @@ export default function SalariesManagement() {
           Please recalculate salaries. The total shown before payment was incorrect and has been updated.
         </p>}
 
-        {weeklySplitView ? <section className="space-y-5" aria-label="Friday and Saturday salary groups">
+        {weeklySplitView ? <section className="hidden space-y-5" aria-label="Friday and Saturday salary groups">
           <div className="flex flex-wrap items-end justify-between gap-3">
             <div>
               <h3 className="font-display text-xl font-semibold text-slate-950">Friday &amp; Saturday payments</h3>
@@ -1353,13 +1698,13 @@ export default function SalariesManagement() {
               </Card>;
             })}
           </div> : <div className="rounded-2xl border border-slate-200 bg-white p-8 text-center text-sm text-slate-500" role="status">Loading Friday and Saturday groups…</div>}
-        </section> : <section className="space-y-4" aria-label="Employee payroll">
+        </section> : <section className="hidden space-y-4" aria-label="Employee payroll">
           <div className="flex flex-wrap items-end justify-between gap-3">
             <div>
               <h3 className="font-display text-xl font-semibold text-slate-950">Employee payroll</h3>
               <p className="mt-1 text-xs text-slate-500">
                 {periodType === "weekly"
-                  ? `${displayDate(weekStart)} – ${displayDate(selectedSunday)}`
+                  ? `${displayDate(period?.start)} – ${displayDate(period?.end)}`
                   : displayMonth(monthValue)}
                 {report ? ` · ${report.employees.length} employees` : ""}
               </p>

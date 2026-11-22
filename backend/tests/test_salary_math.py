@@ -7,7 +7,10 @@ from salary_math import calculate_salary_hours
 from salary_math import (
     calculate_attendance,
     calculate_overtime,
+    calculate_net_and_balance,
+    calculate_period_totals,
     calculate_piecework_formula,
+    calculate_salary_rule,
     calculate_standard_salary,
 )
 
@@ -26,6 +29,41 @@ def test_overtime_uses_configurable_employee_rate():
     assert calculate_overtime(64, 3.5) == 224
     assert calculate_overtime(62, 5) == 310
     assert calculate_overtime(12, 3.5) == 42
+
+
+def test_standard_salary_rules_support_excel_divisors():
+    assert calculate_salary_rule(1000, 40, 20, divisor=48)["gross"] == 853.33
+    assert calculate_salary_rule(1000, 40, 20, divisor=30)["gross"] == 1353.33
+    assert calculate_salary_rule(1000, 40, 20, divisor=6)["gross"] == 6686.67
+
+
+def test_net_and_balance_keep_cut_separate_from_payment():
+    result = calculate_net_and_balance(900, 100, opening_balance=250)
+    assert result["net_pay"] == 800
+    assert result["remaining_balance"] == 150
+    assert result["balance_cut"] == 100
+
+
+def test_period_totals_are_aggregated_from_records_not_excel_ranges():
+    totals = calculate_period_totals([{
+        "weekly_salary": 1000,
+        "overtime_hours": 2,
+        "overtime_pay": 20,
+        "balance_before_period": 250,
+        "gross_salary": 853.33,
+        "cut": 100,
+        "net_salary": 753.33,
+        "balance_after_period": 150,
+    }])
+    assert totals["gross_salary"] == 853.33
+    assert totals["net_salary"] == 753.33
+    assert totals["remaining_balance"] == 150
+
+
+def test_uppercase_x_and_invalid_attendance_values_are_distinct():
+    assert calculate_attendance(["X"])["worked_hours"] == 8
+    with pytest.raises(ValueError, match="Invalid attendance value"):
+        calculate_attendance([2])
 
 
 def test_manually_recorded_overtime_is_used_when_no_shift_times_are_saved():
@@ -57,7 +95,7 @@ def test_piecework_formula_follows_each_named_variant():
     [
         ("A", 625), ("B", 675), ("C", 665), ("D", 725),
         ("E", 615), ("F", 595), ("G", 635), ("H", 675),
-        ("I", 665), ("J", 475), ("K", 595), ("L", 635),
+        ("I", 665), ("J", 615), ("K", 595), ("L", 635),
         ("M", 675), ("N", 665),
     ],
 )

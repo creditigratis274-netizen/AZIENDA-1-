@@ -4,7 +4,7 @@ import { api, apiError } from "@/lib/api";
 import { today } from "@/lib/format";
 import { calculateAttendanceHours } from "@/lib/attendanceHours.mjs";
 import { Card, Btn, Input, Select, Modal, PageHeader, Empty } from "@/components/common";
-import { Users, Plus, CheckCheck, Pencil, CalendarCheck, Wallet, Trash2, Download } from "lucide-react";
+import { Users, Plus, CheckCheck, Pencil, CalendarCheck, Wallet, Trash2, Download, Search } from "lucide-react";
 import SalariesManagement from "@/pages/SalariesManagement";
 import { useAuth } from "@/context/AuthContext";
 
@@ -56,6 +56,9 @@ export default function Attendance() {
   const [workTimeDraft, setWorkTimeDraft] = useState({});
   const [shiftModeDraft, setShiftModeDraft] = useState({});
   const [workTimeSaving, setWorkTimeSaving] = useState({});
+  const [employeeSearch, setEmployeeSearch] = useState("");
+  const [overtimeDraft, setOvertimeDraft] = useState({});
+  const [overtimeSaving, setOvertimeSaving] = useState({});
   const loadRequest = useRef(0);
   const attendanceSavingRef = useRef(new Set());
   const pieceSavingRef = useRef(new Set());
@@ -100,6 +103,12 @@ export default function Attendance() {
   }, [date]);
 
   const active = employees.filter((e) => e.active !== false);
+  const visibleActive = active.filter((employee) => {
+    const query = employeeSearch.trim().toLocaleLowerCase();
+    if (!query) return true;
+    return `${employee.name || ""} ${employee.id || ""} ${employee.department || ""}`
+      .toLocaleLowerCase().includes(query);
+  });
   const employeeDepartmentOptions = isIqfoamWholesaler || isImraanPlastics
     ? companyDepartments
     : DEPTS;
@@ -112,12 +121,12 @@ export default function Attendance() {
   };
   const groups = useMemo(() => {
     const g = {};
-    active.forEach((e) => {
+    visibleActive.forEach((e) => {
       const department = employeeDepartment(e);
       (g[department] ||= []).push(e);
     });
     return Object.entries(g).sort(([a], [b]) => a.localeCompare(b));
-  }, [active]);
+  }, [visibleActive]);
   const present = active.filter((e) => ["Present", "Half Day"].includes(statusOf(e.id))).length;
   const absent = active.filter((e) => statusOf(e.id) === "Absent").length;
 
@@ -163,7 +172,7 @@ export default function Attendance() {
       department: employee.department || "",
       date,
       status,
-      overtime_hours: 0,
+      overtime_hours: status === "Absent" ? 0 : (previous?.overtime_hours ?? 0),
       start_time: status === "Absent" ? null : times.start_time,
       end_time: status === "Absent" ? null : times.end_time,
     };
@@ -195,6 +204,39 @@ export default function Attendance() {
       setAttendanceSaving((current) => ({ ...current, [employee.id]: false }));
     }
   };
+  const saveOvertime = async (employee) => {
+    const record = records.find((item) => item.employee_id === employee.id && item.date === date);
+    if (!record || !["Present", "Half Day"].includes(record.status)) {
+      toast.error("Mark the employee present before saving overtime.");
+      return;
+    }
+    const overtime = Number(overtimeDraft[employee.id] ?? record.overtime_hours ?? 0);
+    if (!Number.isFinite(overtime) || overtime < 0 || overtime > 24) {
+      toast.error("Overtime hours must be between 0 and 24.");
+      return;
+    }
+    setOvertimeSaving((current) => ({ ...current, [employee.id]: true }));
+    try {
+      const saved = await api.post("/attendance", {
+        employee_id: employee.id,
+        date,
+        status: record.status,
+        overtime_hours: overtime,
+        start_time: record.start_time ?? null,
+        end_time: record.end_time ?? null,
+      });
+      setRecords((current) => current.map((item) =>
+        item.employee_id === employee.id && item.date === date ? saved : item,
+      ));
+      setOvertimeDraft((current) => { const next = { ...current }; delete next[employee.id]; return next; });
+      toast.success(`Overtime saved for ${employee.name}`);
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setOvertimeSaving((current) => ({ ...current, [employee.id]: false }));
+    }
+  };
+
   const mark = async (emp, status) => {
     const record = records.find((item) => item.employee_id === emp.id && item.date === date);
     const saturday = new Date(`${date}T00:00:00Z`).getUTCDay() === 6;
@@ -564,7 +606,19 @@ export default function Attendance() {
       ) : (
       <>
       <div className="flex flex-wrap items-end gap-4">
-        <div className="w-48"><Input label="Date" type="date" value={date} onChange={(e) => { setDate(e.target.value); setWorkTimeDraft({}); setShiftModeDraft({}); }} data-testid="attendance-date-input" /></div>
+        <div className="w-48"><Input label="Date" type="date" value={date} onChange={(e) => { setDate(e.target.value); setWorkTimeDraft({}); setShiftModeDraft({}); setOvertimeDraft({}); }} data-testid="attendance-date-input" /></div>
+        <div className="relative min-w-[220px] flex-1 sm:max-w-sm">
+          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+          <input
+            type="search"
+            value={employeeSearch}
+            onChange={(event) => setEmployeeSearch(event.target.value)}
+            placeholder="Search employee, ID or department"
+            aria-label="Search attendance employees"
+            className="h-11 w-full rounded-xl border border-slate-200 bg-white pl-10 pr-3 text-sm text-slate-800 outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/10"
+            data-testid="attendance-search"
+          />
+        </div>
       </div>
       <div className={`grid grid-cols-2 ${isSuperIqFoam ? "lg:grid-cols-4" : "lg:grid-cols-5"} gap-4`}>
         <Stat l="Present (day)" v={loading ? "..." : present} cls="text-emerald-600" k="day-present" />
@@ -573,7 +627,7 @@ export default function Attendance() {
         <Stat l="Present days (week)" v={loading ? "..." : summary?.week_total ?? 0} cls="text-slate-800" k="week" />
         <Stat l="Present days (month)" v={loading ? "..." : summary?.month_total ?? 0} cls="text-slate-800" k="month" />
       </div>
-      {loading ? <Card><p className="p-6 text-sm text-slate-400" role="status">Loading employees...</p></Card> : active.length === 0 ? <Card><Empty icon={Users} title="No employees yet" hint="Add employees with the + Employee button." /></Card> : groups.map(([dept, list]) => (
+      {loading ? <Card><p className="p-6 text-sm text-slate-400" role="status">Loading employees...</p></Card> : active.length === 0 ? <Card><Empty icon={Users} title="No employees yet" hint="Add employees with the + Employee button." /></Card> : visibleActive.length === 0 ? <Card><Empty icon={Search} title="No employees match the search" hint="Try a name, employee ID or department." /></Card> : groups.map(([dept, list]) => (
         <Card key={dept} className="p-4">
           <p className="text-xs font-bold uppercase text-slate-500 mb-3">{dept} <span className="text-slate-300">· {list.length}</span></p>
           <div className="space-y-2">{list.map((e) => {
@@ -624,6 +678,26 @@ export default function Attendance() {
                     Delete
                   </Btn>}
                 </>}
+                <div className="w-36">
+                  <Input
+                    label="Overtime hours"
+                    type="number"
+                    min="0"
+                    max="24"
+                    step="0.25"
+                    value={overtimeDraft[e.id] ?? record?.overtime_hours ?? 0}
+                    onChange={(event) => setOvertimeDraft((current) => ({ ...current, [e.id]: event.target.value }))}
+                    disabled={!!overtimeSaving[e.id] || !["Present", "Half Day"].includes(s)}
+                    data-testid={`attendance-overtime-${e.id}`}
+                  />
+                  <Btn
+                    variant="outline"
+                    className="mt-2 h-8 w-full px-2 text-xs"
+                    onClick={() => saveOvertime(e)}
+                    disabled={!!overtimeSaving[e.id] || !["Present", "Half Day"].includes(s)}
+                    data-testid={`attendance-overtime-save-${e.id}`}
+                  >{overtimeSaving[e.id] ? "Saving…" : "Save overtime"}</Btn>
+                </div>
                 {isSuperIqFoam ? (
                   <label className="inline-flex h-12 items-center gap-2 rounded-xl border border-border px-4 text-sm font-semibold text-slate-700">
                     <input
