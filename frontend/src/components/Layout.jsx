@@ -73,7 +73,7 @@ function SidebarContent({ onNav, companyName, companyId, user, interfaceConfig }
         </div>
         <div>
           <div className="text-white font-bold text-base font-display leading-tight">{companyName || "SUPER IQ-FOAM"}</div>
-          <div className="erp-sidebar-subtitle text-emerald-100/55 text-[10px] font-semibold uppercase tracking-[0.16em]">Business Management</div>
+          <div className="erp-sidebar-subtitle text-emerald-100/55 text-[10px] font-semibold uppercase tracking-[0.16em]">KOKSTAD</div>
         </div>
       </div>
       <nav className="erp-sidebar-nav relative z-10 flex-1 px-2 py-2 space-y-0.5 overflow-y-auto">
