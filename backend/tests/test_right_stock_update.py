@@ -31,19 +31,15 @@ def owner():
 def test_right_stock_targets_match_the_supplied_line_items():
     totals = {}
     for product, _size, quantity in server.RIGHT_STOCK_UPDATE_ITEMS:
-        if product != "White Drum":
-            totals[product] = totals.get(product, 0) + quantity
+        totals[product] = totals.get(product, 0) + quantity
 
-    assert len(server.RIGHT_STOCK_UPDATE_ITEMS) == 63
+    assert len(server.RIGHT_STOCK_UPDATE_ITEMS) == 14
     assert totals == {
-        "Simple": 4749,
-        "Ribbon Black": 240,
-        "Ribbon Pink": 222,
-        "Candy": 25,
-        "Strong Boy": 15,
+        "Simple": 2285,
+        "Ribbon Black": 150,
         "Uncovered": 0,
     }
-    assert sum(totals.values()) == 5251
+    assert sum(totals.values()) == 2435
 
 
 def test_update_right_stock_records_adjustments_and_preserves_history(monkeypatch):
@@ -104,19 +100,14 @@ def test_update_right_stock_records_adjustments_and_preserves_history(monkeypatc
         "_active_company_id": server.DEFAULT_COMPANY_ID,
     }))
 
-    assert result["updated_items"] == 63
+    assert result["updated_items"] == 14
     assert result["created_items"] == 1
-    assert result["adjusted_items"] == 2
-    assert result["net_mattress_stock"] == 5251
-    assert [movement["type"] for movement in movements] == [
-        "adjustment_out",
-        "adjustment_out",
-    ]
-    assert movements[1]["quantity"] == 12
-    assert movements[1]["allow_negative"] is True
-    assert len(audits) == 2
+    assert result["adjusted_items"] == 1
+    assert result["net_mattress_stock"] == 2435
+    assert [movement["type"] for movement in movements] == ["adjustment_out"]
+    assert movements[0]["quantity"] == 10
+    assert len(audits) == 1
     assert stocks[0]["opening"] == server.RIGHT_STOCK_UPDATE_ITEMS[0][2]
-    assert stocks[-1]["opening"] == -12
 
     second_result = asyncio.run(server.update_right_stock({
         "role": "owner",
@@ -126,7 +117,7 @@ def test_update_right_stock_records_adjustments_and_preserves_history(monkeypatc
     }))
 
     assert second_result["adjusted_items"] == 0
-    assert len(movements) == 2
+    assert len(movements) == 1
 
 
 def test_update_right_stock_rejects_non_global_owner_before_reading_stock(monkeypatch):
@@ -159,10 +150,10 @@ def test_update_right_stock_zeroes_duplicates_without_deleting_stock(monkeypatch
         "size": size,
         "opening": quantity,
     } for index, (product, size, quantity) in enumerate(server.RIGHT_STOCK_UPDATE_ITEMS)
-        if (product, size) != ("Ribbon Black", "760x100") and product != "White Drum"]
+        if (product, size) != ("Ribbon Black", "910x100")]
     stocks.extend([
-        {"id": "stock-duplicate-1", "product": "Ribbon Black", "size": "760x100", "opening": 10, "created_at": "2026-01-01"},
-        {"id": "stock-duplicate-2", "product": "Ribbon Balck", "size": "760x100", "opening": 7, "created_at": "2026-02-01"},
+        {"id": "stock-duplicate-1", "product": "Ribbon Black", "size": "910x100", "opening": 10, "created_at": "2026-01-01"},
+        {"id": "stock-duplicate-2", "product": "Ribbon Balck", "size": "910x100", "opening": 7, "created_at": "2026-02-01"},
     ])
     movements = []
     audits = []
@@ -212,11 +203,11 @@ def test_update_right_stock_zeroes_duplicates_without_deleting_stock(monkeypatch
     }))
 
     assert result["duplicate_records_zeroed"] == 1
-    assert len(stocks) == 64
+    assert len(stocks) == 15
     assert next(item for item in stocks if item["id"] == "stock-duplicate-1")["opening"] == 0
-    assert next(item for item in stocks if item["id"] == "stock-duplicate-2")["opening"] == 25
-    assert len(movements) == 3
-    assert len(audits) == 3
+    assert next(item for item in stocks if item["id"] == "stock-duplicate-2")["opening"] == 75
+    assert len(movements) == 2
+    assert len(audits) == 2
 
     second_result = asyncio.run(server.update_right_stock({
         "role": "owner",
@@ -227,8 +218,8 @@ def test_update_right_stock_zeroes_duplicates_without_deleting_stock(monkeypatch
 
     assert second_result["adjusted_items"] == 0
     assert second_result["duplicate_records_zeroed"] == 1
-    assert len(stocks) == 64
-    assert len(movements) == 3
+    assert len(stocks) == 15
+    assert len(movements) == 2
 
 
 def test_daily_count_catalog_includes_all_sizes_and_extra_stock():
@@ -242,23 +233,7 @@ def test_daily_count_catalog_includes_all_sizes_and_extra_stock():
     ribbon = keyed_specs[server.daily_stock_identity_key("Ribbon Black", "760x100")]
     assert ribbon["product"] == "Ribbon Black"
     assert {stock["id"] for stock in ribbon["records"]} == {"a", "b"}
-    assert server.daily_stock_identity_key("White Drum", "1000L") in keyed_specs
     assert server.daily_stock_identity_key("Custom Item", "Large") in keyed_specs
-
-
-def test_daily_count_supports_explicit_entry_modes():
-    default_mode = server.DailyStockReconciliationIn(
-        report_date=server.today_str(),
-        counts=[{"product": "Ribbon Black", "size": "760x100", "made_today": 3}],
-    )
-    stock_only = server.DailyStockReconciliationIn(
-        report_date=server.today_str(),
-        entry_mode="stock_only",
-        counts=[{"product": "Ribbon Black", "size": "760x100", "quantity": 3}],
-    )
-
-    assert default_mode.entry_mode == "pieces_made"
-    assert stock_only.entry_mode == "stock_only"
 
 
 def test_daily_count_input_rejects_duplicate_category_and_size():

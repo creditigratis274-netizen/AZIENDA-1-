@@ -113,6 +113,21 @@ export default function Stock() {
     }
   };
 
+  const reupdateStock = async () => {
+    if (busy || updatingRightStock) return;
+    if (!window.confirm("REUPDATE STOCK? This sets the 14 supplied SUPERIQFOAM quantities while preserving all other stock records.")) return;
+    setUpdatingRightStock(true);
+    try {
+      const result = await api.post("/stock/update-right-stock", {});
+      toast.success(`Stock reupdated: ${result.updated_items} supplied rows checked, ${result.adjusted_items} adjusted`);
+      load();
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setUpdatingRightStock(false);
+    }
+  };
+
   const openDailyCountSheet = async () => {
     if (busy || updatingRightStock) return;
     setUpdatingRightStock(true);
@@ -395,6 +410,15 @@ export default function Stock() {
         <div className="no-print mb-5 flex flex-wrap items-center gap-2 border-b border-slate-200 pb-4" data-testid="stock-update-actions">
           {user?.is_primary_owner && user?.is_owner && (
             <>
+              <Btn
+                type="button"
+                variant="outline"
+                onClick={reupdateStock}
+                disabled={updatingRightStock || busy || list === null}
+                data-testid="reupdate-superiqfoam-stock"
+              >
+                {updatingRightStock ? "Reupdating..." : "REUPDATE STOCK"}
+              </Btn>
               <Btn
                 type="button"
                 onClick={openDailyCountSheet}
