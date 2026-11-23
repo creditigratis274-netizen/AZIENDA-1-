@@ -95,11 +95,13 @@ export default defineConfig(async ({ mode, command }) => {
         .map(([key, value]) => [`process.env.${key}`, JSON.stringify(value)]),
     ),
     resolve: {
+      dedupe: ["react", "react-dom"],
       alias: [{ find: "@", replacement: path.resolve(__dirname, "./src") }],
     },
     // Every shipped dep, pre-bundled up front. Vite discovers deps lazily, so the first
     // import outside the initial graph would trigger a re-optimize + reload mid-session.
     optimizeDeps: {
+      force: true,
       // The dependency scanner runs without user plugins, so it must be told itself that
       // src/**/*.js carries JSX (otherwise it fails the scan and skips pre-bundling).
       rolldownOptions: { moduleTypes: { ".js": "jsx" } },
@@ -151,6 +153,7 @@ export default defineConfig(async ({ mode, command }) => {
         "prop-types",
         "react",
         "react-day-picker",
+        "react-dom",
         "react-dom/client",
         "react-hook-form",
         "react-is",
