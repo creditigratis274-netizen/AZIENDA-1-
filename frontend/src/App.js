@@ -9,6 +9,9 @@ import Layout from "@/components/Layout";
 import { pageLoaders } from "@/lib/pageLoaders";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { ArrowRight, Layers } from "lucide-react";
+import { api } from "@/lib/api";
+import { today, TZ } from "@/lib/format";
+import { createDailyReportPdf } from "@/lib/dailyReportPdf";
 
 const AuthCallback = lazy(() => import("@/pages/AuthCallback"));
 const Login = lazy(() => import("@/pages/Login"));
@@ -100,6 +103,82 @@ class SharedInvoiceErrorBoundary extends Component {
   }
 }
 
+function ScheduledDailyReportSender({ user }) {
+  useEffect(() => {
+    if (!user?.is_owner || user?.company_id !== "superiqfoam") return undefined;
+    if (localStorage.getItem("daily-report-whatsapp-enabled") !== "true") return undefined;
+    const token = (localStorage.getItem("daily-report-whatsapp-token") || "").trim().replace(/^['"]|['"]$/g, "");
+    const phone = (localStorage.getItem("daily-report-whatsapp-phone") || "+393932201409").replace(/[^+0-9]/g, "");
+    const scheduledTime = localStorage.getItem("daily-report-whatsapp-time") || "17:00";
+    const timeMatch = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(scheduledTime);
+    if (!token || !/^\+[1-9]\d{7,14}$/.test(phone) || !timeMatch) return undefined;
+
+    let active = true;
+    let timeoutId;
+    const sentDatesKey = "daily-report-whatsapp-sent-dates";
+
+    const scheduleNext = () => {
+      const now = new Date();
+      const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: TZ,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hourCycle: "h23",
+      }).formatToParts(now);
+      const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+      const localDate = new Date(Date.UTC(
+        Number(values.year),
+        Number(values.month) - 1,
+        Number(values.day),
+        Number(values.hour),
+        Number(values.minute),
+        Number(values.second),
+      ));
+      const nextRun = new Date(localDate);
+      nextRun.setUTCHours(Number(timeMatch[1]), Number(timeMatch[2]), 0, 0);
+      if (nextRun <= localDate) nextRun.setUTCDate(nextRun.getUTCDate() + 1);
+      const delay = nextRun.getTime() - localDate.getTime();
+      timeoutId = window.setTimeout(async () => {
+        if (!active) return;
+        const date = today();
+        let sentDates = [];
+        try { sentDates = JSON.parse(localStorage.getItem(sentDatesKey) || "[]"); } catch (_) {}
+        const sentKey = `${date}|${phone}|${scheduledTime}`;
+        if (!sentDates.includes(sentKey)) {
+          try {
+            const report = await api.getUncached("/daily-report", { report_date: date });
+            const { blob, filename } = await createDailyReportPdf(report, report.main_invoice_no);
+            const form = new FormData();
+            form.append("phone", phone);
+            form.append("message", `Daily Report ${date}`);
+            form.append("invoice_id", `daily-report-${date}`);
+            form.append("company_id", "superiqfoam");
+            form.append("invoice", blob, filename);
+            const response = await fetch("http://127.0.0.1:8765/api/v1/whatsapp", {
+              method: "POST",
+              headers: { Authorization: `Bearer ${token}` },
+              body: form,
+            });
+            if (!response.ok) throw new Error(`WhatsApp helper returned ${response.status}`);
+            sentDates = [sentKey, ...sentDates].slice(0, 30);
+            localStorage.setItem(sentDatesKey, JSON.stringify(sentDates));
+          } catch (_) {}
+        }
+        scheduleNext();
+      }, delay);
+    };
+
+    scheduleNext();
+    return () => { active = false; window.clearTimeout(timeoutId); };
+  }, [user]);
+
+  return null;
+}
+
 function Protected({ children }) {
   const { user, booting } = useAuth();
   const location = useLocation();
@@ -178,7 +257,7 @@ function Protected({ children }) {
     }
   }
   if (user.is_owner && user.company_id === "superiqfoam") {
-    return <OwnerWelcome key={localStorage.getItem("token")} user={user}>{children}</OwnerWelcome>;
+    return <><ScheduledDailyReportSender user={user} /><OwnerWelcome key={localStorage.getItem("token")} user={user}>{children}</OwnerWelcome></>;
   }
   return children;
 }

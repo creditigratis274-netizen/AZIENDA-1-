@@ -47,7 +47,6 @@ export default function ClientPayments({ express = false }) {
   const [expressPayments, setExpressPayments] = useState([]);
   const [expressPaymentsLoading, setExpressPaymentsLoading] = useState(false);
   const [expressPaymentsError, setExpressPaymentsError] = useState("");
-  const [updatingExpressPaymentId, setUpdatingExpressPaymentId] = useState("");
 
   const loadCustomers = () => Promise.all([
     api.get("/customers"),
@@ -264,30 +263,8 @@ export default function ClientPayments({ express = false }) {
     }
   };
 
-  const setExpressPaymentDailyReportInclusion = async (record) => {
-    if (updatingExpressPaymentId) return;
-    const included = !record.include_on_daily_report;
-    setUpdatingExpressPaymentId(record.id);
-    setExpressPaymentsError("");
-    try {
-      await api.post(`/payments/${record.id}/daily-report`, { included });
-      setExpressPayments((current) => current.map((paymentRecord) => (
-        paymentRecord.id === record.id
-          ? { ...paymentRecord, include_on_daily_report: included }
-          : paymentRecord
-      )));
-      toast.success(included ? "Payment included in the daily report" : "Payment removed from the daily report");
-    } catch (error) {
-      setExpressPaymentsError(apiError(error));
-      toast.error(apiError(error));
-    } finally {
-      setUpdatingExpressPaymentId("");
-    }
-  };
-
   const expressPaymentsTotal = expressPayments.reduce((total, record) => total + toCents(record.amount), 0) / 100;
   const expressPaymentsReportTotal = expressPayments
-    .filter((record) => record.include_on_daily_report)
     .reduce((total, record) => total + toCents(record.amount), 0) / 100;
 
   const mostUsedZone = (invoices, fallback) => {
@@ -588,7 +565,7 @@ export default function ClientPayments({ express = false }) {
                 <p className="font-mono font-bold text-emerald-700" data-testid={express ? "express-payments-summary-total" : "payments-summary-total"}>{fmtMoney(expressPaymentsTotal)}</p>
               </div>
               {express && <div className="rounded-lg bg-blue-50 px-4 py-2">
-                <p className="text-xs text-slate-500">Selected for Daily Report</p>
+                <p className="text-xs text-slate-500">Automatically included in Daily Report</p>
                 <p className="font-mono font-bold text-blue-700" data-testid="express-payments-report-total">{fmtMoney(expressPaymentsReportTotal)}</p>
               </div>}
             </div>
@@ -609,7 +586,6 @@ export default function ClientPayments({ express = false }) {
                     <th className="px-3 py-2">Method</th>
                     <th className="px-3 py-2">Reference / notes</th>
                     <th className="px-3 py-2 text-right">Amount</th>
-                    {express && <th className="px-3 py-2 text-center">Daily Report</th>}
                   </tr>
                 </thead>
                 <tbody>
@@ -620,17 +596,6 @@ export default function ClientPayments({ express = false }) {
                       <td className="px-3 py-2">{record.method || "—"}</td>
                       <td className="px-3 py-2 text-slate-500">{[record.reference, record.notes].filter(Boolean).join(" · ") || "—"}</td>
                       <td className="whitespace-nowrap px-3 py-2 text-right font-mono font-semibold text-emerald-700">{fmtMoney(record.amount)}</td>
-                      {express && <td className="px-3 py-2 text-center">
-                        <input
-                          type="checkbox"
-                          checked={!!record.include_on_daily_report}
-                          disabled={!!updatingExpressPaymentId}
-                          onChange={() => setExpressPaymentDailyReportInclusion(record)}
-                          aria-label={`Include payment for ${record.customer_name || record.invoice_number || "client"} on Daily Report`}
-                          data-testid={`express-payment-daily-report-${record.id}`}
-                          className="h-4 w-4 accent-emerald-600"
-                        />
-                      </td>}
                     </tr>
                   ))}
                 </tbody>

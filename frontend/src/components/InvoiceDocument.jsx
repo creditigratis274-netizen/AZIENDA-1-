@@ -87,9 +87,11 @@ export const InvoiceDocument = forwardRef(function InvoiceDocument({
         {activePrintTemplate?.logo_data_url
           ? <img src={activePrintTemplate.logo_data_url} alt="" className="h-11 max-w-36 object-contain" />
           : <Logo />}
-        <div>
-          <p className="text-[24px] font-extrabold leading-tight tracking-tight"><span className="text-blue-700">{invoiceBrand.blue}</span>{invoiceBrand.blue && invoiceBrand.black ? " " : ""}<span className="text-slate-950">{invoiceBrand.black}</span></p>
-        </div>
+        {activePrintTemplate?.show_company_brand !== false && (
+          <div>
+            <p className="text-[24px] font-extrabold leading-tight tracking-tight"><span className="text-blue-700">{invoiceBrand.blue}</span>{invoiceBrand.blue && invoiceBrand.black ? " " : ""}<span className="text-slate-950">{invoiceBrand.black}</span></p>
+          </div>
+        )}
       </div>
       <div className="flex justify-between items-start mt-3">
         <div className="leading-5 text-slate-800">

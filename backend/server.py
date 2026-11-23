@@ -7394,7 +7394,7 @@ async def get_express_payments(payment_date: str, user=Depends(get_current_user)
             "receiving_on": payment.get("receiving_on") or "", "reference": payment.get("reference") or "",
             "notes": payment.get("notes") or "", "invoice_number": "Other balance",
             "customer_name": payment.get("customer_name") or "",
-            "include_on_daily_report": bool(payment.get("include_on_daily_report")),
+            "include_on_daily_report": True,
         }
         for payment in payments
         if payment.get("other_balance_payment") and payment.get("express")
@@ -7406,7 +7406,7 @@ async def get_express_payments(payment_date: str, user=Depends(get_current_user)
             "receiving_on": payment.get("receiving_on") or "", "reference": payment.get("reference") or "",
             "notes": payment.get("notes") or "", "invoice_number": "Advance payment",
             "customer_name": payment.get("customer_name") or "",
-            "include_on_daily_report": bool(payment.get("include_on_daily_report")),
+            "include_on_daily_report": True,
         }
         for payment in payments
         if payment.get("advance_payment") and payment.get("express")
@@ -7441,11 +7441,7 @@ async def get_express_payments(payment_date: str, user=Depends(get_current_user)
             "notes": payment.get("notes") or "",
             "invoice_number": payment.get("invoice_number") or invoice_by_id[payment["invoice_id"]].get("number") or "",
             "customer_name": payment.get("customer_name") or invoice_by_id[payment["invoice_id"]].get("customer_name") or "",
-            "include_on_daily_report": bool(
-                payment.get("include_on_daily_report")
-                if payment.get("daily_report_inclusion_set")
-                else payment.get("include_on_daily_report") or invoice_by_id[payment["invoice_id"]].get("include_on_daily_report")
-            ),
+            "include_on_daily_report": True,
         }
         for payment in payments
         if payment.get("invoice_id") in invoice_by_id and not payment.get("advance_allocation")
@@ -8757,6 +8753,19 @@ class DailyStockCountLine(BaseModel):
         return value
 
 
+class PcsOutIn(BaseModel):
+    product: str = Field(min_length=1, max_length=120)
+    size: str = Field(min_length=1, max_length=80)
+    quantity: int = Field(gt=0)
+
+    @field_validator("quantity")
+    @classmethod
+    def finite_pcs_out_quantity(cls, value):
+        if not math.isfinite(value):
+            raise ValueError("Pcs Out quantity must be finite")
+        return value
+
+
 class DailyStockReconciliationIn(BaseModel):
     report_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     counts: List[DailyStockCountLine] = Field(min_length=1)
@@ -8823,6 +8832,11 @@ async def daily_stock_reconciliation_data(report_date):
     ]
     movements_by_stock = await stock_movements_for_stock_ids(stock_ids)
     movements_today = await listall("stock_movements", {"date": report_date})
+    pcs_out_records = await listall("stock_pcs_out", {"date": report_date})
+    pcs_out_by_key = {}
+    for record in pcs_out_records:
+        key = daily_stock_identity_key(record.get("product"), record.get("size"))
+        pcs_out_by_key[key] = r2(pcs_out_by_key.get(key, 0) + float(record.get("quantity") or 0))
     movements_today_by_stock = {}
     for movement in movements_today:
         movements_today_by_stock.setdefault(movement.get("stock_id"), []).append(movement)
@@ -8865,12 +8879,16 @@ async def daily_stock_reconciliation_data(report_date):
             "dispatch_out": activity["dispatch_out"],
             "other_out": activity["other_out"],
             "received_in": activity["received_in"],
+            "pcs_out": pcs_out_by_key.get(key, 0),
+            "has_stock_record": bool(spec["records"]),
         })
+    activity = daily_stock_movement_summary(summary_movements)
+    activity["pcs_out"] = r2(sum(pcs_out_by_key.values()))
     return {
         "report_date": report_date,
         "already_submitted": bool(saved),
         "rows": rows,
-        "activity": daily_stock_movement_summary(summary_movements),
+        "activity": activity,
     }
 
 
@@ -8888,6 +8906,37 @@ async def get_daily_stock_reconciliation(user, report_date=None):
         return await daily_stock_reconciliation_data(selected_date)
     finally:
         active_company_id.reset(company_context)
+
+
+@api.get("/stock/pcs-out")
+async def get_pcs_out_route(user=Depends(get_current_user)):
+    company_id = user.get("_active_company_id") or user.get("company_id")
+    if company_id != DEFAULT_COMPANY_ID:
+        raise HTTPException(403, "Pcs Out is only available in SuperIQFoam")
+    require_global_owner(user)
+    records = await listall("stock_pcs_out", {"date": today_str()}, sort=("created_at", -1))
+    return sorted(records, key=lambda record: str(record.get("created_at") or ""), reverse=True)
+
+
+@api.post("/stock/pcs-out")
+async def add_pcs_out_route(body: PcsOutIn, user=Depends(get_current_user)):
+    company_id = user.get("_active_company_id") or user.get("company_id")
+    if company_id != DEFAULT_COMPANY_ID:
+        raise HTTPException(403, "Pcs Out is only available in SuperIQFoam")
+    require_global_owner(user)
+    product = right_stock_canonical_product(body.product)
+    size = str(body.size).strip()
+    if not product or not size:
+        raise HTTPException(400, "Product and size are required")
+    record = await insert("stock_pcs_out", {
+        "date": today_str(),
+        "product": product,
+        "size": size,
+        "quantity": body.quantity,
+    })
+    await log_audit("stock_pcs_out", record["id"], "posted", user, after=record,
+                    reason="PCS OUT - PRODUCED AND SHIPPED IMMEDIATELY")
+    return record
 
 
 @api.get("/stock/daily-reconciliation")
@@ -13742,6 +13791,7 @@ class PrintTemplateUpdate(BaseModel):
     footer_text: str = Field(default="", max_length=300)
     signature_text: str = Field(default="", max_length=100)
     show_company_details: bool = True
+    show_company_brand: bool = True
     alignment: Literal["left", "center", "right"] = "left"
     columns: List[Literal["category", "size", "quantity", "unit_price", "total"]] = Field(default_factory=list)
     print_trigger: Literal["manual", "on_issue"] = "manual"
@@ -13785,6 +13835,7 @@ def default_print_template(company_id):
         "footer_text": "",
         "signature_text": "",
         "show_company_details": True,
+        "show_company_brand": True,
         "alignment": "left",
         "columns": [],
         "print_trigger": "manual",
@@ -17154,16 +17205,13 @@ async def get_daily_report(report_date: Optional[str] = None, user=Depends(get_c
         if payment.get("advance_allocation"):
             continue
         invoice = invoice_by_id.get(payment.get("invoice_id"), {})
-        if (
-            invoice.get("invoice_type") == "express"
-            or (
-                payment.get("other_balance_payment") or payment.get("advance_payment")
-            ) and payment.get("express")
-        ):
-            if payment.get("daily_report_inclusion_set"):
-                if not payment.get("include_on_daily_report"):
-                    continue
-            elif not invoice.get("include_on_daily_report") and not payment.get("include_on_daily_report"):
+        if payment.get("express"):
+            express_payment = (
+                invoice.get("invoice_type") == "express"
+                or payment.get("other_balance_payment")
+                or payment.get("advance_payment")
+            )
+            if not express_payment:
                 continue
         note_parts = []
         for value in (

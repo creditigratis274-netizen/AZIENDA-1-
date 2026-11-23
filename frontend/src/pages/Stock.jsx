@@ -1,4 +1,5 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { toast } from "sonner";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { api, apiError } from "@/lib/api";
@@ -13,7 +14,6 @@ import { drawStockRangeReportPdf } from "@/lib/stockRangeReportPdf.mjs";
 import { canonicalStockProduct, deduplicateStockRows, normalizeStockLabel, uniqueStockCategories } from "@/lib/stockCatalog.mjs";
 
 const ProductIdentificationManager = lazy(() => import("@/components/ProductIdentificationManager"));
-const LOW_STOCKS_CATEGORY = "__low_stocks__";
 
 const MOVE_TYPES = [
   { v: "adjustment_in", l: "Manual Adjustment In (+)" },
@@ -50,10 +50,20 @@ export default function Stock() {
   const [busy, setBusy] = useState(false);
   const [updatingRightStock, setUpdatingRightStock] = useState(false);
   const [dailyCountSheet, setDailyCountSheet] = useState(null);
-  const [dailyEntryMode, setDailyEntryMode] = useState("pieces_made");
+  const [dailyCountCategory, setDailyCountCategory] = useState("");
   const [loadingDailyCount, setLoadingDailyCount] = useState(false);
+  const [pcsOutRecords, setPcsOutRecords] = useState([]);
+  const [pcsOutDraft, setPcsOutDraft] = useState({ product: "", size: "", quantity: "" });
+  const [savingPcsOut, setSavingPcsOut] = useState(false);
   const [downloadingRangeReport, setDownloadingRangeReport] = useState(false);
+  const [stockUpdatesMenu, setStockUpdatesMenu] = useState(null);
+  const [reportsMenu, setReportsMenu] = useState(null);
+  const stockUpdatesTriggerRef = useRef(null);
+  const reportsTriggerRef = useRef(null);
+  const stockUpdatesMenuRef = useRef(null);
+  const reportsMenuRef = useRef(null);
   const [valueZone, setValueZone] = useState(1);
+  const canManagePcsOut = isSuperIqFoam && user?.is_primary_owner && user?.is_owner;
 
   const loadMovements = () => loadListRequest({
     request: () => api.get("/stock/movements"),
@@ -67,6 +77,39 @@ export default function Stock() {
     if (showHist) void loadMovements();
   };
   useEffect(() => { load(); }, []);
+  useEffect(() => {
+    if (!stockUpdatesMenu && !reportsMenu) return undefined;
+    const closeMenus = (event) => {
+      if (stockUpdatesTriggerRef.current && !stockUpdatesTriggerRef.current.contains(event.target)
+        && stockUpdatesMenuRef.current && !stockUpdatesMenuRef.current.contains(event.target)) setStockUpdatesMenu(null);
+      if (reportsTriggerRef.current && !reportsTriggerRef.current.contains(event.target)
+        && reportsMenuRef.current && !reportsMenuRef.current.contains(event.target)) setReportsMenu(null);
+    };
+    const closeMenusForViewportChange = () => { setStockUpdatesMenu(null); setReportsMenu(null); };
+    document.addEventListener("pointerdown", closeMenus);
+    window.addEventListener("resize", closeMenusForViewportChange);
+    window.addEventListener("scroll", closeMenusForViewportChange, true);
+    return () => {
+      document.removeEventListener("pointerdown", closeMenus);
+      window.removeEventListener("resize", closeMenusForViewportChange);
+      window.removeEventListener("scroll", closeMenusForViewportChange, true);
+    };
+  }, [stockUpdatesMenu, reportsMenu]);
+
+  const openFixedMenu = (event, setMenu) => {
+    event.stopPropagation();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const menuWidth = 256;
+    const left = Math.max(8, Math.min(rect.right - menuWidth, window.innerWidth - menuWidth - 8));
+    setMenu((current) => current ? null : { left, top: rect.bottom + 8 });
+  };
+
+  useEffect(() => {
+    if (!canManagePcsOut) return;
+    api.get("/stock/pcs-out")
+      .then(setPcsOutRecords)
+      .catch((error) => toast.error(`Could not load today's Pcs Out entries: ${apiError(error)}`));
+  }, [canManagePcsOut]);
 
   const run = async (fn, ok) => {
     if (busy) return; setBusy(true);
@@ -77,13 +120,10 @@ export default function Stock() {
   const canonicalStock = deduplicateStockRows(list || [], STOCK_CATEGORY);
   const stockCategories = uniqueStockCategories(list || [], STOCK_CATEGORY);
   const getCanonicalStock = () => canonicalStock;
-  const filteredList = canonicalStock.filter((item) => {
-    const categoryMatches = category === LOW_STOCKS_CATEGORY
-      ? item.low_stock
-      : !category || normalizeStockLabel(canonicalStockProduct(item.product)) === normalizeStockLabel(canonicalStockProduct(category));
-    return categoryMatches
-      && (!stockSearch.trim() || `${item.product} ${item.size}`.toLowerCase().includes(stockSearch.trim().toLowerCase()));
-  });
+  const filteredList = canonicalStock.filter((item) =>
+    (!category || normalizeStockLabel(canonicalStockProduct(item.product)) === normalizeStockLabel(canonicalStockProduct(category)))
+    && (!stockSearch.trim() || `${item.product} ${item.size}`.toLowerCase().includes(stockSearch.trim().toLowerCase()))
+  );
   const getRangeReportQuantity = (group, size) => {
     const names = REPORT_PRODUCT_NAMES[group];
     const matches = canonicalStock.filter((item) =>
@@ -119,7 +159,7 @@ export default function Stock() {
     setLoadingDailyCount(true);
     try {
       const report = await api.get("/stock/daily-reconciliation");
-      setDailyEntryMode("pieces_made");
+      setDailyCountCategory("");
       setDailyCountSheet({
         ...report,
         rows: report.rows.map((row) => ({
@@ -136,48 +176,155 @@ export default function Stock() {
     }
   };
 
-  const downloadPiecesMadeToday = async () => {
+  const downloadDailyStockReport = async () => {
+    if (downloadingRangeReport || updatingRightStock) return;
+    setDownloadingRangeReport(true);
+    setStockUpdatesMenu(null);
+    setReportsMenu(null);
     try {
-      const report = dailyCountSheet || await api.get("/stock/daily-reconciliation");
-      const rows = (report?.rows || []).filter((row) => Number(row.made_today || 0) > 0);
-      if (!rows.length) {
-        toast.error("No pieces made are recorded for this date.");
-        return;
-      }
+      const report = await api.get("/stock/daily-reconciliation");
+      const rows = report.rows
+        .map((row) => ({
+          ...row,
+          made_today_value: Number(row.made_today || 0),
+          pcs_out_value: Number(row.pcs_out || 0),
+        }))
+        .sort((first, second) => {
+          const productDifference = String(first.product).localeCompare(String(second.product));
+          return productDifference || compareStockSize(first.size, second.size);
+        });
+      const aggregateRows = (sourceRows, valueKey) => {
+        const aggregated = new Map();
+        sourceRows.forEach((row) => {
+          const quantity = Number(row[valueKey] || 0);
+          if (quantity <= 0) return;
+          const product = String(row.product || "Uncategorized").trim() || "Uncategorized";
+          const size = String(row.size || "—").trim() || "—";
+          const key = `${product.toLocaleLowerCase()}|${size.toLocaleLowerCase()}`;
+          const existing = aggregated.get(key);
+          aggregated.set(key, {
+            product,
+            size,
+            [valueKey]: (existing?.[valueKey] || 0) + quantity,
+          });
+        });
+        return [...aggregated.values()].sort((first, second) => {
+          const productDifference = first.product.localeCompare(second.product);
+          return productDifference || compareStockSize(first.size, second.size);
+        });
+      };
+      const madeRows = aggregateRows(rows, "made_today_value");
+      const pcsOutRows = aggregateRows(rows, "pcs_out_value");
+      const madeTotal = madeRows.reduce((sum, row) => sum + row.made_today_value, 0);
+      const pcsOutTotal = pcsOutRows.reduce((sum, row) => sum + row.pcs_out_value, 0);
+
       const { jsPDF } = await import("jspdf");
       const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
-      pdf.setFillColor(88, 45, 180);
-      pdf.rect(0, 0, 210, 24, "F");
+      const navy = [16, 38, 62];
+      const red = [185, 28, 28];
+      const pageWidth = 210;
+      const margin = 12;
+      let y = 14;
+
+      pdf.setFillColor(...navy);
+      pdf.rect(margin, y, pageWidth - margin * 2, 24, "F");
       pdf.setTextColor(255, 255, 255);
       pdf.setFont("helvetica", "bold");
-      pdf.setFontSize(16);
-      pdf.text("PIECES MADE TODAY", 12, 15);
-      pdf.setTextColor(30, 41, 59);
-      pdf.setFontSize(10);
-      pdf.text(`Date: ${report.report_date}`, 12, 32);
-      let y = 42;
-      pdf.setFillColor(243, 244, 246);
-      pdf.rect(12, y - 6, 186, 9, "F");
-      pdf.setFont("helvetica", "bold");
-      pdf.text("CATEGORY", 15, y);
-      pdf.text("SIZE", 105, y);
-      pdf.text("PIECES", 175, y);
-      y += 10;
-      pdf.setFont("helvetica", "normal");
-      rows.forEach((row) => {
-        if (y > 278) {
-          pdf.addPage();
-          y = 20;
+      pdf.setFontSize(18);
+      pdf.text("SUPER IQ-FOAM", margin + 6, y + 10);
+      pdf.setFontSize(14);
+      pdf.text("DAILY STOCK REPORT", pageWidth - margin - 6, y + 10, { align: "right" });
+      pdf.setFontSize(9);
+      pdf.text(`Date: ${report.report_date}`, pageWidth - margin - 6, y + 18, { align: "right" });
+
+      const drawTable = (title, tableRows, valueKey, total, addGrandTotal = false) => {
+        y += 31;
+        pdf.setTextColor(...navy);
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(11);
+        pdf.text(title, margin, y);
+        y += 5;
+
+        const x = margin;
+        const categoryWidth = 70;
+        const sizeWidth = 55;
+        const quantityWidth = pageWidth - margin * 2 - categoryWidth - sizeWidth;
+        pdf.setFillColor(226, 232, 240);
+        pdf.setDrawColor(148, 163, 184);
+        pdf.setTextColor(15, 23, 42);
+        pdf.rect(x, y, categoryWidth, 8, "FD");
+        pdf.rect(x + categoryWidth, y, sizeWidth, 8, "FD");
+        pdf.rect(x + categoryWidth + sizeWidth, y, quantityWidth, 8, "FD");
+        pdf.setFontSize(8);
+        pdf.text("CATEGORY", x + 3, y + 5.2);
+        pdf.text("SIZE", x + categoryWidth + 3, y + 5.2);
+        pdf.text("QUANTITY", x + categoryWidth + sizeWidth + quantityWidth - 3, y + 5.2, { align: "right" });
+        y += 8;
+
+        pdf.setFont("helvetica", "normal");
+        if (!tableRows.length) {
+          pdf.rect(x, y, pageWidth - margin * 2, 10, "FD");
+          pdf.setTextColor(100, 116, 139);
+          pdf.setFont("helvetica", "normal");
+          pdf.setFontSize(8);
+          pdf.text("No entries", x + 3, y + 6.5);
+          y += 10;
+        } else {
+          tableRows.forEach((row) => {
+            const rowHeight = 11;
+            pdf.setDrawColor(148, 163, 184);
+            pdf.setFillColor(255, 255, 255);
+            pdf.rect(x, y, categoryWidth, rowHeight, "FD");
+            pdf.rect(x + categoryWidth, y, sizeWidth, rowHeight, "FD");
+            pdf.rect(x + categoryWidth + sizeWidth, y, quantityWidth, rowHeight, "FD");
+            pdf.setTextColor(15, 23, 42);
+            pdf.setFont("helvetica", "normal");
+            pdf.setFontSize(9);
+            pdf.text(String(row.product), x + 3, y + 7);
+            pdf.text(String(row.size), x + categoryWidth + 3, y + 7);
+            pdf.setFont("helvetica", "bold");
+            pdf.text(String(Number(row[valueKey] || 0)), x + categoryWidth + sizeWidth + quantityWidth - 3, y + 7, { align: "right" });
+            y += rowHeight;
+          });
         }
-        pdf.text(String(row.product), 15, y);
-        pdf.text(String(row.size), 105, y);
-        pdf.text(String(row.made_today), 175, y);
-        y += 7;
-      });
-      pdf.save(`pieces-made-${report.report_date}.pdf`);
-      toast.success("Pieces made report downloaded.");
+
+        pdf.setFillColor(241, 245, 249);
+        pdf.setFont("helvetica", "bold");
+        pdf.rect(x, y, categoryWidth + sizeWidth, 9, "FD");
+        pdf.rect(x + categoryWidth + sizeWidth, y, quantityWidth, 9, "FD");
+        pdf.text("TOTAL", x + 3, y + 6);
+        pdf.text(String(total), x + categoryWidth + sizeWidth + quantityWidth - 3, y + 6, { align: "right" });
+
+        if (addGrandTotal) {
+          y += 15;
+          pdf.setFillColor(254, 242, 242);
+          pdf.setDrawColor(...red);
+          pdf.rect(margin, y, pageWidth - margin * 2, 12, "FD");
+          pdf.setTextColor(...red);
+          pdf.setFontSize(12);
+          pdf.text("GRAND TOTAL", margin + 4, y + 8);
+          pdf.text(String(total), pageWidth - margin - 4, y + 8, { align: "right" });
+        }
+      };
+
+      drawTable("1. PIECES MADE TO STOCK TODAY", madeRows, "made_today_value", madeTotal);
+      drawTable("2. PCS OUT TODAY", pcsOutRows, "pcs_out_value", pcsOutTotal);
+      y += 3;
+      pdf.setFillColor(254, 242, 242);
+      pdf.setDrawColor(...red);
+      pdf.rect(margin, y, pageWidth - margin * 2, 14, "FD");
+      pdf.setTextColor(...red);
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(13);
+      pdf.text("GRAND TOTAL - STOCK + PCS OUT", margin + 5, y + 9);
+      pdf.text(String(madeTotal + pcsOutTotal), pageWidth - margin - 5, y + 9, { align: "right" });
+
+      pdf.save(`daily-stock-report-${report.report_date}.pdf`);
+      toast.success("Daily Stock Report PDF downloaded");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not download pieces made report.");
+      toast.error(`Could not download today's stock report: ${apiError(error)}`);
+    } finally {
+      setDownloadingRangeReport(false);
     }
   };
 
@@ -186,12 +333,8 @@ export default function Stock() {
     const counts = dailyCountSheet.rows.map((row) => ({
       product: row.product,
       size: row.size,
-      made_today: dailyEntryMode === "pieces_made"
-        ? (row.made_today_input === "" ? 0 : Number(row.made_today_input))
-        : 0,
-      quantity: dailyEntryMode === "stock_only"
-        ? (row.physical_count === "" ? null : Number(row.physical_count))
-        : null,
+      made_today: row.made_today_input === "" ? 0 : Number(row.made_today_input),
+      quantity: row.physical_count === "" ? null : Number(row.physical_count),
     }));
     if (counts.some((line) =>
       !Number.isFinite(line.made_today) || line.made_today < 0
@@ -201,16 +344,13 @@ export default function Stock() {
       return;
     }
     const confirmed = window.confirm(
-      dailyEntryMode === "pieces_made"
-        ? "Record pieces made today? This updates the production movement only; physical stock counts will not be changed."
-        : "Update stock by physical count only? This will not add pieces made today.",
+      "Compile today's production quantities? Production will be recorded in the stock ledger. Physical counts are optional; if entered, differences will be recorded as audited adjustments.",
     );
     if (!confirmed) return;
     setUpdatingRightStock(true);
     try {
       const report = await api.post("/stock/daily-reconciliation", {
         report_date: dailyCountSheet.report_date,
-        entry_mode: dailyEntryMode,
         counts,
       });
       setDailyCountSheet({
@@ -221,14 +361,37 @@ export default function Stock() {
           physical_count: row.quantity == null ? "" : String(row.quantity),
         })),
       });
-      toast.success(dailyEntryMode === "pieces_made"
-        ? "Pieces made today were compiled."
-        : "Physical stock update was compiled.");
+      toast.success("Today's production and stock update were compiled");
       load();
     } catch (error) {
       toast.error(`Could not reconcile today's stock: ${apiError(error)}`);
     }
     finally { setUpdatingRightStock(false); }
+  };
+
+  const updateSuppliedRightStock = async () => {
+    if (busy || updatingRightStock) return;
+    const confirmed = window.confirm(
+      "Apply the supplied SuperIQFoam stock quantities by category and size? "
+      + "This records audit-tracked stock movements and keeps all invoices and existing history. "
+      + "Negative quantities (Ribbon Black backorders and White Drum) will be retained. "
+      + "The per-size list will be used; its printed summary totals do not match the listed lines.",
+    );
+    if (!confirmed) return;
+    setUpdatingRightStock(true);
+    try {
+      const result = await api.post("/stock/update-right-stock", {});
+      toast.success(
+        `Supplied stock applied: ${result.adjusted_items} adjustment(s), `
+        + `${result.created_items} new size(s), ${result.duplicate_records_zeroed} duplicate row(s) set to zero. `
+        + `Mattress quantity from listed sizes: ${result.net_mattress_stock}.`,
+      );
+      load();
+    } catch (error) {
+      toast.error(`Could not apply supplied stock: ${apiError(error)}`);
+    } finally {
+      setUpdatingRightStock(false);
+    }
   };
 
   const getTotalsByCategory = () => {
@@ -241,6 +404,25 @@ export default function Stock() {
   };
 
   const getTotalStock = () => getCanonicalStock().reduce((sum, s) => sum + Number(s.current || 0), 0);
+
+  const compareStockSize = (first, second) => {
+    const firstParts = String(first).toLowerCase().match(/\d+(?:\.\d+)?/g)?.map(Number) || [];
+    const secondParts = String(second).toLowerCase().match(/\d+(?:\.\d+)?/g)?.map(Number) || [];
+    const length = Math.max(firstParts.length, secondParts.length);
+    for (let index = 0; index < length; index += 1) {
+      const difference = (firstParts[index] ?? 0) - (secondParts[index] ?? 0);
+      if (difference) return difference;
+    }
+    return String(first).localeCompare(String(second));
+  };
+
+  const dailyCountCategories = [...new Set((dailyCountSheet?.rows || []).map((row) => row.product).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  const visibleDailyCountRows = (dailyCountSheet?.rows || [])
+    .filter((row) => !dailyCountCategory || row.product === dailyCountCategory)
+    .sort((first, second) => {
+      const productDifference = String(first.product).localeCompare(String(second.product));
+      return productDifference || compareStockSize(first.size, second.size);
+    });
 
   const getStockValueTotal = (zone) => {
     let total = 0;
@@ -300,6 +482,31 @@ export default function Stock() {
       unit_cost: unitCost,
     }), "Cost saved")) {
       setCostDrafts((current) => ({ ...current, [stock.id]: unitCost ?? "" }));
+    }
+  };
+
+  const savePcsOut = async () => {
+    const quantity = Number(pcsOutDraft.quantity);
+    if (!pcsOutDraft.product.trim() || !pcsOutDraft.size.trim()) {
+      return toast.error("Product and size are required");
+    }
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      return toast.error("Enter a whole number of pieces greater than zero");
+    }
+    setSavingPcsOut(true);
+    try {
+      const record = await api.post("/stock/pcs-out", {
+        product: pcsOutDraft.product.trim(),
+        size: pcsOutDraft.size.trim(),
+        quantity,
+      });
+      setPcsOutRecords((current) => [record, ...current]);
+      setPcsOutDraft({ product: "", size: "", quantity: "" });
+      toast.success("Pcs Out saved and included in today's pieces-made report");
+    } catch (error) {
+      toast.error(`Could not save Pcs Out: ${apiError(error)}`);
+    } finally {
+      setSavingPcsOut(false);
     }
   };
 
@@ -391,43 +598,99 @@ export default function Stock() {
     <div>
       <PageHeader title="Finished Stock" subtitle="Calculated from the stock movement ledger" />
 
-      {isSuperIqFoam && (
-        <div className="no-print mb-5 flex flex-wrap items-center gap-2 border-b border-slate-200 pb-4" data-testid="stock-update-actions">
-          {user?.is_primary_owner && user?.is_owner && (
-            <>
-              <Btn
-                type="button"
-                onClick={openDailyCountSheet}
-                disabled={updatingRightStock || busy || list === null}
-                data-testid="update-daily-stock"
-              >
-                {loadingDailyCount ? "Loading..." : "COMPILE STOCK UPDATE"}
-              </Btn>
-            </>
-          )}
+      <div className="no-print relative z-40 mb-5 flex flex-wrap items-center justify-between gap-4 border-b border-slate-200 pb-4" data-testid="stock-update-actions">
+        <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap">
+          {addProductAction}
+          {searchAction}
           {productIdsAction}
           {ledgerAction}
-          {isSuperIqFoam && user?.is_primary_owner && user?.is_owner && (
-            <Btn
-              type="button"
-              className="!border-violet-700 !bg-violet-700 !text-white hover:!bg-violet-800"
-              onClick={downloadPiecesMadeToday}
-              data-testid="download-pieces-made-today"
-            >
-              <Download size={16} /> Download Pieces Made Today
-            </Btn>
-          )}
-          <Btn
-            type="button"
-            variant="outline"
-            onClick={() => downloadRangeReport({ blank: true })}
-            disabled={downloadingRangeReport}
-            data-testid="download-stock-count-sheet"
-          >
-            <Download size={16} /> {downloadingRangeReport ? "Preparing..." : "Download Stock Calculating Sheet"}
-          </Btn>
         </div>
-      )}
+
+        <div className="flex flex-wrap items-center gap-2">
+          {isSuperIqFoam && user?.is_primary_owner && user?.is_owner && (
+            <>
+              <button
+                ref={stockUpdatesTriggerRef}
+                type="button"
+                onClick={(event) => openFixedMenu(event, setStockUpdatesMenu)}
+                className="inline-flex cursor-pointer list-none items-center gap-2 rounded-md border border-border bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition-colors hover:bg-secondary/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20"
+                aria-expanded={!!stockUpdatesMenu}
+              >
+                <ArrowUpDown size={16} /> Stock updates <ChevronDown size={15} />
+              </button>
+              {stockUpdatesMenu && createPortal(
+              <div ref={stockUpdatesMenuRef} style={{ left: stockUpdatesMenu.left, top: stockUpdatesMenu.top, width: 256, zIndex: 1000 }} className="fixed flex flex-col gap-2 rounded-lg border border-border bg-white p-2 shadow-xl">
+                <Btn
+                  type="button"
+                  variant="outline"
+                  className="w-full justify-start whitespace-normal text-left"
+                  onClick={openDailyCountSheet}
+                  disabled={updatingRightStock || busy || list === null}
+                  data-testid="update-daily-stock"
+                >
+                  {loadingDailyCount ? "Loading..." : "COMPILE STOCK UPDATE"}
+                </Btn>
+                <Btn
+                  type="button"
+                  variant="outline"
+                  className="w-full justify-start whitespace-normal text-left"
+                  onClick={updateSuppliedRightStock}
+                  disabled={updatingRightStock || busy || list === null}
+                  data-testid="update-right-stock"
+                >
+                  {updatingRightStock && !loadingDailyCount ? "Updating..." : "UPDATE STOCK"}
+                </Btn>
+              </div>, document.body)}
+            </>
+          )}
+          {isSuperIqFoam && (
+            <>
+              <button
+                ref={reportsTriggerRef}
+                type="button"
+                onClick={(event) => openFixedMenu(event, setReportsMenu)}
+                className="inline-flex cursor-pointer list-none items-center gap-2 rounded-md border border-border bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition-colors hover:bg-secondary/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20"
+                aria-expanded={!!reportsMenu}
+              >
+                <Download size={16} /> Reports <ChevronDown size={15} />
+              </button>
+              {reportsMenu && createPortal(
+              <div ref={reportsMenuRef} style={{ left: reportsMenu.left, top: reportsMenu.top, width: 256, zIndex: 1000 }} className="fixed flex flex-col gap-2 rounded-lg border border-border bg-white p-2 shadow-xl">
+                <Btn
+                  type="button"
+                  variant="outline"
+                  className="w-full justify-start whitespace-normal text-left"
+                  onClick={() => downloadRangeReport({ blank: true })}
+                  disabled={downloadingRangeReport}
+                  data-testid="download-stock-count-sheet"
+                >
+                  <Download size={16} /> {downloadingRangeReport ? "Preparing..." : "Stock Calculating Sheet"}
+                </Btn>
+                <Btn
+                  type="button"
+                  variant="outline"
+                  className="w-full justify-start whitespace-normal text-left"
+                  onClick={downloadDailyStockReport}
+                  disabled={downloadingRangeReport || updatingRightStock || list === null}
+                  data-testid="open-daily-stock-report"
+                >
+                  <Download size={16} /> {downloadingRangeReport ? "Preparing..." : "Daily Stock Report PDF"}
+                </Btn>
+                <Btn
+                  type="button"
+                  variant="outline"
+                  className="w-full justify-start whitespace-normal text-left"
+                  onClick={() => downloadRangeReport()}
+                  disabled={downloadingRangeReport}
+                  data-testid="download-product-range-report"
+                >
+                  <Download size={16} /> {downloadingRangeReport ? "Preparing..." : "Current Stock PDF"}
+                </Btn>
+              </div>, document.body)}
+            </>
+          )}
+        </div>
+      </div>
 
       <div className="no-print -mt-3 mb-4 flex flex-wrap items-end gap-3">
         <div className="grid w-full max-w-2xl flex-1 gap-3 sm:grid-cols-2">
@@ -444,25 +707,8 @@ export default function Stock() {
           )}
           <Select label="Filter by category" value={category} onChange={(event) => setCategory(event.target.value)} data-testid="stock-category-filter">
             <option value="">All categories</option>
-            <option value={LOW_STOCKS_CATEGORY}>Low Stocks</option>
             {stockCategories.map((item) => <option key={item} value={item}>{item}</option>)}
           </Select>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          {searchAction}
-          {addProductAction}
-          {isSuperIqFoam && (
-            <>
-              <Btn
-                type="button"
-                onClick={() => downloadRangeReport()}
-                disabled={downloadingRangeReport}
-                data-testid="download-product-range-report"
-              >
-                <Download size={16} /> {downloadingRangeReport ? "Preparing..." : "Download Current Stock PDF"}
-              </Btn>
-            </>
-          )}
         </div>
       </div>
 
@@ -478,32 +724,17 @@ export default function Stock() {
           <div className="flex min-h-0 flex-col">
             <div className="shrink-0 space-y-3 border-b border-border/70 px-4 py-4 sm:px-6">
               <p className="text-sm text-slate-600">
-                Choose what this submission represents, then enter the values for each product and size.
+                Enter pieces made for stock separately from Pcs Out, which was produced and shipped immediately. Choose a product category, then enter today's quantities and any optional physical count.
               </p>
-              <div className="grid gap-2 sm:grid-cols-2" role="radiogroup" aria-label="Daily stock entry type">
-                <button
-                  type="button"
-                  role="radio"
-                  aria-checked={dailyEntryMode === "pieces_made"}
-                  onClick={() => setDailyEntryMode("pieces_made")}
-                  className={"rounded-lg border p-3 text-left " + (dailyEntryMode === "pieces_made" ? "border-violet-600 bg-violet-50 text-violet-950" : "border-slate-200 bg-white text-slate-700")}
-                  data-testid="daily-entry-pieces-made"
-                >
-                  <span className="block text-sm font-bold">This is the pieces made today</span>
-                  <span className="mt-1 block text-xs">Add or update real production quantities.</span>
-                </button>
-                <button
-                  type="button"
-                  role="radio"
-                  aria-checked={dailyEntryMode === "stock_only"}
-                  onClick={() => setDailyEntryMode("stock_only")}
-                  className={"rounded-lg border p-3 text-left " + (dailyEntryMode === "stock_only" ? "border-violet-600 bg-violet-50 text-violet-950" : "border-slate-200 bg-white text-slate-700")}
-                  data-testid="daily-entry-stock-only"
-                >
-                  <span className="block text-sm font-bold">These pieces are only to update the stock</span>
-                  <span className="mt-1 block text-xs">Set the physical stock count without recording production.</span>
-                </button>
-              </div>
+              <Select
+                label="Product category"
+                value={dailyCountCategory}
+                onChange={(event) => setDailyCountCategory(event.target.value)}
+                data-testid="daily-count-category-filter"
+              >
+                <option value="">All categories</option>
+                {dailyCountCategories.map((item) => <option key={item} value={item}>{item}</option>)}
+              </Select>
               {dailyCountSheet.already_submitted && (
                 <p className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800">
                   A production update has already been saved today. Saving again adjusts the production entry to the new total instead of double-counting it.
@@ -514,33 +745,27 @@ export default function Stock() {
                 <div className="rounded-md bg-slate-50 p-2">Dispatched: <strong>{dailyCountSheet.activity.dispatch_out}</strong></div>
                 <div className="rounded-md bg-slate-50 p-2">Other out: <strong>{dailyCountSheet.activity.other_out}</strong></div>
                 <div className="rounded-md bg-slate-50 p-2">Received in: <strong>{dailyCountSheet.activity.received_in}</strong></div>
-                <div className="rounded-md bg-slate-50 p-2">Made today: <strong>{dailyCountSheet.activity.production_in}</strong></div>
+                <div className="rounded-md bg-slate-50 p-2">Made today (including Pcs Out): <strong>{dailyCountSheet.activity.production_in + dailyCountSheet.activity.pcs_out}</strong></div>
+                <div className="rounded-md bg-slate-50 p-2">Pcs Out: <strong>{dailyCountSheet.activity.pcs_out}</strong></div>
               </div>
             </div>
             <div className="min-h-0 overflow-auto px-4 py-3 sm:px-6">
-              <table className="w-full min-w-[1080px] border-collapse text-left text-xs">
+              <table className="w-full min-w-[720px] border-collapse text-left text-xs">
                 <thead className="sticky top-0 z-10 bg-slate-100 text-slate-600">
                   <tr>
                     <th className="p-2">Category</th>
                     <th className="p-2">Size</th>
-                    <th className="p-2">Product ID</th>
-                    <th className="p-2 text-right">Book balance</th>
-                    {dailyEntryMode === "pieces_made" && <th className="p-2">Pieces made today</th>}
-                    <th className="p-2 text-right">Invoice out</th>
-                    <th className="p-2 text-right">Dispatched</th>
-                    <th className="p-2 text-right">Other out</th>
-                    <th className="p-2 text-right">Received in</th>
-                    {dailyEntryMode === "stock_only" && <th className="p-2">Physical count</th>}
+                    <th className="p-2">Pieces made to stock today</th>
+                    <th className="p-2 text-right">Pcs Out</th>
+                    <th className="p-2">Physical count (optional)</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {dailyCountSheet.rows.map((row) => (
+                  {visibleDailyCountRows.map((row) => (
                     <tr key={row.key} className="border-b border-slate-100">
                       <td className="p-2 font-medium">{row.product}</td>
                       <td className="p-2">{row.size}</td>
-                      <td className="p-2 font-mono">{row.product_id || "—"}</td>
-                      <td className="p-2 text-right font-mono">{row.book_quantity}</td>
-                      {dailyEntryMode === "pieces_made" && <td className="p-2">
+                      <td className="p-2">
                         <Input
                           type="number"
                           min="0"
@@ -556,16 +781,17 @@ export default function Stock() {
                           data-testid={`made-today-${row.key}`}
                           className="min-w-24 px-2 py-1.5 text-right"
                         />
-                      </td>}
-                      <td className="p-2 text-right font-mono">{row.invoice_out}</td>
-                      <td className="p-2 text-right font-mono">{row.dispatch_out}</td>
-                      <td className="p-2 text-right font-mono">{row.other_out}</td>
-                      <td className="p-2 text-right font-mono">{row.received_in}</td>
-                      {dailyEntryMode === "stock_only" && <td className="p-2">
+                      </td>
+                      <td className="p-2 text-right font-mono">{row.pcs_out}</td>
+                      <td className="p-2">
+                        {row.pcs_out > 0 && !row.has_stock_record && (
+                          <p className="mb-1 text-[10px] text-slate-400">Rush pieces shipped immediately</p>
+                        )}
                         <Input
                           type="number"
                           min="0"
                           step="any"
+                          disabled={row.pcs_out > 0 && !row.has_stock_record}
                           value={row.physical_count}
                           onChange={(event) => setDailyCountSheet((current) => ({
                             ...current,
@@ -573,11 +799,11 @@ export default function Stock() {
                               ? { ...item, physical_count: event.target.value }
                               : item),
                           }))}
-                          aria-label={`Physical count for ${row.product} ${row.size}`}
+                          aria-label={`Optional physical count for ${row.product} ${row.size}`}
                           data-testid={`physical-count-${row.key}`}
                           className="min-w-24 px-2 py-1.5 text-right"
                         />
-                      </td>}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -594,6 +820,7 @@ export default function Stock() {
               </Btn>
               <Btn
                 type="button"
+                variant="outline"
                 disabled={updatingRightStock || dailyCountSheet.rows.length === 0}
                 onClick={submitDailyCountSheet}
                 data-testid="save-daily-stock-count"
@@ -604,6 +831,75 @@ export default function Stock() {
           </div>
         )}
       </Modal>
+
+      {canManagePcsOut && (
+        <Card className="mb-6 border-slate-200 bg-slate-50 p-4" data-testid="pcs-out-panel">
+          <div className="mb-3">
+            <h2 className="text-xs font-bold uppercase tracking-wide text-slate-600">Pcs Out</h2>
+            <p className="mt-1 text-xs text-slate-500">
+              Record rush pieces made and shipped immediately. They are counted in today's production report but are not added to stock.
+            </p>
+          </div>
+          <div className="grid items-end gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_10rem_auto]">
+            <Select
+              label="Product category"
+              value={pcsOutDraft.product}
+              onChange={(event) => setPcsOutDraft((current) => ({ ...current, product: event.target.value, size: "" }))}
+              data-testid="pcs-out-product"
+            >
+              <option value="">Select category</option>
+              {stockCategories.map((item) => <option key={item} value={item}>{item}</option>)}
+            </Select>
+            <Select
+              label="Size"
+              value={pcsOutDraft.size}
+              onChange={(event) => setPcsOutDraft((current) => ({ ...current, size: event.target.value }))}
+              data-testid="pcs-out-size"
+            >
+              <option value="">Select size</option>
+              {[...new Set(canonicalStock
+                .filter((item) => normalizeStockLabel(canonicalStockProduct(item.product)) === normalizeStockLabel(canonicalStockProduct(pcsOutDraft.product)))
+                .map((item) => item.size)
+                .filter(Boolean))]
+                .sort(compareStockSize)
+                .map((item) => <option key={item} value={item}>{item}</option>)}
+            </Select>
+            <Input
+              label="Pieces"
+              type="number"
+              min="1"
+              step="1"
+              value={pcsOutDraft.quantity}
+              onChange={(event) => setPcsOutDraft((current) => ({ ...current, quantity: event.target.value }))}
+              data-testid="pcs-out-quantity"
+            />
+            <Btn type="button" variant="outline" onClick={savePcsOut} disabled={savingPcsOut} data-testid="save-pcs-out">
+              <Plus size={16} /> {savingPcsOut ? "Saving..." : "Add Pcs Out"}
+            </Btn>
+          </div>
+          {pcsOutRecords.length > 0 && (
+            <div className="mt-4 overflow-x-auto rounded-md border border-slate-200 bg-white">
+              <table className="w-full min-w-[420px] text-sm">
+                <thead className="border-b border-slate-200 bg-slate-50 text-left text-xs text-slate-500">
+                  <tr><th className="px-3 py-2">Product</th><th className="px-3 py-2">Size</th><th className="px-3 py-2 text-right">Pieces</th></tr>
+                </thead>
+                <tbody>
+                  {pcsOutRecords.map((record) => (
+                    <tr key={record.id} className="border-b border-slate-100 last:border-0" data-testid={`pcs-out-row-${record.id}`}>
+                      <td className="px-3 py-2 font-medium">{record.product}</td>
+                      <td className="px-3 py-2">{record.size}</td>
+                      <td className="px-3 py-2 text-right font-mono">{record.quantity}</td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot className="border-t border-slate-200 bg-slate-50 font-semibold">
+                  <tr><td className="px-3 py-2" colSpan={2}>Today's Pcs Out total</td><td className="px-3 py-2 text-right font-mono">{pcsOutRecords.reduce((sum, record) => sum + Number(record.quantity || 0), 0)}</td></tr>
+                </tfoot>
+              </table>
+            </div>
+          )}
+        </Card>
+      )}
 
       <Card className="p-4 mb-6 bg-slate-50 border-slate-200">
         <div className="mb-3 flex items-center justify-between gap-3">
@@ -691,17 +987,17 @@ export default function Stock() {
               <tbody>{filteredList.map((s) => (
                 <tr key={s.id} className="border-b border-border/60 hover:bg-slate-50" data-testid={`stock-row-${s.id}`}>
                   <td className="sticky left-0 z-10 bg-white px-3 whitespace-nowrap">
-                    <button type="button" onClick={() => setMoveModal({ stock_id: s.id, label: `${s.product} ${s.size}`, current: s.current, type: "adjustment_in", quantity: 1, reason: "", reference: "", notes: "" })} className="inline-flex items-center gap-1 rounded-md border border-primary/30 bg-primary/5 px-2.5 py-1.5 text-xs font-semibold text-primary hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1" aria-label={`Adjust ${s.product} ${s.size}`} data-testid={`move-stock-${s.id}`}><ArrowUpDown size={13} /> Adjust</button>
+                    <button type="button" onClick={() => setMoveModal({ stock_id: s.id, label: `${s.product} ${s.size}`, current: s.current, type: "adjustment_in", quantity: 1, reason: "", reference: "", notes: "" })} className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300 focus-visible:ring-offset-1" aria-label={`Adjust ${s.product} ${s.size}`} data-testid={`move-stock-${s.id}`}><ArrowUpDown size={13} /> Adjust</button>
                   </td>
                   <td className="px-4 py-3 text-slate-500 font-mono">{s.size}</td>
                   <td className="px-4 font-semibold text-slate-800">{s.product}</td>
                   <td className="px-4 text-right font-mono text-slate-500">{s.adjustments || 0}</td>
                   <td className="px-4 text-right font-mono text-red-500">{s.invoiced ? `-${s.invoiced}` : 0}</td>
-                  <td className="px-4 text-right"><span className={`font-mono font-bold ${s.low_stock ? "text-red-600" : "text-slate-800"}`} data-testid={`stock-current-${s.id}`}>{s.current}</span>{s.low_stock && <Badge cls="bg-red-50 text-red-700 border-red-200 ml-2">Low</Badge>}</td>
+                  <td className="px-4 text-right"><span className={`font-mono font-bold ${s.current < s.threshold ? "text-red-600" : "text-slate-800"}`} data-testid={`stock-current-${s.id}`}>{s.current}</span>{s.current < s.threshold && <Badge cls="bg-red-50 text-red-700 border-red-200 ml-2">Low</Badge>}</td>
                   {canViewStockCosts && <td className="px-4">
                     <div className="flex items-center justify-end gap-2">
                       <Input aria-label={`Cost for ${s.product} ${s.size}`} type="number" min="0" step="0.01" value={costDrafts[s.id] ?? (s.unit_cost ?? "")} onChange={(e) => setCostDrafts((current) => ({ ...current, [s.id]: e.target.value }))} className="w-32 min-w-[8rem] max-w-none shrink-0 px-2 py-1.5 text-right tabular-nums" data-testid={`stock-cost-${s.id}`} />
-                      <button type="button" onClick={() => saveCost(s)} disabled={busy} className="text-primary hover:underline text-xs font-semibold disabled:opacity-50" data-testid={`save-stock-cost-${s.id}`}>Save</button>
+                      <button type="button" onClick={() => saveCost(s)} disabled={busy} className="text-slate-600 hover:text-slate-900 hover:underline text-xs font-semibold disabled:opacity-50" data-testid={`save-stock-cost-${s.id}`}>Save</button>
                     </div>
                   </td>}
                   {unifiedPriceList || !priceZonesEnabled
@@ -735,7 +1031,7 @@ export default function Stock() {
             {addModal.category && !user?.is_stock_only_worker && (
               <Btn
                 type="button"
-                variant="danger"
+                variant="outline"
                 onClick={deleteStockCategory}
                 disabled={busy || list === null}
                 data-testid="delete-stock-category-btn"
@@ -754,7 +1050,7 @@ export default function Stock() {
             <Input label="Selling Price (R) *" type="number" min="0" step="0.01" value={addModal.selling_price} onChange={(e) => setAddModal({ ...addModal, selling_price: e.target.value })} data-testid="stock-price-input" />
           </div>
           {priceZonesEnabled && <Select label="Price zone" value={addModal.zone} onChange={(e) => setAddModal({ ...addModal, zone: Number(e.target.value) })}><option value={1}>Zone 1</option><option value={2}>Zone 2</option></Select>}
-          <div className="flex justify-end gap-2"><Btn variant="outline" onClick={() => setAddModal(null)}>Cancel</Btn><Btn disabled={busy} onClick={saveStock} data-testid="save-stock-btn">Add</Btn></div>
+          <div className="flex justify-end gap-2"><Btn variant="outline" onClick={() => setAddModal(null)}>Cancel</Btn><Btn variant="outline" disabled={busy} onClick={saveStock} data-testid="save-stock-btn">Add</Btn></div>
         </div>}
       </Modal>
 
@@ -767,7 +1063,7 @@ export default function Stock() {
           <Input label="Quantity" type="number" min="0" step="any" value={moveModal.quantity} onChange={(e) => setMoveModal({ ...moveModal, quantity: Number(e.target.value) })} data-testid="move-qty-input" />
           <Input label="Reason (optional)" value={moveModal.reason} onChange={(e) => setMoveModal({ ...moveModal, reason: e.target.value })} data-testid="move-reason-input" />
           <Input label="Reference (optional)" value={moveModal.reference} onChange={(e) => setMoveModal({ ...moveModal, reference: e.target.value })} />
-          <div className="flex justify-end gap-2"><Btn variant="outline" onClick={() => setMoveModal(null)}>Cancel</Btn><Btn disabled={busy} onClick={saveMove} data-testid="save-move-btn">Record</Btn></div>
+          <div className="flex justify-end gap-2"><Btn variant="outline" onClick={() => setMoveModal(null)}>Cancel</Btn><Btn variant="outline" disabled={busy} onClick={saveMove} data-testid="save-move-btn">Record</Btn></div>
         </div>}
       </Modal>
 

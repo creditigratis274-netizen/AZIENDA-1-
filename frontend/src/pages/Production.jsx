@@ -3,7 +3,7 @@ import { toast } from "sonner";
 import { api, apiError } from "@/lib/api";
 import { fmtDate, fmtMoney, today } from "@/lib/format";
 import { Card, Btn, Input, Select, Modal, PageHeader, Empty, Badge } from "@/components/common";
-import { Factory, Plus, Save, Trash2, Pencil, RotateCcw } from "lucide-react";
+import { Factory, Plus, Save, Trash2, Pencil, RotateCcw, Download } from "lucide-react";
 import BarcodeScanner from "@/components/BarcodeScanner";
 import { useAuth } from "@/context/AuthContext";
 import { usesUnifiedPriceList } from "@/lib/company";
@@ -49,6 +49,7 @@ export default function Production() {
   });
   const [recipeDraft, setRecipeDraft] = useState({ block_type: "", components: [], indicated_total_cost: "" });
   const [cutBusy, setCutBusy] = useState(false);
+  const [downloadingBlockCuttingReport, setDownloadingBlockCuttingReport] = useState(false);
   const dailyLoadRequest = useRef(0);
   const load = () => {
     const requestId = ++dailyLoadRequest.current;
@@ -357,6 +358,146 @@ export default function Production() {
       toast.error(apiError(e));
     }
   };
+  const downloadBlockCuttingReport = async () => {
+    if (downloadingBlockCuttingReport) return;
+    setDownloadingBlockCuttingReport(true);
+    try {
+      const records = await api.get("/production/block-cutting");
+      const compareSize = (first, second) => {
+        const firstParts = String(first).match(/\d+(?:\.\d+)?/g)?.map(Number) || [];
+        const secondParts = String(second).match(/\d+(?:\.\d+)?/g)?.map(Number) || [];
+        for (let index = 0; index < Math.max(firstParts.length, secondParts.length); index += 1) {
+          const difference = (firstParts[index] ?? 0) - (secondParts[index] ?? 0);
+          if (difference) return difference;
+        }
+        return String(first).localeCompare(String(second));
+      };
+      const totals = new Map();
+      records.forEach((record) => {
+        if (record.archived) return;
+        const block = String(record.block || "Uncategorized").trim() || "Uncategorized";
+        const size = record.has_sheet
+          ? (record.sheet_mm ? `Sheet ${record.sheet_mm} mm` : "Sheet")
+          : String(record.size || "—").trim() || "—";
+        const quantity = record.has_sheet
+          ? Number(record.sheet_pieces_recovered || record.pieces_recovered || 0)
+          : Number(record.pieces_recovered || 0);
+        if (quantity <= 0) return;
+        const key = `${block.toLocaleLowerCase()}|${size.toLocaleLowerCase()}`;
+        totals.set(key, {
+          block,
+          size,
+          quantity: (totals.get(key)?.quantity || 0) + quantity,
+        });
+      });
+      const rows = [...totals.values()].sort((first, second) => {
+        const blockDifference = first.block.localeCompare(second.block);
+        return blockDifference || compareSize(first.size, second.size);
+      });
+      const grandTotal = rows.reduce((sum, row) => sum + row.quantity, 0);
+
+      const { jsPDF } = await import("jspdf");
+      const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
+      const navy = [16, 38, 62];
+      const red = [185, 28, 28];
+      const margin = 12;
+      const pageWidth = 210;
+      let y = 14;
+
+      pdf.setFillColor(...navy);
+      pdf.rect(margin, y, pageWidth - margin * 2, 24, "F");
+      pdf.setTextColor(255, 255, 255);
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(18);
+      pdf.text("SUPER IQ-FOAM", margin + 6, y + 10);
+      pdf.setFontSize(14);
+      pdf.text("BLOCK CUTTING REPORT", pageWidth - margin - 6, y + 10, { align: "right" });
+      pdf.setFontSize(9);
+      pdf.text(`Date: ${today()}`, pageWidth - margin - 6, y + 18, { align: "right" });
+
+      y += 31;
+      const categoryWidth = 75;
+      const sizeWidth = 65;
+      const quantityWidth = pageWidth - margin * 2 - categoryWidth - sizeWidth;
+      pdf.setFillColor(226, 232, 240);
+      pdf.setDrawColor(148, 163, 184);
+      pdf.setTextColor(15, 23, 42);
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(8);
+      pdf.rect(margin, y, categoryWidth, 9, "FD");
+      pdf.rect(margin + categoryWidth, y, sizeWidth, 9, "FD");
+      pdf.rect(margin + categoryWidth + sizeWidth, y, quantityWidth, 9, "FD");
+      pdf.text("BLOCK CATEGORY", margin + 3, y + 6);
+      pdf.text("SIZE / SHEET", margin + categoryWidth + 3, y + 6);
+      pdf.text("SHEETS / PCS RECOVERED", pageWidth - margin - 3, y + 6, { align: "right" });
+      y += 9;
+
+      pdf.setFont("helvetica", "normal");
+      if (!rows.length) {
+        pdf.rect(margin, y, pageWidth - margin * 2, 10, "FD");
+        pdf.text("No block cutting records", margin + 3, y + 6.5);
+        y += 10;
+      } else {
+        rows.forEach((row) => {
+          const rowHeight = 11;
+          if (y + rowHeight > 265) {
+            pdf.addPage("a4", "portrait");
+            y = 14;
+            pdf.setFillColor(...navy);
+            pdf.rect(margin, y, pageWidth - margin * 2, 20, "F");
+            pdf.setTextColor(255, 255, 255);
+            pdf.setFont("helvetica", "bold");
+            pdf.setFontSize(15);
+            pdf.text("SUPER IQ-FOAM", margin + 6, y + 9);
+            pdf.text("BLOCK CUTTING REPORT", pageWidth - margin - 6, y + 9, { align: "right" });
+            y += 24;
+            pdf.setFillColor(226, 232, 240);
+            pdf.setDrawColor(148, 163, 184);
+            pdf.setTextColor(15, 23, 42);
+            pdf.rect(margin, y, categoryWidth, 9, "FD");
+            pdf.rect(margin + categoryWidth, y, sizeWidth, 9, "FD");
+            pdf.rect(margin + categoryWidth + sizeWidth, y, quantityWidth, 9, "FD");
+            pdf.text("BLOCK CATEGORY", margin + 3, y + 6);
+            pdf.text("SIZE / SHEET", margin + categoryWidth + 3, y + 6);
+            pdf.text("SHEETS / PCS RECOVERED", pageWidth - margin - 3, y + 6, { align: "right" });
+            y += 9;
+          }
+
+          pdf.setFillColor(255, 255, 255);
+          pdf.setDrawColor(148, 163, 184);
+          pdf.rect(margin, y, categoryWidth, rowHeight, "FD");
+          pdf.rect(margin + categoryWidth, y, sizeWidth, rowHeight, "FD");
+          pdf.rect(margin + categoryWidth + sizeWidth, y, quantityWidth, rowHeight, "FD");
+          pdf.setTextColor(15, 23, 42);
+          pdf.setFont("helvetica", "normal");
+          pdf.setFontSize(9);
+          pdf.text(String(row.block), margin + 3, y + 7, { maxWidth: categoryWidth - 6 });
+          pdf.text(String(row.size), margin + categoryWidth + 3, y + 7, { maxWidth: sizeWidth - 6 });
+          pdf.setFont("helvetica", "bold");
+          pdf.text(String(Number(row.quantity || 0)), pageWidth - margin - 3, y + 7, { align: "right" });
+          y += rowHeight;
+        });
+      }
+
+      y += 5;
+      pdf.setFillColor(254, 242, 242);
+      pdf.setDrawColor(...red);
+      pdf.rect(margin, y, pageWidth - margin * 2, 14, "FD");
+      pdf.setTextColor(...red);
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(13);
+      pdf.text("GRAND TOTAL", margin + 5, y + 9);
+      pdf.text(String(grandTotal), pageWidth - margin - 5, y + 9, { align: "right" });
+
+      pdf.save(`block-cutting-report-${today()}.pdf`);
+      toast.success("Block Cutting Report PDF downloaded");
+    } catch (error) {
+      toast.error(`Could not download block cutting report: ${apiError(error)}`);
+    } finally {
+      setDownloadingBlockCuttingReport(false);
+    }
+  };
+
   const permanentlyDeleteBlockCutting = async (record) => {
     if (!record.archived) return;
     if (!window.confirm(`Permanently delete the ${record.block} ${record.size} block cutting record? This cannot be undone.`)) return;
@@ -510,6 +651,9 @@ export default function Production() {
               <input type="checkbox" checked={showArchivedCuttings} onChange={(event) => setShowArchivedCuttings(event.target.checked)} data-testid="show-archived-block-cuttings" />
               Show archived
             </label>
+            <Btn variant="outline" onClick={downloadBlockCuttingReport} disabled={downloadingBlockCuttingReport} data-testid="download-block-cutting-report">
+              <Download size={16} /> {downloadingBlockCuttingReport ? "Preparing..." : "DOWLOAD BLOCK CUTTING REPORT"}
+            </Btn>
             <Btn onClick={() => { setCutForm({ block: "", size: "", date: today(), pieces_recovered: "", has_sheet: false }); setCutScanProduct(null); setCutOpen(true); }} data-testid="add-block-cutting-btn"><Plus size={16} /> Add Block Cutted</Btn>
           </div>
         </div>

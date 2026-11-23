@@ -225,7 +225,7 @@ function drawSection(pdf, section, pageRows, x, y, width, height, pageIndex) {
   }
 }
 
-export async function downloadDailyReportPdf(report, mainInvoiceNo) {
+export async function createDailyReportPdf(report, mainInvoiceNo) {
   if (!report) throw new Error("Daily report data is not available.");
   const { jsPDF } = await import("jspdf");
   const pdf = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
@@ -266,5 +266,11 @@ export async function downloadDailyReportPdf(report, mainInvoiceNo) {
   }
 
   const companyFileName = (report.company_name || "SUPERIQFOAM").replace(/[^a-z0-9]+/gi, "_");
-  pdf.save(`${companyFileName}_Daily_Report_${report.date}.pdf`);
+  const filename = `${companyFileName}_Daily_Report_${report.date}.pdf`;
+  return { blob: pdf.output("blob"), filename, pdf };
+}
+
+export async function downloadDailyReportPdf(report, mainInvoiceNo) {
+  const { filename, pdf } = await createDailyReportPdf(report, mainInvoiceNo);
+  pdf.save(filename);
 }
