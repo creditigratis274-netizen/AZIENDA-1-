@@ -50,8 +50,12 @@ export default function Stock() {
   const [updatingRightStock, setUpdatingRightStock] = useState(false);
   const [dailyCountSheet, setDailyCountSheet] = useState(null);
   const [loadingDailyCount, setLoadingDailyCount] = useState(false);
+  const [pcsOutRecords, setPcsOutRecords] = useState([]);
+  const [pcsOutDraft, setPcsOutDraft] = useState({ product: "", size: "", quantity: "" });
+  const [savingPcsOut, setSavingPcsOut] = useState(false);
   const [downloadingRangeReport, setDownloadingRangeReport] = useState(false);
   const [valueZone, setValueZone] = useState(1);
+  const canManagePcsOut = isSuperIqFoam && user?.is_primary_owner && user?.is_owner;
 
   const loadMovements = () => loadListRequest({
     request: () => api.get("/stock/movements"),
@@ -65,6 +69,12 @@ export default function Stock() {
     if (showHist) void loadMovements();
   };
   useEffect(() => { load(); }, []);
+  useEffect(() => {
+    if (!canManagePcsOut) return;
+    api.get("/stock/pcs-out")
+      .then(setPcsOutRecords)
+      .catch((error) => toast.error(`Could not load today's Pcs Out entries: ${apiError(error)}`));
+  }, [canManagePcsOut]);
 
   const run = async (fn, ok) => {
     if (busy) return; setBusy(true);
@@ -268,6 +278,31 @@ export default function Stock() {
     }
   };
 
+  const savePcsOut = async () => {
+    const quantity = Number(pcsOutDraft.quantity);
+    if (!pcsOutDraft.product.trim() || !pcsOutDraft.size.trim()) {
+      return toast.error("Product and size are required");
+    }
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      return toast.error("Enter a whole number of pieces greater than zero");
+    }
+    setSavingPcsOut(true);
+    try {
+      const record = await api.post("/stock/pcs-out", {
+        product: pcsOutDraft.product.trim(),
+        size: pcsOutDraft.size.trim(),
+        quantity,
+      });
+      setPcsOutRecords((current) => [record, ...current]);
+      setPcsOutDraft({ product: "", size: "", quantity: "" });
+      toast.success("Pcs Out saved and included in today's pieces-made report");
+    } catch (error) {
+      toast.error(`Could not save Pcs Out: ${apiError(error)}`);
+    } finally {
+      setSavingPcsOut(false);
+    }
+  };
+
   const deleteStock = async (stock) => {
     if (!window.confirm(`Permanently delete ${stock.product} ${stock.size} and all its stock movements? This cannot be undone.`)) return;
     if (busy) return;
@@ -357,11 +392,13 @@ export default function Stock() {
       <PageHeader title="Finished Stock" subtitle="Calculated from the stock movement ledger" />
 
       {isSuperIqFoam && (
-        <div className="no-print mb-5 flex flex-wrap items-center gap-2 border-b border-slate-200 pb-4" data-testid="stock-update-actions">
+        <div className="no-print mb-5 flex flex-wrap items-center justify-between gap-4 border-b border-slate-200 pb-4" data-testid="stock-update-actions">
+          <div className="flex flex-wrap items-center gap-2">
           {user?.is_primary_owner && user?.is_owner && (
             <>
               <Btn
                 type="button"
+                variant="outline"
                 onClick={openDailyCountSheet}
                 disabled={updatingRightStock || busy || list === null}
                 data-testid="update-daily-stock"
@@ -381,15 +418,34 @@ export default function Stock() {
           )}
           {productIdsAction}
           {ledgerAction}
+          </div>
+          <details className="relative">
+            <summary className="inline-flex cursor-pointer list-none items-center gap-2 rounded-md border border-border bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition-colors hover:bg-secondary/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20">
+              <Download size={16} /> Reports <ChevronDown size={15} />
+            </summary>
+            <div className="absolute right-0 z-30 mt-2 flex min-w-64 flex-col gap-2 rounded-lg border border-border bg-white p-2 shadow-lg">
           <Btn
             type="button"
             variant="outline"
+            className="justify-start"
             onClick={() => downloadRangeReport({ blank: true })}
             disabled={downloadingRangeReport}
             data-testid="download-stock-count-sheet"
           >
-            <Download size={16} /> {downloadingRangeReport ? "Preparing..." : "Download Stock Calculating Sheet"}
+            <Download size={16} /> {downloadingRangeReport ? "Preparing..." : "Stock Calculating Sheet"}
           </Btn>
+              <Btn
+                type="button"
+                variant="outline"
+                className="justify-start"
+                onClick={() => downloadRangeReport()}
+                disabled={downloadingRangeReport}
+                data-testid="download-product-range-report"
+              >
+                <Download size={16} /> {downloadingRangeReport ? "Preparing..." : "Current Stock PDF"}
+              </Btn>
+            </div>
+          </details>
         </div>
       )}
 
@@ -414,18 +470,6 @@ export default function Stock() {
         <div className="flex flex-wrap items-center gap-2">
           {searchAction}
           {addProductAction}
-          {isSuperIqFoam && (
-            <>
-              <Btn
-                type="button"
-                onClick={() => downloadRangeReport()}
-                disabled={downloadingRangeReport}
-                data-testid="download-product-range-report"
-              >
-                <Download size={16} /> {downloadingRangeReport ? "Preparing..." : "Download Current Stock PDF"}
-              </Btn>
-            </>
-          )}
         </div>
       </div>
 
@@ -441,7 +485,7 @@ export default function Stock() {
           <div className="flex min-h-0 flex-col">
             <div className="shrink-0 space-y-3 border-b border-border/70 px-4 py-4 sm:px-6">
               <p className="text-sm text-slate-600">
-                Enter the number of pieces made today for each product and size. The stock ID and book balance are shown alongside today's invoices, dispatches, other movements, and receipts. Physical count is optional; when entered, it reconciles the ledger to the actual count.
+                Enter pieces made for stock separately from Pcs Out, which was produced and shipped immediately. The stock ID and book balance are shown alongside today's invoices, dispatches, other movements, and receipts. Physical count is optional; when entered, it reconciles the ledger to the actual count.
               </p>
               {dailyCountSheet.already_submitted && (
                 <p className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800">
@@ -453,7 +497,8 @@ export default function Stock() {
                 <div className="rounded-md bg-slate-50 p-2">Dispatched: <strong>{dailyCountSheet.activity.dispatch_out}</strong></div>
                 <div className="rounded-md bg-slate-50 p-2">Other out: <strong>{dailyCountSheet.activity.other_out}</strong></div>
                 <div className="rounded-md bg-slate-50 p-2">Received in: <strong>{dailyCountSheet.activity.received_in}</strong></div>
-                <div className="rounded-md bg-slate-50 p-2">Made today: <strong>{dailyCountSheet.activity.production_in}</strong></div>
+                <div className="rounded-md bg-slate-50 p-2">Made today (including Pcs Out): <strong>{dailyCountSheet.activity.production_in + dailyCountSheet.activity.pcs_out}</strong></div>
+                <div className="rounded-md bg-slate-50 p-2">Pcs Out: <strong>{dailyCountSheet.activity.pcs_out}</strong></div>
               </div>
             </div>
             <div className="min-h-0 overflow-auto px-4 py-3 sm:px-6">
@@ -464,7 +509,8 @@ export default function Stock() {
                     <th className="p-2">Size</th>
                     <th className="p-2">Product ID</th>
                     <th className="p-2 text-right">Book balance</th>
-                    <th className="p-2">Pieces made today</th>
+                    <th className="p-2">Pieces made to stock today</th>
+                    <th className="p-2 text-right">Pcs Out</th>
                     <th className="p-2 text-right">Invoice out</th>
                     <th className="p-2 text-right">Dispatched</th>
                     <th className="p-2 text-right">Other out</th>
@@ -496,15 +542,20 @@ export default function Stock() {
                           className="min-w-24 px-2 py-1.5 text-right"
                         />
                       </td>
+                      <td className="p-2 text-right font-mono">{row.pcs_out}</td>
                       <td className="p-2 text-right font-mono">{row.invoice_out}</td>
                       <td className="p-2 text-right font-mono">{row.dispatch_out}</td>
                       <td className="p-2 text-right font-mono">{row.other_out}</td>
                       <td className="p-2 text-right font-mono">{row.received_in}</td>
                       <td className="p-2">
+                        {row.pcs_out > 0 && !row.has_stock_record && (
+                          <p className="mb-1 text-[10px] text-slate-400">Rush pieces shipped immediately</p>
+                        )}
                         <Input
                           type="number"
                           min="0"
                           step="any"
+                          disabled={row.pcs_out > 0 && !row.has_stock_record}
                           value={row.physical_count}
                           onChange={(event) => setDailyCountSheet((current) => ({
                             ...current,
@@ -533,6 +584,7 @@ export default function Stock() {
               </Btn>
               <Btn
                 type="button"
+                variant="outline"
                 disabled={updatingRightStock || dailyCountSheet.rows.length === 0}
                 onClick={submitDailyCountSheet}
                 data-testid="save-daily-stock-count"
@@ -543,6 +595,64 @@ export default function Stock() {
           </div>
         )}
       </Modal>
+
+      {canManagePcsOut && (
+        <Card className="mb-6 border-slate-200 bg-slate-50 p-4" data-testid="pcs-out-panel">
+          <div className="mb-3">
+            <h2 className="text-xs font-bold uppercase tracking-wide text-slate-600">Pcs Out</h2>
+            <p className="mt-1 text-xs text-slate-500">
+              Record rush pieces made and shipped immediately. They are counted in today's production report but are not added to stock.
+            </p>
+          </div>
+          <div className="grid items-end gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_10rem_auto]">
+            <Input
+              label="Product"
+              value={pcsOutDraft.product}
+              onChange={(event) => setPcsOutDraft((current) => ({ ...current, product: event.target.value }))}
+              data-testid="pcs-out-product"
+            />
+            <Input
+              label="Size"
+              value={pcsOutDraft.size}
+              onChange={(event) => setPcsOutDraft((current) => ({ ...current, size: event.target.value }))}
+              data-testid="pcs-out-size"
+            />
+            <Input
+              label="Pieces"
+              type="number"
+              min="1"
+              step="1"
+              value={pcsOutDraft.quantity}
+              onChange={(event) => setPcsOutDraft((current) => ({ ...current, quantity: event.target.value }))}
+              data-testid="pcs-out-quantity"
+            />
+            <Btn type="button" variant="outline" onClick={savePcsOut} disabled={savingPcsOut} data-testid="save-pcs-out">
+              <Plus size={16} /> {savingPcsOut ? "Saving..." : "Add Pcs Out"}
+            </Btn>
+          </div>
+          {pcsOutRecords.length > 0 && (
+            <div className="mt-4 overflow-x-auto rounded-md border border-slate-200 bg-white">
+              <table className="w-full min-w-[420px] text-sm">
+                <thead className="border-b border-slate-200 bg-slate-50 text-left text-xs text-slate-500">
+                  <tr><th className="px-3 py-2">Product</th><th className="px-3 py-2">Size</th><th className="px-3 py-2 text-right">Pieces</th></tr>
+                </thead>
+                <tbody>
+                  {pcsOutRecords.map((record) => (
+                    <tr key={record.id} className="border-b border-slate-100 last:border-0" data-testid={`pcs-out-row-${record.id}`}>
+                      <td className="px-3 py-2 font-medium">{record.product}</td>
+                      <td className="px-3 py-2">{record.size}</td>
+                      <td className="px-3 py-2 text-right font-mono">{record.quantity}</td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot className="border-t border-slate-200 bg-slate-50 font-semibold">
+                  <tr><td className="px-3 py-2" colSpan={2}>Today's Pcs Out total</td><td className="px-3 py-2 text-right font-mono">{pcsOutRecords.reduce((sum, record) => sum + Number(record.quantity || 0), 0)}</td></tr>
+                </tfoot>
+              </table>
+            </div>
+          )}
+        </Card>
+      )}
 
       <Card className="p-4 mb-6 bg-slate-50 border-slate-200">
         <div className="mb-3 flex items-center justify-between gap-3">
@@ -630,7 +740,7 @@ export default function Stock() {
               <tbody>{filteredList.map((s) => (
                 <tr key={s.id} className="border-b border-border/60 hover:bg-slate-50" data-testid={`stock-row-${s.id}`}>
                   <td className="sticky left-0 z-10 bg-white px-3 whitespace-nowrap">
-                    <button type="button" onClick={() => setMoveModal({ stock_id: s.id, label: `${s.product} ${s.size}`, current: s.current, type: "adjustment_in", quantity: 1, reason: "", reference: "", notes: "" })} className="inline-flex items-center gap-1 rounded-md border border-primary/30 bg-primary/5 px-2.5 py-1.5 text-xs font-semibold text-primary hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1" aria-label={`Adjust ${s.product} ${s.size}`} data-testid={`move-stock-${s.id}`}><ArrowUpDown size={13} /> Adjust</button>
+                    <button type="button" onClick={() => setMoveModal({ stock_id: s.id, label: `${s.product} ${s.size}`, current: s.current, type: "adjustment_in", quantity: 1, reason: "", reference: "", notes: "" })} className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300 focus-visible:ring-offset-1" aria-label={`Adjust ${s.product} ${s.size}`} data-testid={`move-stock-${s.id}`}><ArrowUpDown size={13} /> Adjust</button>
                   </td>
                   <td className="px-4 py-3 text-slate-500 font-mono">{s.size}</td>
                   <td className="px-4 font-semibold text-slate-800">{s.product}</td>
@@ -640,7 +750,7 @@ export default function Stock() {
                   {canViewStockCosts && <td className="px-4">
                     <div className="flex items-center justify-end gap-2">
                       <Input aria-label={`Cost for ${s.product} ${s.size}`} type="number" min="0" step="0.01" value={costDrafts[s.id] ?? (s.unit_cost ?? "")} onChange={(e) => setCostDrafts((current) => ({ ...current, [s.id]: e.target.value }))} className="w-32 min-w-[8rem] max-w-none shrink-0 px-2 py-1.5 text-right tabular-nums" data-testid={`stock-cost-${s.id}`} />
-                      <button type="button" onClick={() => saveCost(s)} disabled={busy} className="text-primary hover:underline text-xs font-semibold disabled:opacity-50" data-testid={`save-stock-cost-${s.id}`}>Save</button>
+                      <button type="button" onClick={() => saveCost(s)} disabled={busy} className="text-slate-600 hover:text-slate-900 hover:underline text-xs font-semibold disabled:opacity-50" data-testid={`save-stock-cost-${s.id}`}>Save</button>
                     </div>
                   </td>}
                   {unifiedPriceList || !priceZonesEnabled
@@ -674,7 +784,7 @@ export default function Stock() {
             {addModal.category && !user?.is_stock_only_worker && (
               <Btn
                 type="button"
-                variant="danger"
+                variant="outline"
                 onClick={deleteStockCategory}
                 disabled={busy || list === null}
                 data-testid="delete-stock-category-btn"
@@ -693,7 +803,7 @@ export default function Stock() {
             <Input label="Selling Price (R) *" type="number" min="0" step="0.01" value={addModal.selling_price} onChange={(e) => setAddModal({ ...addModal, selling_price: e.target.value })} data-testid="stock-price-input" />
           </div>
           {priceZonesEnabled && <Select label="Price zone" value={addModal.zone} onChange={(e) => setAddModal({ ...addModal, zone: Number(e.target.value) })}><option value={1}>Zone 1</option><option value={2}>Zone 2</option></Select>}
-          <div className="flex justify-end gap-2"><Btn variant="outline" onClick={() => setAddModal(null)}>Cancel</Btn><Btn disabled={busy} onClick={saveStock} data-testid="save-stock-btn">Add</Btn></div>
+          <div className="flex justify-end gap-2"><Btn variant="outline" onClick={() => setAddModal(null)}>Cancel</Btn><Btn variant="outline" disabled={busy} onClick={saveStock} data-testid="save-stock-btn">Add</Btn></div>
         </div>}
       </Modal>
 
@@ -706,7 +816,7 @@ export default function Stock() {
           <Input label="Quantity" type="number" min="0" step="any" value={moveModal.quantity} onChange={(e) => setMoveModal({ ...moveModal, quantity: Number(e.target.value) })} data-testid="move-qty-input" />
           <Input label="Reason (optional)" value={moveModal.reason} onChange={(e) => setMoveModal({ ...moveModal, reason: e.target.value })} data-testid="move-reason-input" />
           <Input label="Reference (optional)" value={moveModal.reference} onChange={(e) => setMoveModal({ ...moveModal, reference: e.target.value })} />
-          <div className="flex justify-end gap-2"><Btn variant="outline" onClick={() => setMoveModal(null)}>Cancel</Btn><Btn disabled={busy} onClick={saveMove} data-testid="save-move-btn">Record</Btn></div>
+          <div className="flex justify-end gap-2"><Btn variant="outline" onClick={() => setMoveModal(null)}>Cancel</Btn><Btn variant="outline" disabled={busy} onClick={saveMove} data-testid="save-move-btn">Record</Btn></div>
         </div>}
       </Modal>
 

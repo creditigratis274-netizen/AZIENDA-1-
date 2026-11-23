@@ -295,6 +295,8 @@ def test_daily_count_sheet_shows_ledger_balance_and_today_movements(monkeypatch)
     async def listall(collection, filters=None, *_args, **_kwargs):
         if collection == "stock":
             return [stock]
+        if collection == "stock_pcs_out":
+            return []
         assert collection == "stock_movements"
         return [movement for movement in all_movements if movement["date"] == filters["date"]]
 
@@ -320,6 +322,174 @@ def test_daily_count_sheet_shows_ledger_balance_and_today_movements(monkeypatch)
     assert row["received_in"] == 1
     assert report["activity"]["invoice_out"] == 2
     assert report["activity"]["received_in"] == 1
+
+
+def test_pcs_out_is_reported_without_creating_stock(monkeypatch):
+    today = server.today_str()
+    pcs_out_records = [{
+        "id": "pcs-out-1",
+        "company_id": server.DEFAULT_COMPANY_ID,
+        "date": today,
+        "product": "Rush Simple",
+        "size": "760x50",
+        "quantity": 7,
+    }]
+    calls = []
+
+    async def listall(collection, filters=None, *_args, **_kwargs):
+        calls.append((collection, filters))
+        if collection == "stock":
+            return []
+        if collection == "stock_pcs_out":
+            return pcs_out_records
+        if collection == "stock_movements":
+            return []
+        raise AssertionError(f"Unexpected collection: {collection}")
+
+    monkeypatch.setattr(server, "listall", listall)
+    monkeypatch.setattr(
+        server,
+        "stock_movements_for_stock_ids",
+        lambda ids: asyncio.sleep(0, result={stock_id: [] for stock_id in ids}),
+    )
+    monkeypatch.setattr(
+        server,
+        "db",
+        SimpleNamespace(stock_daily_reconciliations=SimpleNamespace(
+            find_one=lambda *_args, **_kwargs: asyncio.sleep(0, result=None),
+        )),
+    )
+
+    report = asyncio.run(server.daily_stock_reconciliation_data(today))
+    row = next(item for item in report["rows"] if item["product"] == "Rush Simple")
+
+    assert row["size"] == "760x50"
+    assert row["pcs_out"] == 7
+    assert row["book_quantity"] == 0
+    assert row["made_today"] == 0
+    assert report["activity"]["pcs_out"] == 7
+    assert report["activity"]["production_in"] == 0
+    assert ("stock", None) in calls
+    assert ("stock_movements", {"date": today}) in calls
+
+
+def test_pcs_out_entry_is_saved_as_a_separate_audited_record(monkeypatch):
+    monkeypatch.setenv("ADMIN_EMAIL", "owner@example.com")
+    saved_records = []
+    audits = []
+
+    async def insert(collection, data):
+        assert collection == "stock_pcs_out"
+        record = {"id": "pcs-out-1", **data}
+        saved_records.append(record)
+        return record
+
+    async def log_audit(*args, **kwargs):
+        audits.append((args, kwargs))
+
+    monkeypatch.setattr(server, "insert", insert)
+    monkeypatch.setattr(server, "log_audit", log_audit)
+
+    record = asyncio.run(server.add_pcs_out(
+        server.PcsOutIn(product="Rush Simple", size="760x50", quantity=7),
+        owner(),
+    ))
+
+    assert record["product"] == "Rush Simple"
+    assert record["size"] == "760x50"
+    assert record["quantity"] == 7
+    assert record["company_id"] == server.DEFAULT_COMPANY_ID
+    assert record["date"] == server.today_str()
+    assert [saved["id"] for saved in saved_records] == ["pcs-out-1"]
+    assert audits[0][0][:3] == ("stock_pcs_out", "pcs-out-1", "created")
+
+
+def test_pcs_out_only_rows_do_not_create_stock_when_daily_report_is_saved(monkeypatch):
+    monkeypatch.setenv("ADMIN_EMAIL", "owner@example.com")
+    monkeypatch.setattr(server, "StockLock", NoopStockLock)
+    pcs_out_records = [{
+        "id": "pcs-out-1",
+        "company_id": server.DEFAULT_COMPANY_ID,
+        "date": server.today_str(),
+        "product": "Rush Simple",
+        "size": "760x50",
+        "quantity": 7,
+    }]
+    specs = server.daily_stock_count_specs([], pcs_out_records)
+    rows = [
+        {
+            "key": server.daily_stock_identity_key(spec["product"], spec["size"]),
+            "product": spec["product"],
+            "size": spec["size"],
+        }
+        for spec in specs
+    ]
+    inserted = []
+
+    async def listall(collection, *_args, **_kwargs):
+        if collection == "stock":
+            return []
+        if collection == "stock_pcs_out":
+            return pcs_out_records
+        raise AssertionError(f"Unexpected collection: {collection}")
+
+    async def insert(collection, data):
+        inserted.append((collection, data))
+        return {"id": data.get("id", "daily-report"), **data}
+
+    async def log_audit(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "listall", listall)
+    monkeypatch.setattr(server, "insert", insert)
+    monkeypatch.setattr(server, "log_audit", log_audit)
+    monkeypatch.setattr(server, "daily_stock_reconciliation_data", lambda _date: asyncio.sleep(
+        0, result={"rows": rows},
+    ))
+    monkeypatch.setattr(server, "stock_movements_for_stock_ids", lambda ids: asyncio.sleep(
+        0, result={stock_id: [] for stock_id in ids},
+    ))
+    monkeypatch.setattr(server, "post_movement", lambda *_args, **_kwargs: pytest.fail(
+        "Pcs Out must not post a stock movement",
+    ))
+    monkeypatch.setattr(
+        server,
+        "db",
+        SimpleNamespace(stock_daily_reconciliations=SimpleNamespace(
+            find_one=lambda *_args, **_kwargs: asyncio.sleep(0, result=None),
+        )),
+    )
+    counts = [
+        {"product": spec["product"], "size": spec["size"], "made_today": 0}
+        for spec in specs
+    ]
+
+    asyncio.run(server.update_daily_stock_reconciliation(
+        server.DailyStockReconciliationIn(report_date=server.today_str(), counts=counts),
+        owner(),
+    ))
+
+    assert [collection for collection, _ in inserted] == ["stock_daily_reconciliations"]
+    assert next(line for line in inserted[0][1]["counts"] if line["product"] == "Rush Simple")["made_today"] == 0
+
+    inserted.clear()
+    physical_counts = [
+        {
+            "product": spec["product"],
+            "size": spec["size"],
+            "made_today": 0,
+            "quantity": 1 if spec["product"] == "Rush Simple" else None,
+        }
+        for spec in specs
+    ]
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(server.update_daily_stock_reconciliation(
+            server.DailyStockReconciliationIn(report_date=server.today_str(), counts=physical_counts),
+            owner(),
+        ))
+
+    assert error.value.status_code == 400
+    assert inserted == []
 
 
 def test_daily_count_requires_a_complete_catalog(monkeypatch):

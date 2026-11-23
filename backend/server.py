@@ -8596,6 +8596,20 @@ class DailyStockCountLine(BaseModel):
         return value
 
 
+class PcsOutIn(BaseModel):
+    product: str = Field(min_length=1, max_length=120)
+    size: str = Field(min_length=1, max_length=80)
+    quantity: int = Field(gt=0, le=1_000_000_000)
+
+    @field_validator("product", "size")
+    @classmethod
+    def pcs_out_value_required(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("Product and size are required")
+        return value
+
+
 class DailyStockReconciliationIn(BaseModel):
     report_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     counts: List[DailyStockCountLine] = Field(min_length=1)
@@ -8611,7 +8625,7 @@ class DailyStockReconciliationIn(BaseModel):
         return self
 
 
-def daily_stock_count_specs(stock_items):
+def daily_stock_count_specs(stock_items, pcs_out_records=()):
     specs = {}
     for product, size, _quantity in RIGHT_STOCK_UPDATE_ITEMS:
         canonical_product = right_stock_canonical_product(product)
@@ -8625,6 +8639,13 @@ def daily_stock_count_specs(stock_items):
         key = daily_stock_identity_key(product, size)
         specs.setdefault(key, {"product": product, "size": size, "records": []})
         specs[key]["records"].append(stock)
+    for record in pcs_out_records:
+        product = right_stock_canonical_product(record.get("product"))
+        size = str(record.get("size") or "").strip()
+        if not product or not size:
+            continue
+        key = daily_stock_identity_key(product, size)
+        specs.setdefault(key, {"product": product, "size": size, "records": []})
     return list(specs.values())
 
 
@@ -8635,6 +8656,7 @@ def daily_stock_movement_summary(movements):
         "other_out": 0.0,
         "received_in": 0.0,
         "production_in": 0.0,
+        "pcs_out": 0.0,
     }
     for movement in movements:
         quantity = float(movement.get("quantity") or 0)
@@ -8654,7 +8676,15 @@ def daily_stock_movement_summary(movements):
 
 async def daily_stock_reconciliation_data(report_date):
     stock_items = await listall("stock")
-    specs = daily_stock_count_specs(stock_items)
+    pcs_out_records = await listall("stock_pcs_out", {
+        "company_id": DEFAULT_COMPANY_ID,
+        "date": report_date,
+    })
+    specs = daily_stock_count_specs(stock_items, pcs_out_records)
+    pcs_out_by_key = {}
+    for record in pcs_out_records:
+        key = daily_stock_identity_key(record.get("product"), record.get("size"))
+        pcs_out_by_key[key] = pcs_out_by_key.get(key, 0) + int(record.get("quantity") or 0)
     stock_ids = [
         stock["id"]
         for spec in specs
@@ -8697,19 +8727,23 @@ async def daily_stock_reconciliation_data(report_date):
                  if stock.get("product_id") or stock.get("code")),
                 "",
             ),
+            "has_stock_record": bool(spec["records"]),
             "book_quantity": r2(book_quantity),
             "quantity": saved_counts.get(key),
             "made_today": saved_production.get(key, 0),
+            "pcs_out": pcs_out_by_key.get(key, 0),
             "invoice_out": activity["invoice_out"],
             "dispatch_out": activity["dispatch_out"],
             "other_out": activity["other_out"],
             "received_in": activity["received_in"],
         })
+    activity = daily_stock_movement_summary(summary_movements)
+    activity["pcs_out"] = sum(pcs_out_by_key.values())
     return {
         "report_date": report_date,
         "already_submitted": bool(saved),
         "rows": rows,
-        "activity": daily_stock_movement_summary(summary_movements),
+        "activity": activity,
     }
 
 
@@ -8735,6 +8769,35 @@ async def get_daily_stock_reconciliation_route(
     user=Depends(get_current_user),
 ):
     return await get_daily_stock_reconciliation(user, report_date)
+
+
+@api.get("/stock/pcs-out")
+async def get_pcs_out_today(user=Depends(get_current_user)):
+    company_id = user.get("_active_company_id") or user.get("company_id")
+    if company_id != DEFAULT_COMPANY_ID:
+        raise HTTPException(403, "Pcs Out is only available in SuperIQFoam")
+    require_global_owner(user)
+    return await listall("stock_pcs_out", {
+        "company_id": DEFAULT_COMPANY_ID,
+        "date": today_str(),
+    }, sort=("created_at", -1))
+
+
+@api.post("/stock/pcs-out")
+async def add_pcs_out(body: PcsOutIn, user=Depends(get_current_user)):
+    company_id = user.get("_active_company_id") or user.get("company_id")
+    if company_id != DEFAULT_COMPANY_ID:
+        raise HTTPException(403, "Pcs Out is only available in SuperIQFoam")
+    require_global_owner(user)
+    record = await insert("stock_pcs_out", {
+        **body.model_dump(),
+        "company_id": DEFAULT_COMPANY_ID,
+        "date": today_str(),
+        "created_by": worker_display_name(user),
+        "created_by_user_id": user.get("id", ""),
+    })
+    await log_audit("stock_pcs_out", record["id"], "created", user, after=record)
+    return record
 
 
 @api.post("/stock/update-right-stock")
@@ -8880,14 +8943,22 @@ async def update_daily_stock_reconciliation(
                 "unexpected_count": len(unexpected),
             })
 
-        initial_stock_specs = daily_stock_count_specs(await listall("stock"))
+        initial_pcs_out = await listall("stock_pcs_out", {
+            "company_id": DEFAULT_COMPANY_ID,
+            "date": body.report_date,
+        })
+        initial_stock_specs = daily_stock_count_specs(await listall("stock"), initial_pcs_out)
         existing_ids = sorted(
             stock["id"]
             for spec in initial_stock_specs
             for stock in spec["records"]
         )
         async with StockLock(existing_ids):
-            specs = daily_stock_count_specs(await listall("stock"))
+            pcs_out_records = await listall("stock_pcs_out", {
+                "company_id": DEFAULT_COMPANY_ID,
+                "date": body.report_date,
+            })
+            specs = daily_stock_count_specs(await listall("stock"), pcs_out_records)
             current_ids = sorted(
                 stock["id"]
                 for spec in specs
@@ -8897,6 +8968,17 @@ async def update_daily_stock_reconciliation(
                 raise HTTPException(409, "Stock products changed while preparing the count sheet. Reload and retry.")
             if {daily_stock_identity_key(spec["product"], spec["size"]) for spec in specs} != set(submitted):
                 raise HTTPException(409, "Stock categories or sizes changed while preparing the count sheet. Reload and retry.")
+            pcs_out_keys = {
+                daily_stock_identity_key(record.get("product"), record.get("size"))
+                for record in pcs_out_records
+            }
+            if any(
+                not spec["records"]
+                and daily_stock_identity_key(spec["product"], spec["size"]) in pcs_out_keys
+                and submitted[daily_stock_identity_key(spec["product"], spec["size"])].quantity is not None
+                for spec in specs
+            ):
+                raise HTTPException(400, "Pcs Out items shipped immediately cannot be added to the physical stock count.")
 
             movements_by_stock = await stock_movements_for_stock_ids(current_ids)
             reconciliation_id = f"daily-stock-reconciliation:{body.report_date}"
