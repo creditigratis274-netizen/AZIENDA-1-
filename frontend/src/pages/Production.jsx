@@ -3,7 +3,7 @@ import { toast } from "sonner";
 import { api, apiError } from "@/lib/api";
 import { fmtDate, fmtDateTime, today } from "@/lib/format";
 import { Card, Btn, Input, Select, Modal, PageHeader, Empty, Badge } from "@/components/common";
-import { Factory, Plus, Save, Trash2, Pencil, RotateCcw } from "lucide-react";
+import { Factory, Plus, Save, Trash2, Pencil, RotateCcw, Download } from "lucide-react";
 import BarcodeScanner from "@/components/BarcodeScanner";
 import { useAuth } from "@/context/AuthContext";
 
@@ -317,6 +317,243 @@ export default function Production() {
       toast.error(apiError(error));
     }
   };
+
+  const downloadTodayBlockCuttingReport = async () => {
+    try {
+      const reportDate = today();
+
+      const getLocalDate = (value) => {
+        if (!value) return "";
+        const parsed = new Date(value);
+        if (Number.isNaN(parsed.getTime())) return "";
+        return new Intl.DateTimeFormat("en-CA", {
+          timeZone: "Africa/Johannesburg",
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+        }).format(parsed);
+      };
+
+      const records = blockCuttings.filter((record) =>
+        !record.archived && getLocalDate(record.created_at) === reportDate
+      );
+
+      const grouped = new Map();
+
+      records.forEach((record) => {
+        const block = String(record.block || "Unspecified").trim();
+        const size = record.has_sheet
+          ? `Sheet${record.sheet_mm ? ` - ${record.sheet_mm} mm` : ""}`
+          : String(record.size || "Unspecified").trim();
+
+        const pieces = Number(
+          record.sheet_pieces_recovered ??
+          record.pieces_recovered ??
+          0
+        ) || 0;
+
+        if (!grouped.has(block)) grouped.set(block, new Map());
+
+        const sizes = grouped.get(block);
+
+        if (!sizes.has(size)) {
+          sizes.set(size, { blocks: 0, pieces: 0 });
+        }
+
+        const item = sizes.get(size);
+        item.blocks += 1;
+        item.pieces += pieces;
+      });
+
+      const { jsPDF } = await import("jspdf");
+      const pdf = new jsPDF({
+        orientation: "landscape",
+        unit: "mm",
+        format: "a4",
+      });
+
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const margin = 10;
+      const widths = [125, 65, 87];
+      let y = 42;
+      let grandBlocks = 0;
+      let grandPieces = 0;
+
+      const drawPageHeader = () => {
+        pdf.setFillColor(16, 38, 62);
+        pdf.rect(margin, 9, pageWidth - margin * 2, 23, "F");
+
+        pdf.setTextColor(255, 255, 255);
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(16);
+        pdf.text("SUPER IQ-FOAM", margin + 5, 19);
+
+        pdf.setFontSize(12);
+        pdf.text(
+          "BLOCK CUTTING REPORT",
+          pageWidth - margin - 5,
+          19,
+          { align: "right" }
+        );
+
+        pdf.setFontSize(9);
+        pdf.text(`Date: ${reportDate}`, margin + 5, 27);
+      };
+
+      const ensureSpace = (height) => {
+        if (y + height > pageHeight - 12) {
+          pdf.addPage();
+          drawPageHeader();
+          y = 39;
+        }
+      };
+
+      const drawCell = (x, width, value, options = {}) => {
+        pdf.setFillColor(...(options.fill || [255, 255, 255]));
+        pdf.setDrawColor(203, 213, 225);
+        pdf.rect(x, y, width, 8, "FD");
+
+        pdf.setTextColor(...(options.color || [15, 23, 42]));
+        pdf.setFont("helvetica", options.bold ? "bold" : "normal");
+        pdf.setFontSize(8);
+
+        const align = options.align || "left";
+        const textX = align === "right"
+          ? x + width - 3
+          : align === "center"
+            ? x + width / 2
+            : x + 3;
+
+        pdf.text(String(value ?? ""), textX, y + 5.3, { align });
+      };
+
+      const drawTableHeader = () => {
+        let x = margin;
+        const headers = [
+          "Measurement / Size",
+          "Blocks cut",
+          "Pieces recovered",
+        ];
+
+        headers.forEach((header, index) => {
+          drawCell(x, widths[index], header, {
+            fill: [226, 232, 240],
+            color: [15, 23, 42],
+            bold: true,
+            align: index === 0 ? "left" : "center",
+          });
+          x += widths[index];
+        });
+
+        y += 8;
+      };
+
+      drawPageHeader();
+
+      pdf.setFont("helvetica", "normal");
+      pdf.setFontSize(9);
+      pdf.setTextColor(71, 85, 105);
+      pdf.text(`Block cutting records today: ${records.length}`, margin, 37);
+
+      if (grouped.size === 0) {
+        pdf.text("No block cutting records were entered today.", margin, 50);
+      }
+
+      [...grouped.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .forEach(([block, sizes]) => {
+          ensureSpace(27);
+
+          pdf.setFont("helvetica", "bold");
+          pdf.setFontSize(11);
+          pdf.setTextColor(15, 23, 42);
+          pdf.text(`BLOCK TYPE: ${block.toUpperCase()}`, margin, y);
+          y += 4;
+
+          drawTableHeader();
+
+          let typeBlocks = 0;
+          let typePieces = 0;
+
+          [...sizes.entries()]
+            .sort(([a], [b]) =>
+              a.localeCompare(b, undefined, { numeric: true })
+            )
+            .forEach(([size, values]) => {
+              ensureSpace(8);
+
+              let x = margin;
+              drawCell(x, widths[0], size);
+              x += widths[0];
+
+              drawCell(x, widths[1], values.blocks, { align: "right" });
+              x += widths[1];
+
+              drawCell(x, widths[2], values.pieces.toLocaleString(), {
+                align: "right",
+              });
+
+              y += 8;
+              typeBlocks += values.blocks;
+              typePieces += values.pieces;
+            });
+
+          ensureSpace(8);
+
+          let x = margin;
+          drawCell(x, widths[0], "BLOCK TYPE TOTAL", {
+            fill: [16, 38, 62],
+            color: [255, 255, 255],
+            bold: true,
+          });
+          x += widths[0];
+
+          drawCell(x, widths[1], typeBlocks, {
+            fill: [16, 38, 62],
+            color: [255, 255, 255],
+            bold: true,
+            align: "right",
+          });
+          x += widths[1];
+
+          drawCell(x, widths[2], typePieces.toLocaleString(), {
+            fill: [16, 38, 62],
+            color: [255, 255, 255],
+            bold: true,
+            align: "right",
+          });
+
+          y += 13;
+          grandBlocks += typeBlocks;
+          grandPieces += typePieces;
+        });
+
+      ensureSpace(12);
+
+      pdf.setFillColor(16, 38, 62);
+      pdf.rect(margin, y, pageWidth - margin * 2, 11, "F");
+
+      pdf.setTextColor(255, 255, 255);
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(11);
+      pdf.text("GRAND TOTAL", margin + 5, y + 7);
+
+      pdf.setFontSize(9);
+      pdf.text(
+        `Blocks cut: ${grandBlocks.toLocaleString()}  |  Total pieces: ${grandPieces.toLocaleString()}`,
+        pageWidth - margin - 5,
+        y + 7,
+        { align: "right" }
+      );
+
+      pdf.save(`block-cutting-report-${reportDate}.pdf`);
+      toast.success("Today's Block Cutting PDF downloaded");
+    } catch (error) {
+      toast.error(`Could not generate Block Cutting report: ${error.message}`);
+    }
+  };
+
   const deleteBlockCutting = async (record) => {
     if (!window.confirm(`Archive the ${record.block} ${record.size} block cutting record?`)) return;
     try {
@@ -362,27 +599,6 @@ export default function Production() {
   return (
     <div className="space-y-6">
       <PageHeader title="Production" subtitle="Record block quantities produced each day" />
-      <Card className="p-5">
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-end">
-          <Input label="Date" type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} data-testid="prod-date-input" />
-          <Input label="Notes" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} data-testid="prod-notes-input" />
-        </div>
-        <datalist id="production-block-options"><option value="Black" /><option value="White" /></datalist>
-        <div className="mt-4 space-y-3">
-          {form.blocks.map((item, index) => (
-            <div key={index} className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_auto] gap-3 items-end">
-              <Input label="Block" list="production-block-options" value={item.block} onChange={(e) => setForm({ ...form, blocks: form.blocks.map((block, row) => row === index ? { ...block, block: e.target.value } : block) })} data-testid={`prod-block-input-${index}`} />
-              <Input label="Quantity" type="number" min="0" step="1" value={item.quantity} onChange={(e) => setForm({ ...form, blocks: form.blocks.map((block, row) => row === index ? { ...block, quantity: e.target.value } : block) })} data-testid={`prod-quantity-input-${index}`} />
-              {form.blocks.length > 1 && <Btn variant="outline" onClick={() => setForm({ ...form, blocks: form.blocks.filter((_, row) => row !== index) })} aria-label="Remove block row"><Trash2 size={16} /></Btn>}
-            </div>
-          ))}
-          <div className="flex flex-wrap gap-2">
-            <Btn variant="outline" onClick={() => setForm({ ...form, blocks: [...form.blocks, { block: "Black", quantity: "" }] })} data-testid="add-production-block-btn"><Plus size={16} /> Add Block</Btn>
-            <Btn disabled={busy} onClick={save} data-testid="save-production-btn"><Save size={16} /> Save</Btn>
-          </div>
-        </div>
-        <p className="text-xs text-slate-400 mt-2">Saving the same date again replaces that day's numbers.</p>
-      </Card>
       {canRecordBlockProduction && <Card className="p-5 space-y-4" data-testid="block-production-card">
         <div>
           <h2 className="font-semibold text-slate-800">Production Warehouse · Block production</h2>
@@ -503,6 +719,7 @@ export default function Production() {
               <input type="checkbox" checked={showArchivedCuttings} onChange={(event) => setShowArchivedCuttings(event.target.checked)} data-testid="show-archived-block-cuttings" />
               Show archived
             </label>
+            <Btn type="button" variant="outline" onClick={downloadTodayBlockCuttingReport} data-testid="download-today-block-cutting-report"><Download size={16} /> Download Today's Report</Btn>
             <Btn onClick={() => { setCutForm({ block: "", size: "", pieces_recovered: "", has_sheet: false }); setCutScanProduct(null); setCutOpen(true); }} data-testid="add-block-cutting-btn"><Plus size={16} /> Add Block Cutted</Btn>
           </div>
         </div>
