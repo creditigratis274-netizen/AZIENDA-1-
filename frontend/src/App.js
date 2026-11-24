@@ -8,7 +8,7 @@ import { AuthProvider, useAuth } from "@/context/AuthContext";
 import Layout from "@/components/Layout";
 import { pageLoaders } from "@/lib/pageLoaders";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
-import { ArrowRight, Layers } from "lucide-react";
+import { ArrowRight, Layers, X } from "lucide-react";
 
 const AuthCallback = lazy(() => import("@/pages/AuthCallback"));
 const Login = lazy(() => import("@/pages/Login"));
@@ -232,6 +232,18 @@ function OwnerWelcome({ children, user }) {
           transition={{ duration: reduceMotion ? 0 : 0.55, ease: [0.22, 1, 0.36, 1] }}
           className="fixed inset-0 z-[100] flex min-h-screen items-center justify-center overflow-hidden bg-[#091b17] px-5 py-10 text-white"
         >
+          <button
+            type="button"
+            onClick={() => {
+              sessionStorage.setItem("owner-welcome-session", token);
+              setStage("done");
+            }}
+            aria-label="Close popup"
+            title="Close"
+            className="absolute right-4 top-4 z-20 rounded-full border border-white/10 bg-white/[0.06] p-2 text-white/70 transition-colors hover:bg-white/10 hover:text-white"
+          >
+            <X size={20} />
+          </button>
           <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_18%_18%,rgba(52,125,99,0.3),transparent_42%),radial-gradient(ellipse_at_82%_78%,rgba(180,151,81,0.18),transparent_40%)]" />
           <div className="relative w-full max-w-3xl">
             <AnimatePresence mode="wait" initial={false}>
@@ -411,7 +423,7 @@ function App() {
   return (
     <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false} storageKey="erp-theme" disableTransitionOnChange>
       <AuthProvider>
-        <Toaster position="top-right" richColors />
+        <Toaster position="top-right" richColors closeButton />
         <BrowserRouter>
           <AppErrorBoundary>
             <AppRouter />

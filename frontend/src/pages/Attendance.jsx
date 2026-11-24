@@ -47,6 +47,7 @@ export default function Attendance() {
   const [loading, setLoading] = useState(true);
   const [date, setDate] = useState(today());
   const [empModal, setEmpModal] = useState(null);
+  const [deleteEmployeeModal, setDeleteEmployeeModal] = useState(null);
   const [newDepartmentName, setNewDepartmentName] = useState("");
   const [departmentSaving, setDepartmentSaving] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -322,12 +323,16 @@ export default function Attendance() {
       setDepartmentSaving(false);
     }
   };
-  const deleteEmployee = async (employee) => {
-    if (!window.confirm(`Permanently delete ${employee.name} from this profile? The employee will appear in Deleted employees; attendance and salary history will be retained.`)) return;
+  const deleteEmployee = (employee) => setDeleteEmployeeModal(employee);
+
+  const confirmDeleteEmployee = async () => {
+    const employee = deleteEmployeeModal;
+    if (!employee) return;
     try {
       await api.del(`/employees/${employee.id}`);
       setEmployees((current) => current.filter((item) => item.id !== employee.id));
       toast.success("Employee permanently deleted; history retained");
+      setDeleteEmployeeModal(null);
     } catch (error) {
       toast.error(apiError(error));
       return;
@@ -686,6 +691,18 @@ export default function Attendance() {
               </div>);
           })}</div>
         </Card>))}
+      <Modal open={!!deleteEmployeeModal} onClose={() => setDeleteEmployeeModal(null)} title="Permanently delete employee">
+        {deleteEmployeeModal && <div className="space-y-5">
+          <p className="text-sm text-slate-700">
+            Permanently delete <strong>{deleteEmployeeModal.name}</strong> from this profile? The employee will appear in Deleted employees; attendance and salary history will be retained.
+          </p>
+          <div className="flex justify-end gap-2">
+            <Btn variant="outline" onClick={() => setDeleteEmployeeModal(null)}>Cancel</Btn>
+            <Btn variant="danger" onClick={confirmDeleteEmployee}>Delete Employee</Btn>
+          </div>
+        </div>}
+      </Modal>
+
       <Modal open={!!empModal} onClose={() => setEmpModal(null)} title={empModal?.id ? "Edit Employee" : "Add Employee"}>
         {empModal && <div className="space-y-4">
           <Input label="Name *" value={empModal.name} onChange={(e) => setEmpModal({ ...empModal, name: e.target.value })} data-testid="employee-name-input" />

@@ -1,12 +1,14 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { toast } from "sonner";
 import { api, apiError } from "@/lib/api";
 import { fmtMoney, fmtDateTime } from "@/lib/format";
 import { Card, Btn, Input, Select, Badge, Modal, PageHeader } from "@/components/common";
-import { Building2, Receipt, Tag, Truck, Save, Pencil, Plus, ShieldCheck, Fuel, MapPin, Smartphone, Trash2, UserPlus, CirclePause, CirclePlay, KeyRound, Database, RotateCcw, Search, X } from "lucide-react";
+import { Building2, Receipt, Tag, Truck, Save, Pencil, Plus, ShieldCheck, Fuel, MapPin, Trash2, UserPlus, CirclePause, CirclePlay, KeyRound, Database, RotateCcw, Search, X, Printer } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { usesFreeformInvoiceItems, usesUnifiedPriceList } from "@/lib/company";
 import shop2shopQr from "@/assets/shop2shop-n29rxh.png";
+
+const PrintTemplatesDesigner = lazy(() => import("@/pages/PrintTemplatesDesigner"));
 
 const TABS = [
   { k: "company", l: "Company", icon: Building2 },
@@ -16,7 +18,7 @@ const TABS = [
   { k: "diesel", l: "Diesel", icon: Fuel },
   { k: "access", l: "Access", icon: ShieldCheck },
   { k: "profiles", l: "Credentials", icon: KeyRound },
-  { k: "whatsapp", l: "WhatsApp Daily Report", icon: Smartphone },
+  { k: "print-templates", l: "Print Templates", icon: Printer },
   { k: "backups", l: "Backups", icon: Database },
 ];
 
@@ -248,7 +250,7 @@ export default function Settings() {
     (canManageCompanySettings || !["company", "invoice", "profiles"].includes(item.k))
     && (item.k !== "prices" || !freeformInvoiceItems)
     && (item.k !== "diesel" || user?.is_admin)
-    && (item.k !== "whatsapp" || (user?.is_owner && user?.company_id === "superiqfoam"))
+    && (item.k !== "print-templates" || (user?.is_primary_owner && user?.is_owner && !user?.is_worker))
     && (item.k !== "access" || user?.is_owner)
     && (item.k !== "backups" || user?.is_primary_owner)
   );
@@ -583,48 +585,10 @@ export default function Settings() {
         </Card>
       )}
 
-      {tab === "whatsapp" && user?.is_owner && user?.company_id === "superiqfoam" && (
-        <Card className="p-6 max-w-2xl space-y-4">
-          <div>
-            <h3 className="font-bold text-slate-800">WhatsApp Daily Report</h3>
-            <p className="mt-1 text-sm text-slate-500">Prepare the report manually or receive a dashboard reminder at the configured time. WhatsApp requires your manual click to send.</p>
-          </div>
-          <Input
-            label="Recipient WhatsApp number"
-            value={s.daily_report_whatsapp_phone ?? "+27 073 072 3286"}
-            onChange={(event) => setS({ ...s, daily_report_whatsapp_phone: event.target.value })}
-            placeholder="+27 073 072 3286"
-            data-testid="daily-report-whatsapp-phone"
-          />
-          <Input
-            label="Send reminder time (Africa/Johannesburg)"
-            type="time"
-            value={s.daily_report_whatsapp_send_time ?? "17:00"}
-            onChange={(event) => setS({ ...s, daily_report_whatsapp_send_time: event.target.value })}
-            data-testid="daily-report-whatsapp-time"
-          />
-          <label className="flex items-center gap-2 text-sm font-semibold text-slate-700">
-            <input
-              type="checkbox"
-              checked={s.daily_report_whatsapp_enabled === true}
-              onChange={(event) => setS({ ...s, daily_report_whatsapp_enabled: event.target.checked })}
-              data-testid="daily-report-whatsapp-enabled"
-            />
-            Enable 17:00-style dashboard reminder
-          </label>
-          <label className="block">
-            <span className="block text-xs font-semibold text-slate-500 mb-1.5">Message Template</span>
-            <textarea
-              rows={5}
-              value={s.daily_report_whatsapp_message_template ?? "Hello, here is the Daily Report for {DATE}.\n{PDF_URL}"}
-              onChange={(event) => setS({ ...s, daily_report_whatsapp_message_template: event.target.value })}
-              className="w-full rounded-lg border border-input px-3 py-2.5 text-sm"
-              data-testid="daily-report-whatsapp-template"
-            />
-          </label>
-          <p className="text-xs text-slate-500">Available placeholders: <code>{"{DATE}"}</code> and <code>{"{PDF_URL}"}</code>.</p>
-          <Btn onClick={saveSettings} data-testid="save-daily-report-whatsapp"><Save size={16} /> Save WhatsApp Settings</Btn>
-        </Card>
+      {tab === "print-templates" && user?.is_primary_owner && user?.is_owner && !user?.is_worker && (
+        <Suspense fallback={<p className="text-sm text-slate-500" role="status">Loading print template designer...</p>}>
+          <PrintTemplatesDesigner />
+        </Suspense>
       )}
 
       {tab === "invoice" && canManageCompanySettings && (

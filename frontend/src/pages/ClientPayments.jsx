@@ -287,7 +287,9 @@ export default function ClientPayments({ express = false }) {
 
   const expressPaymentsTotal = expressPayments.reduce((total, record) => total + toCents(record.amount), 0) / 100;
   const expressPaymentsReportTotal = expressPayments
-    .filter((record) => record.include_on_daily_report)
+    .filter((record) => record.daily_report_inclusion_set
+      ? !!record.include_on_daily_report
+      : true)
     .reduce((total, record) => total + toCents(record.amount), 0) / 100;
 
   const mostUsedZone = (invoices, fallback) => {

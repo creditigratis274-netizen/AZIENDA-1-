@@ -5244,7 +5244,10 @@ async def pay_other_balance(cid: str, body: OtherBalancePayIn, user=Depends(get_
         "amount": float(amount), "method": body.method, "receiving_on": body.receiving_on or "",
         "date": body.date, "reference": body.reference or "", "notes": body.note or "",
         "invoice_id": None, "invoice_number": "Other balance", "other_balance_payment": True,
-        "express": body.express, "customer_id": cid, "customer_name": customer.get("name"),
+        "express": body.express,
+        "include_on_daily_report": True if body.express else False,
+        "daily_report_inclusion_set": False,
+        "customer_id": cid, "customer_name": customer.get("name"),
         "reversed": False, "user": user["email"],
     })
     history[-1]["payment_id"] = pay_rec["id"]
@@ -6929,6 +6932,8 @@ async def record_advance_payment(cid: str, body: AdvancePaymentIn, user=Depends(
         "invoice_number": "Advance payment",
         "advance_payment": True,
         "express": body.express,
+        "include_on_daily_report": True if body.express else payment.get("include_on_daily_report", False),
+        "daily_report_inclusion_set": False,
         "customer_id": cid,
         "customer_name": customer.get("name"),
         "reversed": False,
@@ -7116,9 +7121,12 @@ async def record_payment(iid: str, body: PaymentIn, user=Depends(get_current_use
         pay = body.model_dump()
         if not pay.get("idempotency_key"):
             pay.pop("idempotency_key")
+        is_express = inv.get("invoice_type") == "express"
         pay.update({"amount": amt, "invoice_id": iid, "invoice_number": inv.get("number"),
                     "customer_id": inv.get("customer_id"), "customer_name": inv.get("customer_name"),
-                    "reversed": False, "user": user["email"]})
+                    "reversed": False, "user": user["email"],
+                    "include_on_daily_report": True if is_express else False,
+                    "daily_report_inclusion_set": False})
         try:
             pay_rec = await insert("payments", pay)
         except DuplicateKeyError:
@@ -7300,7 +7308,11 @@ async def get_express_payments(payment_date: str, user=Depends(get_current_user)
             "receiving_on": payment.get("receiving_on") or "", "reference": payment.get("reference") or "",
             "notes": payment.get("notes") or "", "invoice_number": "Other balance",
             "customer_name": payment.get("customer_name") or "",
-            "include_on_daily_report": bool(payment.get("include_on_daily_report")),
+            "include_on_daily_report": bool(
+                payment.get("include_on_daily_report")
+                if payment.get("daily_report_inclusion_set")
+                else True
+            ),
         }
         for payment in payments
         if payment.get("other_balance_payment") and payment.get("express")
@@ -7312,7 +7324,11 @@ async def get_express_payments(payment_date: str, user=Depends(get_current_user)
             "receiving_on": payment.get("receiving_on") or "", "reference": payment.get("reference") or "",
             "notes": payment.get("notes") or "", "invoice_number": "Advance payment",
             "customer_name": payment.get("customer_name") or "",
-            "include_on_daily_report": bool(payment.get("include_on_daily_report")),
+            "include_on_daily_report": bool(
+                payment.get("include_on_daily_report")
+                if payment.get("daily_report_inclusion_set")
+                else True
+            ),
         }
         for payment in payments
         if payment.get("advance_payment") and payment.get("express")
@@ -7350,7 +7366,7 @@ async def get_express_payments(payment_date: str, user=Depends(get_current_user)
             "include_on_daily_report": bool(
                 payment.get("include_on_daily_report")
                 if payment.get("daily_report_inclusion_set")
-                else payment.get("include_on_daily_report") or invoice_by_id[payment["invoice_id"]].get("include_on_daily_report")
+                else True
             ),
         }
         for payment in payments
@@ -12979,6 +12995,104 @@ def _interface_settings_company_id(requested_company_id, user):
     return company_id
 
 
+class PrintTemplateUpdate(BaseModel):
+    name: str = Field(default="Default invoice", min_length=1, max_length=80)
+    logo_data_url: str = Field(default="", max_length=350_000)
+    font_family: Literal["Arial", "Helvetica", "Georgia", "Times New Roman"] = "Arial"
+    font_size: int = Field(default=14, ge=10, le=18)
+    primary_color: str = "#1e293b"
+    margin_mm: int = Field(default=6, ge=4, le=25)
+    spacing: float = Field(default=1, ge=0.8, le=1.6)
+    header_text: str = Field(default="", max_length=200)
+    footer_text: str = Field(default="", max_length=300)
+    signature_text: str = Field(default="", max_length=100)
+    show_company_details: bool = True
+    alignment: Literal["left", "center", "right"] = "left"
+    columns: List[Literal["category", "size", "quantity", "unit_price", "total"]] = Field(default_factory=list)
+    print_trigger: Literal["manual", "on_issue"] = "manual"
+
+    @field_validator("primary_color")
+    @classmethod
+    def validate_print_template_color(cls, value):
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            raise ValueError("Use a six-digit hexadecimal color")
+        return value
+
+    @field_validator("logo_data_url")
+    @classmethod
+    def validate_print_template_logo(cls, value):
+        if value and not re.fullmatch(r"data:image/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}", value):
+            raise ValueError("Logo must be a base64 PNG, JPEG, or WebP image")
+        return value
+
+    @field_validator("columns")
+    @classmethod
+    def validate_print_template_columns(cls, value):
+        if value and ("category" not in value or "total" not in value):
+            raise ValueError("Invoice columns must include Category and Total")
+        if len(set(value)) != len(value):
+            raise ValueError("Invoice columns must not contain duplicates")
+        return value
+
+
+def default_print_template(company_id):
+    return {
+        "company_id": company_id,
+        "is_configured": False,
+        "name": "Default invoice",
+        "logo_data_url": "",
+        "font_family": "Arial",
+        "font_size": 14,
+        "primary_color": "#1e293b",
+        "margin_mm": 6,
+        "spacing": 1,
+        "header_text": "",
+        "footer_text": "",
+        "signature_text": "",
+        "show_company_details": True,
+        "alignment": "left",
+        "columns": [],
+        "print_trigger": "manual",
+    }
+
+
+@api.get("/print-templates")
+async def get_print_template(
+    user=Depends(get_current_user), company_id: Optional[str] = None,
+):
+    company_id = _interface_settings_company_id(company_id, user)
+    saved = await base_db.print_templates.find_one({"id": company_id}, {"_id": 0})
+    approved_fields = default_print_template(company_id)
+    if saved:
+        approved_fields.update({key: value for key, value in saved.items() if key in approved_fields})
+        approved_fields["is_configured"] = True
+    return approved_fields
+
+
+@api.put("/print-templates")
+async def update_print_template(
+    body: PrintTemplateUpdate, user=Depends(get_current_user),
+    company_id: Optional[str] = None,
+):
+    require_global_owner(user)
+    company_id = _interface_settings_company_id(company_id, user)
+    template = body.model_dump()
+    before = await base_db.print_templates.find_one({"id": company_id}, {"_id": 0})
+    saved = {
+        "id": company_id,
+        **template,
+        "company_id": company_id,
+        "updated_at": now_iso(),
+        "updated_by": user.get("email", ""),
+    }
+    await base_db.print_templates.update_one({"id": company_id}, {"$set": saved}, upsert=True)
+    await log_audit(
+        "print_templates", company_id, "updated", user,
+        before=before or default_print_template(company_id), after=template,
+    )
+    return {**template, "company_id": company_id, "is_configured": True}
+
+
 @api.get("/settings")
 async def get_settings(user=Depends(get_current_user)):
     s = await db.settings.find_one({"id": "singleton"}, {"_id": 0})
@@ -16336,17 +16450,20 @@ async def get_daily_report(report_date: Optional[str] = None, user=Depends(get_c
         if payment.get("advance_allocation"):
             continue
         invoice = invoice_by_id.get(payment.get("invoice_id"), {})
-        if (
+        is_express_payment = (
             invoice.get("invoice_type") == "express"
-            or (
-                payment.get("other_balance_payment") or payment.get("advance_payment")
-            ) and payment.get("express")
-        ):
+            or payment.get("express") is True
+            and (payment.get("other_balance_payment") or payment.get("advance_payment"))
+        )
+        if is_express_payment:
             if payment.get("daily_report_inclusion_set"):
                 if not payment.get("include_on_daily_report"):
                     continue
-            elif not invoice.get("include_on_daily_report") and not payment.get("include_on_daily_report"):
+        elif payment.get("daily_report_inclusion_set"):
+            if not payment.get("include_on_daily_report"):
                 continue
+        elif not payment.get("include_on_daily_report"):
+            continue
         note_parts = []
         for value in (
             payment.get("notes"),

@@ -437,7 +437,7 @@ export default function Layout() {
                 <h2 className="font-bold text-slate-900">Notifications</h2>
                 <div className="flex items-center gap-3">
                   {user?.is_primary_owner && user?.is_owner && !user?.is_worker && <button type="button" onClick={dismissAllNotifications} disabled={dismissingAllNotifications || notifications.length === 0} className="text-xs font-semibold text-red-600 hover:text-red-800 disabled:opacity-50" data-testid="dismiss-all-notifications-btn">{dismissingAllNotifications ? "Dismissing…" : "Dismiss all"}</button>}
-                  <button type="button" onClick={() => setNotificationsOpen(false)} className="text-xs font-semibold text-slate-500 hover:text-slate-900">Close</button>
+                  <button type="button" onClick={() => setNotificationsOpen(false)} aria-label="Close notifications" title="Close" className="rounded-full p-2 text-slate-400 hover:bg-slate-100 hover:text-slate-700"><X size={18} /></button>
                 </div>
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">

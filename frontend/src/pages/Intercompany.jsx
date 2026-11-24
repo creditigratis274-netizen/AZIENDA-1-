@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Building2, CircleAlert, ClipboardCheck, Download, LoaderCircle, Plus, RefreshCw, Send } from "lucide-react";
+import { Building2, CircleAlert, ClipboardCheck, Download, LoaderCircle, Plus, RefreshCw, Send, X } from "lucide-react";
 import { api, apiError } from "@/lib/api";
 import { companyProfileName } from "@/lib/company";
 import { InvoiceDocument } from "@/components/InvoiceDocument";
@@ -612,7 +612,7 @@ export default function Intercompany() {
         <div className="max-h-[90vh] w-full max-w-5xl overflow-auto rounded-xl bg-white p-5 shadow-xl">
           <div className="flex items-start justify-between gap-3">
             <div><h2 id="intercompany-detail-title" className="text-lg font-bold">{selectedRequest.invoice_details ? `Intercompany invoice ${selectedRequest.invoice_details.invoice.number || ""}` : "Request details"}</h2><p className="mt-1 text-sm text-slate-500">{selectedRequest.source === "direct" ? `${companyName(selectedRequest.supplying_company_id)} → ${companyName(selectedRequest.requesting_company_id)}` : `${companyName(selectedRequest.requesting_company_id)} → ${companyName(selectedRequest.supplying_company_id)}`}</p></div>
-            <button type="button" onClick={() => { setSelectedRequest(null); setGrvAssignments(null); }} className="rounded-md border px-3 py-1.5 text-sm">Close</button>
+            <button type="button" onClick={() => { setSelectedRequest(null); setGrvAssignments(null); }} aria-label="Close popup" title="Close" className="shrink-0 rounded-full p-2 text-slate-400 hover:bg-slate-100 hover:text-slate-700"><X size={20} /></button>
           </div>
           {!selectedRequest.invoice_details && <>
             <div className="mt-4 space-y-3">
@@ -719,8 +719,9 @@ export default function Intercompany() {
       </div>}
 
       {confirmInvoice && <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/50 p-4" role="dialog" aria-modal="true" aria-labelledby="intercompany-invoice-title">
-        <div className="w-full max-w-4xl rounded-xl bg-white p-6 shadow-xl">
-          <h2 id="intercompany-invoice-title" className="text-lg font-bold">{confirmInvoice.step === "create" ? "Create intercompany invoice?" : "Send intercompany invoice?"}</h2>
+        <div className="relative w-full max-w-4xl rounded-xl bg-white p-6 shadow-xl">
+          <button type="button" onClick={() => setConfirmInvoice(null)} aria-label="Close popup" title="Close" className="absolute right-4 top-4 rounded-full p-2 text-slate-400 hover:bg-slate-100 hover:text-slate-700"><X size={20} /></button>
+          <h2 id="intercompany-invoice-title" className="pr-10 text-lg font-bold">{confirmInvoice.step === "create" ? "Create intercompany invoice?" : "Send intercompany invoice?"}</h2>
           <p className="mt-2 text-sm text-slate-600">{confirmInvoice.step === "create"
             ? `The invoice will use the supplier's saved price list and its customer record for your company.`
             : `The created invoice will be released to ${companyName(confirmInvoice.request.requesting_company_id)}. Once sent, the requesting company can view its details.`}</p>
