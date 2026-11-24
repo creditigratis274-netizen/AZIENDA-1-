@@ -183,6 +183,109 @@ export default function Stock() {
     const quantity = matches.reduce((total, item) => total + Number(item.current || 0), 0);
     return quantity.toLocaleString(undefined, { maximumFractionDigits: 2 });
   };
+  const downloadPcsMadeTodayReport = async () => {
+    try {
+      const sheet = dailyCountSheet || await api.get("/stock/daily-reconciliation");
+      const { jsPDF } = await import("jspdf");
+      const pdf = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const madeRows = [...sheet.rows]
+        .filter((row) => Number(row.made_today || 0) > 0)
+        .sort((a, b) => compareStockProducts(a.product, b.product) || compareStockSizes(a.size, b.size));
+      const pcsRows = [...sheet.rows]
+        .filter((row) => Number(row.pcs_out || 0) > 0)
+        .sort((a, b) => compareStockProducts(a.product, b.product) || compareStockSizes(a.size, b.size));
+
+      pdf.setFillColor(16, 38, 62);
+      pdf.rect(10, 9, pageWidth - 20, 23, "F");
+      pdf.setTextColor(255, 255, 255);
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(16);
+      pdf.text("SUPER IQ-FOAM", 15, 19);
+      pdf.setFontSize(12);
+      pdf.text("PCS MADE TODAY REPORT", pageWidth - 15, 19, { align: "right" });
+      pdf.setFontSize(9);
+      pdf.text(`Date: ${sheet.report_date}`, 15, 27);
+
+      const drawTable = (title, rows, y) => {
+        pdf.setTextColor(15, 23, 42);
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(10);
+        pdf.text(title, 10, y);
+        const startY = y + 4;
+        const widths = [95, 95, 87];
+        const headers = ["Category", "Size", "Quantity"];
+        let x = 10;
+        pdf.setFillColor(226, 232, 240);
+        pdf.setDrawColor(148, 163, 184);
+        pdf.setTextColor(15, 23, 42);
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(8);
+        headers.forEach((header, index) => {
+          pdf.rect(x, startY, widths[index], 8, "FD");
+          pdf.text(header, x + widths[index] / 2, startY + 5.5, { align: "center" });
+          x += widths[index];
+        });
+        let rowY = startY + 8;
+        let total = 0;
+        if (!rows.length) {
+          x = 10;
+          pdf.setFillColor(255, 255, 255);
+          pdf.setTextColor(100, 116, 139);
+          pdf.setFont("helvetica", "normal");
+          headers.forEach((_, index) => {
+            pdf.rect(x, rowY, widths[index], 8, "FD");
+            x += widths[index];
+          });
+          pdf.text("No entries", 10 + widths[0] + widths[1] / 2, rowY + 5.5, { align: "center" });
+          rowY += 8;
+        }
+        rows.forEach((row) => {
+          const quantity = title === "Pieces Made Today"
+            ? Number(row.made_today_input !== undefined && row.made_today_input !== ""
+              ? row.made_today_input
+              : row.made_today || 0)
+            : Number(row.pcs_out || 0);
+          total += quantity;
+          x = 10;
+          [row.product, row.size, String(quantity)].forEach((value, index) => {
+            pdf.rect(x, rowY, widths[index], 8, "FD");
+            pdf.setTextColor(15, 23, 42);
+            pdf.setFont("helvetica", index === 2 ? "bold" : "normal");
+            pdf.text(String(value), x + (index === 2 ? widths[index] - 4 : widths[index] / 2), rowY + 5.5, { align: index === 2 ? "right" : "center" });
+            x += widths[index];
+          });
+          rowY += 8;
+        });
+        x = 10;
+        pdf.setFillColor(16, 38, 62);
+        pdf.setTextColor(255, 255, 255);
+        pdf.setFont("helvetica", "bold");
+        pdf.rect(x, rowY, widths[0] + widths[1], 8, "F");
+        pdf.text("TOTAL", x + 3, rowY + 5.5);
+        pdf.rect(x + widths[0] + widths[1], rowY, widths[2], 8, "F");
+        pdf.text(String(total), x + widths[0] + widths[1] + widths[2] - 3, rowY + 5.5, { align: "right" });
+        return { total, endY: rowY + 8 };
+      };
+
+      const made = drawTable("Pieces Made Today", madeRows, 42);
+      const pcs = drawTable("PCS Out", pcsRows, made.endY + 18);
+      const grandY = pcs.endY + 12;
+      pdf.setFillColor(31, 78, 121);
+      pdf.rect(10, grandY, pageWidth - 20, 10, "F");
+      pdf.setTextColor(255, 255, 255);
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(11);
+      pdf.text("GRAND TOTAL", 15, grandY + 7);
+      pdf.text(String(made.total + pcs.total), pageWidth - 15, grandY + 7, { align: "right" });
+
+      pdf.save(`pcs-made-today-${sheet.report_date}.pdf`);
+      toast.success("PCS Made Today report downloaded");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not download PCS Made Today report");
+    }
+  };
+
   const downloadRangeReport = async ({ blank = false } = {}) => {
     if (downloadingRangeReport) return;
     setDownloadingRangeReport(true);
@@ -508,6 +611,15 @@ export default function Stock() {
               <Download size={16} /> Reports <ChevronDown size={15} />
             </summary>
             <div className="absolute right-0 z-30 mt-2 flex min-w-64 flex-col gap-2 rounded-lg border border-border bg-white p-2 shadow-lg">
+          <Btn
+            type="button"
+            variant="outline"
+            className="justify-start"
+            onClick={downloadPcsMadeTodayReport}
+            data-testid="download-pcs-made-today"
+          >
+            <Download size={16} /> Download PCS Made Today
+          </Btn>
           <Btn
             type="button"
             variant="outline"
