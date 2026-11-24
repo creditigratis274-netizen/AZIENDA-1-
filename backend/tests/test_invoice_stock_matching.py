@@ -119,3 +119,20 @@ def test_invoice_stock_matches_text_names_and_sizes_case_insensitively(
         "size": stock_size,
         "quantity": server.D("1"),
     }]
+
+
+@pytest.mark.parametrize(
+    "company,expected",
+    [
+        ("imraan-plastics", False),
+        ("superiqfoam", True),
+        ("iqfoam-manufactoring", True),
+        ("iqfoam-whole-sallers", True),
+    ],
+)
+def test_invoice_stock_deduction_is_disabled_only_for_freeform_company(company, expected):
+    token = server.active_company_id.set(company)
+    try:
+        assert server.invoice_stock_deduction_enabled() is expected
+    finally:
+        server.active_company_id.reset(token)
