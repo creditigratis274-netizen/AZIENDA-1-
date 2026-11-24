@@ -222,6 +222,9 @@ export default function Stock() {
         pdf.setFont("helvetica", "bold");
         pdf.setFontSize(8);
         headers.forEach((header, index) => {
+          pdf.setFillColor(226, 232, 240);
+          pdf.setDrawColor(148, 163, 184);
+          pdf.setTextColor(15, 23, 42);
           pdf.rect(x, startY, widths[index], 8, "FD");
           pdf.text(header, x + widths[index] / 2, startY + 5.5, { align: "center" });
           x += widths[index];
@@ -249,6 +252,8 @@ export default function Stock() {
           total += quantity;
           x = 10;
           [row.product, row.size, String(quantity)].forEach((value, index) => {
+            pdf.setFillColor(255, 255, 255);
+            pdf.setDrawColor(203, 213, 225);
             pdf.rect(x, rowY, widths[index], 8, "FD");
             pdf.setTextColor(15, 23, 42);
             pdf.setFont("helvetica", index === 2 ? "bold" : "normal");
