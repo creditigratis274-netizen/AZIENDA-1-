@@ -134,5 +134,15 @@ def test_invoice_stock_deduction_is_disabled_only_for_freeform_company(company, 
     token = server.active_company_id.set(company)
     try:
         assert server.invoice_stock_deduction_enabled() is expected
+        assert server.invoice_stock_deduction_enabled(company) is expected
+    finally:
+        server.active_company_id.reset(token)
+
+
+def test_authenticated_company_overrides_stale_context_for_invoice_stock_rule():
+    token = server.active_company_id.set("superiqfoam")
+    try:
+        assert server.invoice_stock_deduction_enabled("imraan-plastics") is False
+        assert server.invoice_stock_deduction_enabled("iqfoam-whole-sallers") is True
     finally:
         server.active_company_id.reset(token)
