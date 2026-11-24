@@ -2,14 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { fmtMoney, fmtDate, fmtDateTime, STATUS_META, documentFilename, today } from "@/lib/format";
 import { Card, Btn, Input, Badge, PageHeader, Empty, Modal } from "@/components/common";
-import { Eye, FileText, Search, Plus, Pencil, Trash2, Download, RotateCcw, Archive, MessageCircle, Link2Off, RefreshCw, LoaderCircle } from "lucide-react";
+import { Eye, FileText, Search, Plus, Pencil, Trash2, Download, RotateCcw, Archive, MessageCircle, Link2Off, RefreshCw, LoaderCircle, Printer } from "lucide-react";
 import { toast } from "sonner";
 import { api, apiError } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { companyProfileName, usesFreeformInvoiceItems, usesPriceZones } from "@/lib/company";
 import { resolveWhatsAppPhone } from "@/lib/whatsappPhone.mjs";
 import { InvoiceDocument } from "@/components/InvoiceDocument";
-import { elementToPdf } from "@/lib/pdf";
+import { elementToPdf, printElements } from "@/lib/pdf";
 
 const receivedInvoicesSeenKey = (companyId) => `received-invoices-seen:${companyId || "default"}`;
 const receivedInvoiceItems = (invoice) => (invoice?.items || [])
@@ -69,6 +69,12 @@ export default function InvoiceList({ express = false }) {
   const [whatsappDraft, setWhatsappDraft] = useState(null);
   const [pdfDownload, setPdfDownload] = useState(null);
   const [pdfBusyId, setPdfBusyId] = useState("");
+  const [printSel, setPrintSel] = useState([]);
+  const [printPreviewOpen, setPrintPreviewOpen] = useState(false);
+  const [printPreviewLoading, setPrintPreviewLoading] = useState(false);
+  const [printPreview, setPrintPreview] = useState([]);
+  const [printPreviewFailures, setPrintPreviewFailures] = useState([]);
+  const [batchPrintResult, setBatchPrintResult] = useState(null);
   const detailRequest = useRef(0);
   const pdfDocumentRef = useRef(null);
   const receivedInvoiceDocumentRef = useRef(null);
@@ -76,6 +82,7 @@ export default function InvoiceList({ express = false }) {
   const receivedInvoicesCompanyRef = useRef(user?.company_id);
   const pdfBusyRef = useRef(false);
   const pdfDownloadStartedRef = useRef("");
+  const batchPrintRefs = useRef(new Map());
   const listPath = express ? "/express-invoices" : "/invoices";
 
   useEffect(() => {
@@ -337,7 +344,17 @@ export default function InvoiceList({ express = false }) {
     setViewInvoice(null);
     setViewCustomer(null);
     detailRequest.current += 1;
+    setPrintSel([]);
+    setPrintPreviewOpen(false);
+    setPrintPreview([]);
+    setPrintPreviewFailures([]);
+    setBatchPrintResult(null);
+    batchPrintRefs.current.clear();
   }, [user?.company_id]);
+
+  useEffect(() => {
+    setPrintSel([]);
+  }, [page, debouncedQ, status, zone, invoiceDate, showArchived, express, user?.company_id]);
 
   const load = () => setReload((current) => current + 1);
 
@@ -418,6 +435,109 @@ export default function InvoiceList({ express = false }) {
   }, [pdfDownload]);
 
   const toggle = (id) => setSel((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
+
+  const togglePrintSelection = (id) => setPrintSel((selected) => (
+    selected.includes(id) ? selected.filter((item) => item !== id) : [...selected, id]
+  ));
+
+  const prepareBatchPrint = async () => {
+    if (!printSel.length || printPreviewLoading) return;
+    setPrintPreviewLoading(true);
+    setPrintPreview([]);
+    setPrintPreviewFailures([]);
+    setBatchPrintResult(null);
+    batchPrintRefs.current.clear();
+
+    try {
+      const [settings, printTemplate] = await Promise.all([
+        api.get("/settings"),
+        api.getUncached("/print-templates"),
+      ]);
+
+      const results = await Promise.all(printSel.map(async (invoiceId) => {
+        try {
+          const invoice = await api.get(`/invoices/${invoiceId}`);
+          let customer = {
+            phone: invoice.customer_phone || "",
+            city: invoice.customer_city || "",
+            address: invoice.customer_address || "",
+          };
+
+          if (invoice.customer_id && !invoice.customer_deleted) {
+            customer = {
+              ...customer,
+              ...await api.getUncached(`/customers/${invoice.customer_id}`),
+            };
+          }
+
+          return { invoice, customer, settings, printTemplate };
+        } catch (error) {
+          return { failure: { id: invoiceId, error: apiError(error) } };
+        }
+      }));
+
+      const documents = results.filter((result) => !result.failure);
+      const failures = results
+        .filter((result) => result.failure)
+        .map((result) => result.failure);
+
+      setPrintPreview(documents);
+      setPrintPreviewFailures(failures);
+      setBatchPrintResult({ printed: 0, failed: failures.length });
+      setPrintPreviewOpen(true);
+    } catch (error) {
+      toast.error(`Could not prepare invoice batch: ${apiError(error)}`);
+    } finally {
+      setPrintPreviewLoading(false);
+    }
+  };
+
+  const printSelectedInvoices = () => {
+    if (!printPreview.length) return;
+
+    if (!window.confirm(
+      `Print ${printPreview.length} invoice(s)? Check the preview to avoid accidental duplicate printing.`
+    )) return;
+
+    const elements = printPreview.map((_, index) => batchPrintRefs.current.get(index));
+    const renderFailures = printPreview.flatMap((document, index) => elements[index] ? [] : [{
+      id: document.invoice.id,
+      error: "The invoice preview could not be rendered.",
+    }]);
+
+    const printableElements = elements.filter(Boolean);
+    const previousPreparationFailures = printPreviewFailures.filter(
+      (failure) => !failure.error.includes("browser blocked the print window"),
+    );
+
+    if (
+      !printableElements.length
+      || !printElements(printableElements, `Invoice batch (${printableElements.length})`)
+    ) {
+      const errors = printPreview.map((document) => ({
+        id: document.invoice.id,
+        error: "The browser blocked the print window. Allow pop-ups and try again.",
+      }));
+
+      setPrintPreviewFailures([...previousPreparationFailures, ...errors]);
+      setBatchPrintResult({
+        printed: 0,
+        failed: previousPreparationFailures.length + errors.length,
+      });
+      return;
+    }
+
+    const printed = printableElements.length;
+    setPrintPreviewFailures([...previousPreparationFailures, ...renderFailures]);
+    setBatchPrintResult({
+      printed,
+      failed: previousPreparationFailures.length + renderFailures.length,
+    });
+
+    toast.success(
+      `${printed} invoice(s) sent to the print dialog; ${previousPreparationFailures.length + renderFailures.length} failed to prepare.`
+    );
+  };
   const removeMany = async (ids) => {
     if (!window.confirm(`Delete ${ids.length} invoice(s)?`)) return;
     const restoreStock = window.confirm("Also re-add the invoiced quantities to stock? Choose Cancel to archive without changing stock.");
@@ -662,15 +782,46 @@ export default function InvoiceList({ express = false }) {
         </Btn>
       </div>}
 
+      <p className="mb-3 text-sm text-slate-600" data-testid="batch-print-instructions">
+        To print multiple invoices together, select the checkboxes in the first column, then click <strong>Print Selected</strong>.
+      </p>
+
+      {printSel.length > 0 && <div className="mb-3 flex items-center justify-between rounded-xl border border-blue-200 bg-blue-50 px-4 py-2" data-testid="batch-print-bar">
+        <span className="text-sm font-semibold text-blue-900">{printSel.length} invoice(s) selected for printing</span>
+        <Btn onClick={prepareBatchPrint} disabled={printPreviewLoading} data-testid="print-selected-invoices">
+          <Printer size={15} /> {printPreviewLoading ? "Preparing preview..." : "Print Selected"}
+        </Btn>
+      </div>}
+
       <Card className="overflow-hidden">
         {loading ? <p className="p-6 text-sm text-slate-400" role="status">Loading invoices...</p> : list.length === 0 ? <Empty icon={FileText} title="No invoices found" hint="Create your first invoice to get started." /> : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead><tr className="text-left text-xs text-slate-400 bg-slate-50 border-b border-border">
+                <th className="px-3 py-3 w-8" title="Select for printing">
+                  <input
+                    type="checkbox"
+                    checked={list.length > 0 && list.every((item) => printSel.includes(item.id))}
+                    onChange={(event) => setPrintSel((current) => event.target.checked
+                      ? [...new Set([...current, ...list.map((item) => item.id)])]
+                      : current.filter((id) => !list.some((item) => item.id === id)))}
+                    aria-label="Select all invoices on this page for printing"
+                    data-testid="select-all-invoices-for-print"
+                  />
+                </th>
                 {canManageInvoices && <th className="px-3 py-3 w-8"><input type="checkbox" checked={sel.length > 0 && sel.length === list.filter((i) => showArchived ? i.archived : !i.archived && i.status === "draft").length} onChange={(e) => setSel(e.target.checked ? list.filter((i) => showArchived ? i.archived : !i.archived && i.status === "draft").map((i) => i.id) : [])} data-testid="select-all-invoices" /></th>}<th className="px-4 py-3 font-semibold">Invoice</th><th className="px-4 font-semibold">Customer</th><th className="px-4 font-semibold">Date</th><th className="px-4 font-semibold">Due</th>{priceZonesEnabled && <th className="px-4 font-semibold">Zone</th>}<th className="px-4 font-semibold text-right">Total</th><th className="px-4 font-semibold text-right">Paid</th><th className="px-4 font-semibold text-right">Balance</th><th className="px-4 font-semibold text-center">Status</th><th className="px-4 font-semibold text-right">Actions</th>
               </tr></thead>
               <tbody>{list.map((i) => (
                 <tr key={i.id} className="border-b border-border/60 hover:bg-slate-50 cursor-pointer" onClick={() => i.archived ? view(i.id) : nav(`${listPath}/${i.id}`)} data-testid={`invoice-row-${i.id}`}>
+                  <td className="px-3" onClick={(event) => event.stopPropagation()}>
+                    <input
+                      type="checkbox"
+                      checked={printSel.includes(i.id)}
+                      onChange={() => togglePrintSelection(i.id)}
+                      aria-label={`Select invoice ${i.number || "draft"} for printing`}
+                      data-testid={`select-invoice-for-print-${i.id}`}
+                    />
+                  </td>
                   {canManageInvoices && <td className="px-3" onClick={(e) => e.stopPropagation()}>{(showArchived ? i.archived : !i.archived && i.status === "draft") && <input type="checkbox" checked={sel.includes(i.id)} onChange={() => toggle(i.id)} data-testid={`select-invoice-${i.id}`} />}</td>}
                   <td className="px-4 py-3 font-mono font-semibold text-slate-700">{i.number || "DRAFT"}{i.archived && <span className="ml-2 inline-block rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-800 font-sans">Archived</span>}{i.opening_balance && <span className="ml-2 inline-block rounded-full border border-violet-200 bg-violet-50 px-2 py-0.5 text-[10px] font-semibold text-violet-700 font-sans" data-testid={`opening-badge-${i.id}`}>Opening Balance</span>}</td>
                   <td className="px-4 text-slate-600">{i.customer_name}{i.customer_deleted && <Badge cls="ml-2 border-red-200 bg-red-50 text-red-700">Deleted customer</Badge>}</td>
@@ -1021,6 +1172,75 @@ export default function InvoiceList({ express = false }) {
             </> : <Btn variant="danger" onClick={() => permanentlyDelete(false)} data-testid="confirm-permanent-invoice-delete">
               Delete permanently
             </Btn>}
+          </div>
+        </div>
+      </Modal>
+      <Modal
+        open={printPreviewOpen}
+        onClose={() => setPrintPreviewOpen(false)}
+        title={`Print preview · ${printPreview.length} invoice(s)`}
+        wide
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-slate-600">
+            Review all documents before opening the browser print dialog. Cancel here to leave every invoice unchanged.
+          </p>
+
+          {batchPrintResult && <p className="rounded-md border border-blue-200 bg-blue-50 p-3 text-sm font-semibold text-blue-900" role="status" data-testid="batch-print-result">
+            Sent to print dialog: {batchPrintResult.printed} · Failed: {batchPrintResult.failed}
+          </p>}
+
+          {printPreviewFailures.length > 0 && <div className="rounded-md border border-amber-200 bg-amber-50 p-3" data-testid="batch-print-failures">
+            <p className="text-sm font-semibold text-amber-900">
+              {printPreviewFailures.length} invoice(s) could not be prepared:
+            </p>
+            <ul className="mt-1 list-inside list-disc text-sm text-amber-900">
+              {printPreviewFailures.map((failure, index) => (
+                <li key={`${failure.id}-${index}`}>{failure.id}: {failure.error}</li>
+              ))}
+            </ul>
+          </div>}
+
+          <div className="max-h-[65vh] space-y-5 overflow-auto rounded-lg bg-slate-100 p-3">
+            {printPreview.map((document, index) => (
+              <section
+                key={document.invoice.id}
+                className="overflow-x-auto border border-slate-200 bg-white shadow-sm"
+                data-testid={`batch-print-preview-${document.invoice.id}`}
+              >
+                <p className="sticky left-0 z-10 bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-700">
+                  {document.invoice.number || "DRAFT"} · {document.invoice.customer_name || "Customer"}
+                </p>
+                <InvoiceDocument
+                  ref={(element) => {
+                    if (element) batchPrintRefs.current.set(index, element);
+                    else batchPrintRefs.current.delete(index);
+                  }}
+                  inv={document.invoice}
+                  totals={{
+                    subtotal: Number(document.invoice.subtotal) || 0,
+                    tax: Number(document.invoice.tax_amount) || 0,
+                    total: Number(document.invoice.total) || 0,
+                    outstanding: Number(document.invoice.outstanding) || 0,
+                  }}
+                  customer={document.customer}
+                  settings={document.settings}
+                  previousInvoices={document.invoice.previous_invoices_pending || []}
+                  customerBalanceBeforeInvoice={Number(document.invoice.customer_balance_before_invoice) || 0}
+                  showCustomerBalance={document.invoice.include_previous_balance !== false
+                    && document.invoice.customer_balance_before_invoice != null}
+                  printTemplate={document.printTemplate}
+                />
+              </section>
+            ))}
+            {!printPreview.length && <p className="p-5 text-sm text-slate-500">No invoice previews are available.</p>}
+          </div>
+
+          <div className="flex flex-wrap justify-end gap-2">
+            <Btn variant="outline" onClick={() => setPrintPreviewOpen(false)}>Close</Btn>
+            <Btn onClick={printSelectedInvoices} disabled={!printPreview.length} data-testid="confirm-print-selected">
+              <Printer size={15} /> Print Selected
+            </Btn>
           </div>
         </div>
       </Modal>
