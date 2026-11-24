@@ -146,3 +146,15 @@ def test_authenticated_company_overrides_stale_context_for_invoice_stock_rule():
         assert server.invoice_stock_deduction_enabled("iqfoam-whole-sallers") is True
     finally:
         server.active_company_id.reset(token)
+
+def test_invoice_stock_deduction_is_disabled_for_authenticated_imraan_profile_even_if_context_differs():
+    token = server.active_company_id.set("superiqfoam")
+    try:
+        user = {"profile_id": "imraan-plastics", "_active_company_id": "superiqfoam"}
+        assert server.invoice_stock_deduction_enabled("superiqfoam", user) is False
+        assert server.invoice_stock_deduction_enabled("imraan-plastics", user) is False
+        assert server.invoice_stock_deduction_enabled(
+            "iqfoam-whole-sallers", {"profile_id": "iqfoam-whole-sallers"}
+        ) is True
+    finally:
+        server.active_company_id.reset(token)
