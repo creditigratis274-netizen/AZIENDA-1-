@@ -6553,7 +6553,7 @@ async def create_invoice(body: InvoiceIn, user=Depends(get_current_user)):
             await link_invoice_orders(existing_submission)
             return invoice_for_user(existing_submission, user)
 
-    deduct_stock = body.deduct_stock
+    deduct_stock = body.deduct_stock and invoice_stock_deduction_enabled()
     inv = await _prepare_invoice(body, user=user)
     if body.idempotency_key:
         inv["idempotency_key"] = body.idempotency_key
@@ -6664,6 +6664,7 @@ async def update_invoice(iid: str, body: InvoiceIn, user=Depends(get_current_use
             inv.get("customer_id"),
             iid,
         )
+    deduct_stock = body.deduct_stock and invoice_stock_deduction_enabled()
     inv.pop("edit_reason", None)
     inv["amount_paid"] = existing.get("amount_paid", 0)
     compute_invoice(inv)
@@ -6701,7 +6702,7 @@ async def update_invoice(iid: str, body: InvoiceIn, user=Depends(get_current_use
         inv["audit"].append({"action": "edited", "at": now_iso(), "by": user["email"], "reason": reason, "changes": changes})
     if existing.get("stock_deducted"):
         inv["stock_deducted"] = True
-    if not body.deduct_stock:
+    if not deduct_stock:
         rec = await update_doc("invoices", iid, inv)
     else:
         stock_changes = await invoice_stock_changes({**inv, "id": iid})
@@ -6815,7 +6816,8 @@ async def issue_invoice(iid: str, body: InvoiceIssueIn = InvoiceIssueIn(), user=
     if inv.get("status") == "void":
         raise HTTPException(400, "Cannot issue a voided invoice")
     await validate_for_issue(inv)
-    if body.deduct_stock and inv.get("stock_deducted"):
+    deduct_stock = body.deduct_stock and invoice_stock_deduction_enabled()
+    if deduct_stock and inv.get("stock_deducted"):
         raise HTTPException(409, "Stock has already been deducted for this invoice")
     upd = {"items": inv["items"]}
     if not inv.get("number"):
@@ -6835,7 +6837,7 @@ async def issue_invoice(iid: str, body: InvoiceIssueIn = InvoiceIssueIn(), user=
     audit = inv.get("audit", [])
     audit.append({"action": "issued", "at": now_iso(), "by": user["email"]})
     upd["audit"] = audit
-    if not body.deduct_stock:
+    if not deduct_stock:
         rec = await update_doc("invoices", iid, upd)
     else:
         deductions = await invoice_stock_deductions(inv)
@@ -8311,6 +8313,11 @@ async def invoice_return_batch_allocations(invoice_id, stock_id, quantity):
             "source_type": "unallocated_invoice_return",
         })
     return result
+
+def invoice_stock_deduction_enabled():
+    # IMRAAN PLASTICS uses freeform invoice descriptions, not finished-stock SKUs.
+    return active_company_id.get() != "imraan-plastics"
+
 
 def invoice_stock_product(item):
     category = (item.get("category") or "").strip()
