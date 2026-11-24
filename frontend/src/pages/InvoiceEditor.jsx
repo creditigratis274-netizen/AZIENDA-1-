@@ -702,6 +702,7 @@ export default function InvoiceEditor({ express = false }) {
 
   const save = async (status, saveNewEntries = null, downloadAfterSave = false, deductStock = null, allowNegativeStock = false, resolvedCustomerId = null) => {
     if (!validate(status) || busy || saveLockRef.current) return;
+    if (freeformInvoiceItems) deductStock = false;
     if (status !== "draft" && deductStock === null) {
       setPendingStockSubmit({ action: "save", status, downloadAfterSave });
       return;
@@ -835,6 +836,7 @@ export default function InvoiceEditor({ express = false }) {
 
   const submitEdit = async (deductStock, reason, allowNegativeStock = false, targetStatus = inv.status === "draft" ? "draft" : "issued") => {
     if (busy || saveLockRef.current) return;
+    if (freeformInvoiceItems) deductStock = false;
     saveLockRef.current = true;
     setBusy(true);
     try {
@@ -866,10 +868,13 @@ export default function InvoiceEditor({ express = false }) {
     } finally { saveLockRef.current = false; setBusy(false); }
   };
 
-  const issueExisting = () => setPendingStockSubmit({ action: "issue" });
+  const issueExisting = () => freeformInvoiceItems
+    ? issueWithStock(false, "issue")
+    : setPendingStockSubmit({ action: "issue" });
 
   const issueWithStock = async (deductStock, action, allowNegativeStock = false) => {
     if (busy) return;
+    if (freeformInvoiceItems) deductStock = false;
     setBusy(true);
     try {
       const res = await api.post(`/invoices/${id}/issue`, {
