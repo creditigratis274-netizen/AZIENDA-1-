@@ -976,7 +976,7 @@ export default function InvoiceEditor({ express = false }) {
     if (isCod && inv.cod_amount_due != null && inv.cod_amount_due !== "") L.push(`Cash to collect: ${fmtMoney(Number(inv.cod_amount_due))}`);
     if (inv.destination) L.push(`Delivery To: ${inv.destination}`);
     if (inv.reference && !inv.opening_balance) L.push(`Reference: ${inv.reference}`);
-    if (!inv.opening_balance && previousInvoices.length > 0) {
+    if (showCustomerBalance && !inv.opening_balance && previousInvoices.length > 0) {
       L.push("");
       L.push("PREVIOUS INVOICES PENDING PAYMENTS:");
       previousInvoices.forEach((invoice) => {
@@ -1445,7 +1445,7 @@ export default function InvoiceEditor({ express = false }) {
             </FitPreview></Card>
           </div>
           {loadingPreviousInvoices && !id && inv.customer_id && <p className="no-print text-xs text-slate-500" role="status">Loading previous invoice balances...</p>}
-          {!id && !inv.opening_balance && previousInvoices.length > 0 && <div className="no-print rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950" data-testid="previous-invoices-pending-summary">
+          {showCustomerBalance && !id && !inv.opening_balance && previousInvoices.length > 0 && <div className="no-print rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950" data-testid="previous-invoices-pending-summary">
             <div className="flex flex-wrap items-center justify-between gap-2 font-bold">
               <span>PREVIOUS INVOICES PENDING PAYMENTS</span>
               <span>Total previous balance: {fmtMoney(previousInvoicesBalance)}</span>

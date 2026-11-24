@@ -77,7 +77,7 @@ export const InvoiceDocument = forwardRef(function InvoiceDocument({
             <div key={k} className="flex justify-between leading-5"><span className="font-semibold">{k}</span><span className="text-slate-800">{v}</span></div>))}
         </div>
       </div>
-      {!inv.opening_balance && previousInvoices.length > 0 && <div
+      {showCustomerBalance && !inv.opening_balance && previousInvoices.length > 0 && <div
         className="mt-3 rounded border border-amber-400 bg-amber-50 px-3 py-2 text-[12px] text-amber-950"
         style={{ breakInside: "avoid", pageBreakInside: "avoid" }}
         data-testid="doc-previous-invoices-pending"
