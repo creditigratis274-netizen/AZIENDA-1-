@@ -621,7 +621,7 @@ export default function Dashboard() {
       </div>
       <div className="dashboard-hero relative z-10 flex flex-wrap items-end justify-between gap-4">
         <div>
-        <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-primary">Admin · Operations</p>
+        <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-primary">Hello sir</p>
         <h1 className="mt-1 font-display text-4xl font-normal text-slate-900 sm:text-5xl">Business overview</h1>
         <p className="mt-1 font-display text-base italic text-slate-500">Performance, cash flow and daily operations</p>
         </div>
