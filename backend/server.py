@@ -6553,7 +6553,7 @@ async def create_invoice(body: InvoiceIn, user=Depends(get_current_user)):
             await link_invoice_orders(existing_submission)
             return invoice_for_user(existing_submission, user)
 
-    deduct_stock = body.deduct_stock and invoice_stock_deduction_enabled()
+    deduct_stock = body.deduct_stock and invoice_stock_deduction_enabled(user.get("_active_company_id"))
     inv = await _prepare_invoice(body, user=user)
     if body.idempotency_key:
         inv["idempotency_key"] = body.idempotency_key
@@ -6664,7 +6664,7 @@ async def update_invoice(iid: str, body: InvoiceIn, user=Depends(get_current_use
             inv.get("customer_id"),
             iid,
         )
-    deduct_stock = body.deduct_stock and invoice_stock_deduction_enabled()
+    deduct_stock = body.deduct_stock and invoice_stock_deduction_enabled(user.get("_active_company_id"))
     inv.pop("edit_reason", None)
     inv["amount_paid"] = existing.get("amount_paid", 0)
     compute_invoice(inv)
@@ -6816,7 +6816,7 @@ async def issue_invoice(iid: str, body: InvoiceIssueIn = InvoiceIssueIn(), user=
     if inv.get("status") == "void":
         raise HTTPException(400, "Cannot issue a voided invoice")
     await validate_for_issue(inv)
-    deduct_stock = body.deduct_stock and invoice_stock_deduction_enabled()
+    deduct_stock = body.deduct_stock and invoice_stock_deduction_enabled(user.get("_active_company_id"))
     if deduct_stock and inv.get("stock_deducted"):
         raise HTTPException(409, "Stock has already been deducted for this invoice")
     upd = {"items": inv["items"]}
@@ -8314,9 +8314,12 @@ async def invoice_return_batch_allocations(invoice_id, stock_id, quantity):
         })
     return result
 
-def invoice_stock_deduction_enabled():
-    # IMRAAN PLASTICS uses freeform invoice descriptions, not finished-stock SKUs.
-    return active_company_id.get() != "imraan-plastics"
+def invoice_stock_deduction_enabled(company_id=None):
+    # Use the authenticated company explicitly when available. IMRAAN PLASTICS
+    # uses freeform invoice descriptions, not finished-stock SKUs.
+    if company_id is None:
+        company_id = active_company_id.get()
+    return company_id != IMRAAN_PLASTICS_COMPANY_ID
 
 
 def invoice_stock_product(item):
