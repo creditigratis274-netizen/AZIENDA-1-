@@ -16242,6 +16242,14 @@ async def get_expenses(include_voided: bool = False, include_archived: bool = Fa
         flt["archived"] = {"$ne": True}
     return await listall("expenses", flt, sort=("date", -1))
 
+def daily_report_payment_included(payment):
+    return bool(
+        payment.get("include_on_daily_report")
+        if payment.get("daily_report_inclusion_set")
+        else True
+    )
+
+
 def report_date_filter(selected_date):
     selected = date.fromisoformat(selected_date)
     dates = [(selected + timedelta(days=offset)).isoformat() for offset in (-1, 0, 1)]
@@ -16464,19 +16472,7 @@ async def get_daily_report(report_date: Optional[str] = None, user=Depends(get_c
         if payment.get("advance_allocation"):
             continue
         invoice = invoice_by_id.get(payment.get("invoice_id"), {})
-        is_express_payment = (
-            invoice.get("invoice_type") == "express"
-            or payment.get("express") is True
-            and (payment.get("other_balance_payment") or payment.get("advance_payment"))
-        )
-        if is_express_payment:
-            if payment.get("daily_report_inclusion_set"):
-                if not payment.get("include_on_daily_report"):
-                    continue
-        elif payment.get("daily_report_inclusion_set"):
-            if not payment.get("include_on_daily_report"):
-                continue
-        elif not payment.get("include_on_daily_report"):
+        if not daily_report_payment_included(payment):
             continue
         note_parts = []
         for value in (
