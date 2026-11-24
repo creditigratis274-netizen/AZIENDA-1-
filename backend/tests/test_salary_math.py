@@ -367,11 +367,33 @@ def test_five_weekdays_earn_five_sixths_of_fixed_weekly_salary(monkeypatch):
 
 
 def test_monthly_fixed_employees_are_recognized_by_name():
+    assert server.is_monthly_fixed_salary_employee({"name": "YASSINE"})
     assert server.is_monthly_fixed_salary_employee({"name": "MR. YASEEN"})
     assert server.is_monthly_fixed_salary_employee({"name": "Yassine Uncle"})
     assert server.is_monthly_fixed_salary_employee({"name": "AMEENA"})
     assert server.is_monthly_fixed_salary_employee({"name": "Amina"})
     assert not server.is_monthly_fixed_salary_employee({"name": "Yaseen"})
+
+
+def test_fixed_manager_and_housemaid_are_always_present_for_salary_only(monkeypatch):
+    records = {
+        "employees": [
+            {"id": "yassine", "name": "Yassine Uncle", "monthly_salary": 18000},
+            {"id": "ameena", "name": "AMEENA", "monthly_salary": 9000},
+        ],
+        "attendance": [],
+        "piece_production": [],
+        "salary_advances": [],
+        "salary_cuts": [],
+    }
+
+    async def fake_listall(collection, *_args, **_kwargs):
+        return records[collection]
+
+    monkeypatch.setattr(server, "listall", fake_listall)
+
+    report = asyncio.run(server.salary_report("2026-11-01", "2026-11-30", include_monthly_salaries=True))
+    assert all(result["present_days"] == 0 for result in report["employees"])
 
 
 def test_monthly_fixed_salary_is_paid_once_for_a_complete_month(monkeypatch):
@@ -467,6 +489,14 @@ def test_monthly_fixed_salary_can_be_explicitly_included_in_a_weekly_report(monk
 def test_salary_payroll_keys_are_unique_by_week_or_calendar_month():
     assert server.salary_payroll_key("weekly", "2026-11-02", "2026-11-07") == "weekly:2026-11-02"
     assert server.salary_payroll_key("monthly", "2026-11-01", "2026-11-30") == "monthly:2026-11"
+
+
+def test_monthly_fixed_employee_names_cannot_be_paid_in_two_weekly_periods():
+    employee = {"name": "Yassine Uncle", "monthly_salary": 18000}
+    assert server.is_monthly_fixed_salary_employee(employee)
+
+    ameena = {"name": "AMEENA", "monthly_salary": 9000}
+    assert server.is_monthly_fixed_salary_employee(ameena)
 
 
 def test_yaseen_uncle_november_salary_does_not_apply_an_automatic_balance_deduction(monkeypatch):
@@ -609,8 +639,8 @@ def test_missing_monthly_salary_is_not_replaced_by_a_weekly_default_and_unmatche
     report = asyncio.run(server.salary_report("2026-11-02", "2026-11-07", include_monthly_salaries=True))
 
     assert report["employees"][0]["pay_frequency"] == "monthly_fixed"
-    assert report["employees"][0]["gross_salary"] == 0
-    assert report["employees"][0]["salary_rate_missing"] is True
+    assert report["employees"][0]["gross_salary"] == 5300
+    assert report["employees"][0]["salary_rate_missing"] is False
     assert report["unmatched_attendance_records"] == [{
         "employee_id": "missing-employee",
         "employee_name": "Unmatched worker",

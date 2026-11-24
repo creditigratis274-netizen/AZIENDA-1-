@@ -4,10 +4,11 @@ import { Link } from "react-router-dom";
 import { toast } from "sonner";
 import { api, apiError } from "@/lib/api";
 import { today, TZ } from "@/lib/format";
-import { downloadDailyReportPdf } from "@/lib/dailyReportPdf";
+import { createDailyReportPdf, downloadDailyReportPdf } from "@/lib/dailyReportPdf";
 import { downloadFinancialReportPdf } from "@/lib/financialReportPdf";
 import { companyDailyReportName, companyProfileName } from "@/lib/company";
 import { useAuth } from "@/context/AuthContext";
+import { normalizeWhatsAppPhone } from "@/lib/whatsappPhone.mjs";
 import { Btn } from "@/components/common";
 
 function getNextFinancialRefreshDelay(now = new Date()) {
@@ -518,7 +519,11 @@ export default function DailyReport() {
   const [financialLoading, setFinancialLoading] = useState(false);
   const [error, setError] = useState("");
   const [downloading, setDownloading] = useState(false);
+  const [whatsappPhone, setWhatsappPhone] = useState(() => localStorage.getItem("daily-report-whatsapp-phone") || "+27 073 072 3286");
+  const [whatsappTemplate, setWhatsappTemplate] = useState("Hello, here is the Daily Report for {DATE}.\n{PDF_URL}");
+  const [whatsappTesting, setWhatsappTesting] = useState(false);
   const reportRequestId = useRef(0);
+
   const companyName = report?.company_name || companyDailyReportName(user?.company_id);
   const accessibleCompanies = Array.isArray(user?.company_ids) && user.company_ids.length
     ? user.company_ids
@@ -608,6 +613,38 @@ export default function DailyReport() {
     };
   }, [viewMode, financialValue, accountingMode, reportCompany]);
 
+  const sendViaWhatsApp = async () => {
+    if (!report) return toast.error("Generate the Daily Report first.");
+    const phone = normalizeWhatsAppPhone(whatsappPhone);
+    if (!phone) {
+      return toast.error("Enter a valid WhatsApp number with international prefix.");
+    }
+    setWhatsappTesting(true);
+    try {
+      const { blob, filename } = await createDailyReportPdf(report, report.main_invoice_no);
+      const pdfBase64 = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result).split(",", 2)[1]);
+        reader.onerror = () => reject(new Error("Could not read the generated PDF."));
+        reader.readAsDataURL(blob);
+      });
+      const template = whatsappTemplate.replace("{SECTION}", companyName);
+      const result = await api.post("/daily-report-whatsapp/prepare", {
+        report_date: reportDate,
+        pdf_base64: pdfBase64,
+        filename,
+        phone: `+${phone}`,
+        message_template: template,
+      });
+      window.open(result.wa_me_url, "_blank", "noopener,noreferrer");
+      toast.success("WhatsApp link prepared. Send manually from WhatsApp.");
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setWhatsappTesting(false);
+    }
+  };
+
   const downloadPdf = async () => {
     setDownloading(true);
     try {
@@ -681,6 +718,32 @@ export default function DailyReport() {
           {downloading ? <RefreshCw size={16} className="animate-spin" /> : <Download size={16} />}
           {downloading ? "Preparing PDF..." : "DOWNLOAD COMPANY PDF"}
         </Btn>}
+        {viewMode === "daily" && user?.is_owner && user?.company_id === "superiqfoam" && (
+          <div className="flex w-full flex-wrap items-end gap-3 border-t border-slate-200 pt-4">
+            <label className="min-w-[220px]">
+              <span className="mb-2 block text-sm font-bold text-slate-700">Recipient WhatsApp number</span>
+              <input
+                type="tel"
+                value={whatsappPhone}
+                onChange={(event) => {
+                  setWhatsappPhone(event.target.value);
+                  localStorage.setItem("daily-report-whatsapp-phone", event.target.value);
+                }}
+                placeholder="+39 39 322 014 09"
+                className="w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm"
+              />
+            </label>
+            <Btn
+              type="button"
+              variant="outline"
+              onClick={sendViaWhatsApp}
+              disabled={whatsappTesting}
+              className="h-11"
+            >
+              {whatsappTesting ? "Preparing WhatsApp..." : "Send via WhatsApp"}
+            </Btn>
+          </div>
+        )}
       </div>
       {viewMode !== "daily" && (
         <p role="status" className="text-lg font-bold text-red-600" data-testid="financial-report-refresh-info">

@@ -9,6 +9,7 @@ from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Respons
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 import json, re
+from urllib.parse import quote
 import shutil
 import calendar
 from starlette.middleware.cors import CORSMiddleware
@@ -87,6 +88,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 api = APIRouter(prefix="/api")
 backup_scheduler_task = None
 fleet_notification_scheduler_task = None
+daily_report_whatsapp_scheduler_task = None
 legacy_migration_task = None
 
 
@@ -1121,6 +1123,22 @@ class SupervisorPasswordIn(BaseModel):
 class SupervisorWriteAuthorizationIn(BaseModel):
     password: str
     action: Optional[str] = None
+
+class DailyReportWhatsAppPrepareIn(BaseModel):
+    report_date: str
+    pdf_base64: str = Field(min_length=1)
+    filename: str = Field(min_length=1, max_length=180)
+    phone: str
+    message_template: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("report_date")
+    @classmethod
+    def valid_report_date(cls, value):
+        try:
+            date.fromisoformat(value)
+        except ValueError:
+            raise ValueError("Report date must be a valid YYYY-MM-DD date")
+        return value
 
 class BackupRestoreIn(BaseModel):
     key: str = Field(min_length=12, max_length=50)
@@ -5066,6 +5084,7 @@ class CustomerIn(BaseModel):
 class CustomerInvoiceContactIn(BaseModel):
     phone: Optional[str] = Field(default=None, max_length=100)
     city: Optional[str] = Field(default=None, max_length=120)
+    client_number: Optional[str] = Field(default=None, max_length=100)
 
 @api.get("/customers")
 async def get_customers(
@@ -5191,8 +5210,8 @@ async def update_customer_invoice_contact(
     record = await update_doc("customers", cid, contact)
     await log_audit(
         "customer", cid, "invoice_contact_updated", user,
-        before={key: before.get(key, "") for key in ("phone", "city")},
-        after={key: record.get(key, "") for key in ("phone", "city")},
+        before={key: before.get(key, "") for key in ("phone", "city", "client_number")},
+        after={key: record.get(key, "") for key in ("phone", "city", "client_number")},
     )
     await emit_workflow_event("customer.updated", record)
     return record
@@ -9671,7 +9690,17 @@ def is_monthly_fixed_salary_employee(employee):
         "".join(character if character.isalnum() else " " for character in (employee.get("name") or "")).split()
     ).upper()
     tokens = set(normalized_name.split())
-    return normalized_name in {"AMEENA", "AMINA", "MR YASEEN", "MR YASSINE"} or (
+    return normalized_name in {"AMEENA", "AMINA", "YASSINE", "MR YASEEN", "MR YASSINE"} or (
+        "UNCLE" in tokens and bool(tokens & {"YASEEN", "YASSEN", "YASSINE", "YASIN"})
+    )
+
+
+def is_always_present_salary_employee(employee):
+    normalized_name = " ".join(
+        "".join(character if character.isalnum() else " " for character in (employee.get("name") or "")).split()
+    ).upper()
+    tokens = set(normalized_name.split())
+    return normalized_name in {"AMEENA", "AMINA", "YASSINE", "MR YASEEN", "MR YASSINE"} or (
         "UNCLE" in tokens and bool(tokens & {"YASEEN", "YASSEN", "YASSINE", "YASIN"})
     )
 
@@ -9880,8 +9909,16 @@ async def delete_employee(eid: str, user=Depends(get_current_user)):
         **employee, "deleted_at": deleted_at, "deleted_by": user.get("id"),
     })
     await db.employees.delete_one({"id": eid})
+
+    for collection_name in ("attendance", "piece_production", "salary_advances", "salary_cuts"):
+        await db[collection_name].delete_many({"employee_id": eid})
+
     await log_audit("employee", eid, "permanently_deleted", user,
-                    before=employee, after={"deleted_at": deleted_at})
+                    before=employee, after={
+                        "deleted_at": deleted_at,
+                        "removed_salary_related_records": True,
+                        "payment_history_retained": True,
+                    })
     return {"ok": True, "deleted": True}
 
 def validate_iso_date(value):
@@ -10168,7 +10205,12 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
         payroll_month_end = payroll_month_start.replace(
             day=calendar.monthrange(payroll_month_start.year, payroll_month_start.month)[1]
         )
-        monthly_salary = employee.get("monthly_salary") if is_monthly_fixed else None
+        monthly_salary = (
+            employee.get("monthly_salary")
+            if is_monthly_fixed and employee.get("monthly_salary") is not None
+            else r2(employee.get("weekly_salary")) if is_monthly_fixed and employee.get("weekly_salary") is not None
+            else None
+        )
         configured_hourly_rate = employee.get("hourly_rate")
         hourly_rate = float(configured_hourly_rate) if configured_hourly_rate else 0
         weekly_salary = employee.get("weekly_salary") if not is_piece_paid and not is_monthly_fixed else None
@@ -10201,6 +10243,8 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
             [record for record in attendance if record.get("employee_id") == employee["id"]],
             key=lambda record: record.get("date", ""),
         )
+        if is_always_present_salary_employee(employee) and is_monthly_fixed:
+            rows = []
         employee_piecework = calculate_piecework([
             record for record in piece_records if record.get("employee_id") == employee["id"]
         ], include_sunday=piecework_includes_sunday(employee.get("name", "")),
@@ -10857,6 +10901,54 @@ async def process_daily_vehicle_licence_alerts(today=None):
                     {"$set": dynamic_fields, "$setOnInsert": notification},
                     upsert=True,
                 )
+
+async def process_daily_report_whatsapp_schedule():
+    company_db = tenant_database(client, base_db, "superiqfoam")
+    settings = await company_db.settings.find_one({"id": "singleton"}, {"_id": 0}) or {}
+    if settings.get("daily_report_whatsapp_enabled") is not True:
+        return
+
+    time_match = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", str(settings.get("daily_report_whatsapp_send_time", "17:00")))
+    if not time_match:
+        return
+    now = local_now()
+    scheduled_hour = int(time_match.group(1))
+    scheduled_minute = int(time_match.group(2))
+    if now.hour != scheduled_hour or now.minute != scheduled_minute:
+        return
+
+    owner = await base_db.users.find_one({"email": canonical_email(os.environ["ADMIN_EMAIL"])}, {"_id": 0, "id": 1})
+    if not owner:
+        return
+    report_date = today_str()
+    event_key = f"daily-report-whatsapp-ready:{report_date}:{scheduled_hour:02d}:{scheduled_minute:02d}"
+    await base_db.notifications.update_one(
+        {"company_id": "superiqfoam", "event_key": event_key, "recipient_user_id": owner["id"]},
+        {"$set": {
+            "company_id": "superiqfoam",
+            "recipient_user_id": owner["id"],
+            "event_key": event_key,
+            "kind": "daily_report_whatsapp_ready",
+            "title": "Daily Report ready for WhatsApp",
+            "message": f"Prepare and open WhatsApp for the {report_date} Daily Report. No message is sent automatically.",
+            "action_path": "/daily-report",
+            "created_at": now_iso(),
+            "read": False,
+            "archived": False,
+            "permanently_dismissed": False,
+        }, "$setOnInsert": {"id": new_id()}},
+        upsert=True,
+    )
+
+
+async def scheduled_daily_report_whatsapp_loop():
+    while True:
+        try:
+            await process_daily_report_whatsapp_schedule()
+        except Exception:
+            logging.exception("Scheduled Daily Report WhatsApp preparation could not be processed")
+        await asyncio.sleep(30)
+
 
 async def scheduled_fleet_notification_loop():
     while True:
@@ -16054,6 +16146,114 @@ async def daily_report_records(collection_name, selected_date, conditions=None, 
     records = await cursor.to_list(None)
     return [record for record in records if record_local_date(record) == selected_date]
 
+def normalize_whatsapp_phone(value):
+    digits = re.sub(r"\D", "", str(value or ""))
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("0"):
+        digits = f"27{digits[1:]}"
+    if digits.startswith("270"):
+        digits = f"27{digits[3:]}"
+    return digits if 7 <= len(digits) <= 15 else ""
+
+
+def require_superiqfoam_whatsapp_owner(user):
+    company_id = user.get("_active_company_id") or user.get("company_id")
+    if company_id != "superiqfoam" or not (user.get("is_owner") or user.get("_active_role") == "owner"):
+        raise HTTPException(403, "WhatsApp Daily Report is available only to the SUPER IQ-FOAM owner")
+
+
+@api.post("/daily-report-whatsapp/prepare")
+async def prepare_daily_report_whatsapp(body: DailyReportWhatsAppPrepareIn, request: Request, user=Depends(get_current_user)):
+    require_superiqfoam_whatsapp_owner(user)
+    phone = normalize_whatsapp_phone(body.phone)
+    if not phone:
+        raise HTTPException(422, "WhatsApp number not configured or invalid")
+    try:
+        pdf = base64.b64decode(body.pdf_base64, validate=True)
+    except (ValueError, base64.binascii.Error) as error:
+        raise HTTPException(422, "The generated PDF is not valid") from error
+    if not pdf.startswith(b"%PDF-"):
+        raise HTTPException(422, "The generated file is not a PDF")
+
+    token = secrets.token_urlsafe(32)
+    record_id = new_id()
+    link = {
+        "id": record_id,
+        "report_date": body.report_date,
+        "filename": body.filename,
+        "phone": phone,
+        "message_template": body.message_template,
+        "pdf_base64": body.pdf_base64,
+        "token_hash": worker_access_token_hash(token),
+        "token_encrypted": encrypt_worker_access_token(token),
+        "created_at": now_iso(),
+        "status": "ready",
+    }
+    await db.daily_report_whatsapp_links.replace_one(
+        {"company_id": "superiqfoam", "report_date": body.report_date},
+        {"company_id": "superiqfoam", **link},
+        upsert=True,
+    )
+    await log_audit("daily_report", body.report_date, "whatsapp_link_prepared", user,
+                    after={"phone": phone, "filename": body.filename})
+
+    protocol = "https" if request.url.scheme == "https" else request.url.scheme
+    origin = str(request.base_url).rstrip("/")
+    pdf_url = f"{origin}/api/public/daily-reports/{token}"
+    message = body.message_template.replace("{DATE}", body.report_date).replace("{PDF_URL}", pdf_url)
+    return {
+        "pdf_url": pdf_url,
+        "wa_me_url": f"https://wa.me/{phone}?text={quote(message, safe='')}",
+        "status": "ready",
+    }
+
+
+@api.get("/public/daily-reports/{token}")
+async def get_public_daily_report_pdf(token: str, response: Response):
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Robots-Tag"] = "noindex, nofollow"
+    if not re.fullmatch(r"[A-Za-z0-9_-]{40,64}", token or ""):
+        raise HTTPException(404, "Daily report link not found")
+    token_hash = worker_access_token_hash(token)
+    for profile in COMPANY_PROFILES:
+        company_db = tenant_database(client, base_db, profile["id"])
+        link = await company_db.daily_report_whatsapp_links.find_one(
+            {"token_hash": token_hash}, {"_id": 0},
+        )
+        if not link:
+            continue
+        if profile["id"] != "superiqfoam":
+            raise HTTPException(404, "Daily report link not found")
+        try:
+            pdf = base64.b64decode(link["pdf_base64"], validate=True)
+        except (ValueError, base64.binascii.Error):
+            raise HTTPException(404, "Daily report PDF unavailable")
+        return StreamingResponse(
+            iter([pdf]),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"inline; filename={link['filename']}"},
+        )
+    raise HTTPException(404, "Daily report link not found")
+
+
+@api.get("/daily-report-whatsapp/status")
+async def get_daily_report_whatsapp_status(user=Depends(get_current_user)):
+    require_superiqfoam_whatsapp_owner(user)
+    settings = await db.settings.find_one({"id": "singleton"}, {"_id": 0}) or {}
+    records = await db.daily_report_whatsapp_links.find(
+        {"company_id": "superiqfoam"}, {"_id": 0, "pdf_base64": 0, "token_hash": 0, "token_encrypted": 0},
+    ).sort("report_date", -1).limit(30).to_list(30)
+    return {
+        "phone": settings.get("daily_report_whatsapp_phone", "+27 073 072 3286"),
+        "send_time": settings.get("daily_report_whatsapp_send_time", "17:00"),
+        "enabled": settings.get("daily_report_whatsapp_enabled", False),
+        "message_template": settings.get("daily_report_whatsapp_message_template", "Hello, here is the Daily Report for {DATE}.\n{PDF_URL}"),
+        "records": records,
+    }
+
+
 @api.get("/daily-report")
 async def get_daily_report(report_date: Optional[str] = None, user=Depends(get_current_user)):
     company_id = user.get("_active_company_id") or DEFAULT_COMPANY_ID
@@ -19613,7 +19813,7 @@ async def initialize_empty_company(company_id):
 
 @app.on_event("startup")
 async def on_startup():
-    global backup_scheduler_task, fleet_notification_scheduler_task, legacy_migration_task
+    global backup_scheduler_task, fleet_notification_scheduler_task, daily_report_whatsapp_scheduler_task, legacy_migration_task
     startup_company = active_company_id.set(DEFAULT_COMPANY_ID)
     try:
         await seed()
@@ -19634,6 +19834,9 @@ async def on_startup():
         logging.warning("Notification/intercompany indexes not fully created: %s", error)
     fleet_notification_scheduler_task = asyncio.create_task(
         scheduled_fleet_notification_loop()
+    )
+    daily_report_whatsapp_scheduler_task = asyncio.create_task(
+        scheduled_daily_report_whatsapp_loop()
     )
     status = backup_runtime_status()
     if status["configured"] and status["tools_available"]:
@@ -19801,6 +20004,12 @@ logging.basicConfig(level=logging.INFO)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
+    if daily_report_whatsapp_scheduler_task:
+        daily_report_whatsapp_scheduler_task.cancel()
+        try:
+            await daily_report_whatsapp_scheduler_task
+        except asyncio.CancelledError:
+            pass
     if fleet_notification_scheduler_task:
         fleet_notification_scheduler_task.cancel()
         try:

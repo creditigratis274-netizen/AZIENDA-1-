@@ -225,6 +225,49 @@ function drawSection(pdf, section, pageRows, x, y, width, height, pageIndex) {
   }
 }
 
+export async function createDailyReportPdf(report, mainInvoiceNo) {
+  if (!report) throw new Error("Daily report data is not available.");
+  const { jsPDF } = await import("jspdf");
+  const pdf = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
+  const sections = sectionRows(report, mainInvoiceNo);
+  const pageWidth = pdf.internal.pageSize.getWidth();
+  const margin = 9;
+  const gapX = 4;
+  const gapY = 4;
+  const sectionWidth = (pageWidth - margin * 2 - gapX) / 2;
+  const sectionHeight = 78.5;
+  const top = 36;
+  const sectionPages = sections.map((section) => paginateRows(pdf, section, sectionWidth));
+  const pageCount = Math.max(1, ...sectionPages.map((pages) => pages.length));
+
+  for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
+    if (pageIndex > 0) pdf.addPage("a4", "landscape");
+    pdf.setTextColor(...BRAND);
+    pdf.setFont("helvetica", "bold");
+    pdf.setFontSize(15);
+    pdf.text(report.company_name || "SUPER IQ-FOAM", pageWidth / 2, 10, { align: "center" });
+    pdf.setTextColor(38, 43, 48);
+    pdf.setFontSize(11);
+    pdf.text(pageIndex ? "DAILY REPORT (CONTINUED)" : "DAILY REPORT", pageWidth / 2, 17, { align: "center" });
+    pdf.setDrawColor(90, 96, 101);
+    pdf.line(margin, 25, pageWidth - margin, 25);
+    pdf.setFont("helvetica", "normal");
+    pdf.setFontSize(7);
+    pdf.text(`Date: ${report.date}`, margin, 31);
+    pdf.text(`Day: ${report.day || ""}`, pageWidth / 2, 31, { align: "center" });
+    pdf.text(`Company: ${report.company_name || "SUPER IQ-FOAM"}`, pageWidth - margin, 31, { align: "right" });
+
+    sections.forEach((section, index) => {
+      const x = margin + (index % 2) * (sectionWidth + gapX);
+      const y = top + Math.floor(index / 2) * (sectionHeight + gapY);
+      drawSection(pdf, section, sectionPages[index], x, y, sectionWidth, sectionHeight, pageIndex);
+    });
+  }
+
+  const companyFileName = (report.company_name || "SUPERIQFOAM").replace(/[^a-z0-9]+/gi, "_");
+  return { blob: pdf.output("blob"), filename: `${companyFileName}_Daily_Report_${report.date}.pdf` };
+}
+
 export async function downloadDailyReportPdf(report, mainInvoiceNo) {
   if (!report) throw new Error("Daily report data is not available.");
   const { jsPDF } = await import("jspdf");

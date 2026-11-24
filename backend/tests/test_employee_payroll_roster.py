@@ -89,6 +89,56 @@ def test_all_employees_use_the_six_day_45_hour_salary_schedule():
     assert all(employee["hours_per_week"] == 45 for employee in seed_data.EMPLOYEE_PAYROLL_ROSTER)
 
 
+def test_employee_delete_removes_live_salary_dependencies_but_keeps_payment_history(monkeypatch):
+    employee = {"id": "employee-123", "name": "Test Worker", "department": "Production", "active": True}
+    deleted = []
+    deleted_many = []
+
+    class Collection:
+        def __init__(self, name):
+            self.name = name
+
+        async def find_one(self, *_args, **_kwargs):
+            return employee if self.name == "employees" else None
+
+        async def insert_one(self, document):
+            deleted.append((self.name, document))
+
+        async def delete_one(self, *_args, **_kwargs):
+            return type("Result", (), {"deleted_count": 1})()
+
+        async def delete_many(self, query):
+            deleted_many.append((self.name, query))
+
+    class FakeDB:
+        def __init__(self):
+            self.collections = {
+                name: Collection(name)
+                for name in ("employees", "deleted_employees", "attendance", "piece_production", "salary_advances", "salary_cuts", "salary_payments")
+            }
+            self.employees = self.collections["employees"]
+            self.deleted_employees = self.collections["deleted_employees"]
+            self.attendance = self.collections["attendance"]
+            self.piece_production = self.collections["piece_production"]
+            self.salary_advances = self.collections["salary_advances"]
+            self.salary_cuts = self.collections["salary_cuts"]
+            self.salary_payments = self.collections["salary_payments"]
+
+        def __getitem__(self, name):
+            return self.collections[name]
+
+    fake_db = FakeDB()
+    monkeypatch.setattr(server, "db", fake_db)
+    monkeypatch.setattr(server, "require_owner", lambda _user: None)
+    monkeypatch.setattr(server, "log_audit", lambda *_args, **_kwargs: asyncio.sleep(0))
+
+    result = asyncio.run(server.delete_employee("employee-123", user={"id": "owner"}))
+
+    assert result == {"ok": True, "deleted": True}
+    assert {name for name, _ in deleted_many} == {"attendance", "piece_production", "salary_advances", "salary_cuts"}
+    assert not any(name == "salary_payments" for name, _ in deleted_many)
+
+
 def test_security_guard_has_fixed_1000_weekly_salary_for_45_hours():
     security = next(
         employee for employee in seed_data.EMPLOYEE_PAYROLL_ROSTER

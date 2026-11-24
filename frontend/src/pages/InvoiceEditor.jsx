@@ -729,6 +729,7 @@ export default function InvoiceEditor({ express = false }) {
         else if (inv.customer_name.trim()) {
           const createdCustomer = await api.post("/customers", {
             name: inv.customer_name.trim(),
+            client_number: inv.client_number || "",
             phone: inv.customer_phone || "",
             city: inv.customer_city || "",
             default_zone: inv.zone,
@@ -743,7 +744,9 @@ export default function InvoiceEditor({ express = false }) {
       const contactChanges = {};
       const phone = (inv.customer_phone || "").trim();
       const city = (inv.customer_city || "").trim();
+      const clientNumber = (inv.client_number || "").trim();
       if (phone && phone !== (savedCustomer?.phone || "")) contactChanges.phone = phone;
+      if (clientNumber && clientNumber !== (savedCustomer?.client_number || "")) contactChanges.client_number = clientNumber;
       if (city && city !== (savedCustomer?.city || "")) contactChanges.city = city;
       if (customerId && Object.keys(contactChanges).length) {
         const updatedCustomer = await api.put(`/customers/${customerId}/invoice-contact`, contactChanges);

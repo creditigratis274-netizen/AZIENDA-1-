@@ -33,6 +33,27 @@ const monthRange = (month) => {
   return { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) };
 };
 
+const monthSalaryWeeks = (month) => {
+  if (!/^\d{4}-\d{2}$/.test(String(month || ""))) return [];
+  const monthStart = new Date(month + "-01T00:00:00Z");
+  if (!Number.isFinite(monthStart.getTime())) return [];
+  const monthEnd = new Date(Date.UTC(monthStart.getUTCFullYear(), monthStart.getUTCMonth() + 1, 0));
+  const firstMonday = new Date(monthStart);
+  const offsetToMonday = (firstMonday.getUTCDay() + 6) % 7;
+  firstMonday.setUTCDate(firstMonday.getUTCDate() + ((7 - offsetToMonday) % 7));
+  const weeks = [];
+  for (let monday = new Date(firstMonday); monday <= monthEnd; monday.setUTCDate(monday.getUTCDate() + 7)) {
+    const saturday = new Date(monday);
+    saturday.setUTCDate(saturday.getUTCDate() + 5);
+    if (saturday > monthEnd) break;
+    weeks.push({
+      start: monday.toISOString().slice(0, 10),
+      end: saturday.toISOString().slice(0, 10),
+    });
+  }
+  return weeks;
+};
+
 const addDays = (value, days) => {
   const date = new Date(String(value || "") + "T00:00:00Z");
   date.setUTCDate(date.getUTCDate() + days);
@@ -74,7 +95,26 @@ const displayMonth = (value) =>
 
 const cents = moneyToCents;
 const monthlyEmployee = (employee) => employee?.pay_frequency === "monthly_fixed";
+const payrollConfigFromEmployee = (employee) => ({
+  pay_mode: employee?.pay_mode || (monthlyEmployee(employee) ? "monthly" : isPieceworkTailor(employee) ? "piecework" : "standard"),
+  overtime_rate: employee?.overtime_rate == null ? "21" : String(employee.overtime_rate),
+  pay_divisor: String(employee?.pay_divisor ?? 48),
+  half_day_hours: String(employee?.half_day_hours ?? 5),
+  piecework_formula: employee?.piecework_formula || "",
+});
 const employeeDepartment = (employee) => employee?.department || (employee?.is_general_worker ? "General Worker" : "Other");
+const excelAttendanceValues = (employee, period) => Array.from({ length: 7 }, (_, index) => {
+  const date = addDays(period.start, index);
+  if (isPieceworkTailor(employee)) {
+    const pieceDay = (employee.piece_days || []).find((day) => day.date === date);
+    return pieceDay ? Number(pieceDay.pieces || 0) : "";
+  }
+  const attendanceDay = (employee.days || []).find((day) => day.date === date);
+  if (!attendanceDay) return "";
+  if (attendanceDay.status === "Present") return 1;
+  if (attendanceDay.status === "Half Day") return 0.5;
+  return 0;
+});
 const salaryDepartment = (employee) => employee?.is_general_worker ? "General Worker" : employeeDepartment(employee);
 const periodKey = (type, start) => type === "monthly" ? "monthly:" + start.slice(0, 7) : "weekly:" + start;
 
@@ -97,6 +137,11 @@ const fetchPeriodPayments = async (period, periodType) => {
   ));
   return lists.flat();
 };
+
+const weeklyPlanEmployees = (plan) => [
+  ...(plan?.friday?.employees || []),
+  ...(plan?.saturday?.employees || []),
+];
 
 const calculateReportTotals = (report, monthlyIncluded, periodType) => {
   const includedRows = (report?.employees || [])
@@ -122,6 +167,8 @@ function PayrollEmployeeCard({
   onIncludeChange,
   rateValue,
   onRateChange,
+  configuration,
+  onConfigurationChange,
   paymentDate,
   onPaymentDateChange,
   saving,
@@ -252,17 +299,65 @@ function PayrollEmployeeCard({
             <h5 className="text-sm font-semibold text-slate-900">Salary &amp; balance</h5>
             <p className="mt-1 text-xs text-slate-500">Deductions are manual; nothing is taken automatically.</p>
           </div>
-          <label className="block text-xs font-semibold text-slate-600">
-            Configured {monthly ? "monthly" : "weekly"} salary
+          {configuration.pay_mode !== "piecework" && <label className="block text-xs font-semibold text-slate-600">
+            Configured {configuration.pay_mode === "monthly" ? "monthly" : "weekly"} salary
             <span className="mt-1 flex items-center gap-2">
               <span>R</span>
-              <input type="number" min="0.01" step="0.01" value={rateValue} onChange={(event) => onRateChange(event.target.value)} disabled={saving} className="min-w-0 flex-1 rounded-lg border border-slate-200 px-3 py-2 font-mono text-sm" />
-              <Btn className="rounded-lg" disabled={saving} onClick={onSaveRate}>Save</Btn>
+              <input type="number" min="0.01" step="0.01" value={rateValue} onChange={(event) => onRateChange(event.target.value)} disabled={saving || !!payment} className="min-w-0 flex-1 rounded-lg border border-slate-200 px-3 py-2 font-mono text-sm" />
             </span>
-          </label>
+          </label>}
+          <div className="grid gap-3 rounded-xl border border-slate-200 p-3 text-xs">
+            <label className="font-semibold text-slate-600">
+              Pay calculation mode
+              <select value={configuration.pay_mode} onChange={(event) => onConfigurationChange("pay_mode", event.target.value)} disabled={saving || !!payment} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-normal">
+                <option value="standard">Standard, by hours</option>
+                <option value="piecework">Piecework</option>
+                <option value="monthly">Monthly fixed</option>
+              </select>
+            </label>
+            <label className="font-semibold text-slate-600">
+              Overtime rate (R/hour; blank uses legacy default)
+              <input type="number" min="0" step="0.01" value={configuration.overtime_rate} onChange={(event) => onConfigurationChange("overtime_rate", event.target.value)} disabled={saving || !!payment} className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-normal" />
+            </label>
+            {configuration.pay_mode !== "monthly" && <>
+              {configuration.pay_mode !== "piecework" && <label className="font-semibold text-slate-600">
+                Weekly salary divisor (typically 48)
+                <input type="number" min="1" step="1" value={configuration.pay_divisor} onChange={(event) => onConfigurationChange("pay_divisor", event.target.value)} disabled={saving || !!payment} className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-normal" />
+              </label>}
+              <label className="font-semibold text-slate-600">
+                Half-day hours
+                <input type="number" min="1" max="8" step="0.5" value={configuration.half_day_hours} onChange={(event) => onConfigurationChange("half_day_hours", event.target.value)} disabled={saving || !!payment} className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-normal" />
+              </label>
+            </>}
+            {configuration.pay_mode === "piecework" && <label className="font-semibold text-slate-600">
+              Piecework formula for this employee
+              <select value={configuration.piecework_formula} onChange={(event) => onConfigurationChange("piecework_formula", event.target.value)} disabled={saving || !!payment} className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-normal">
+                <option value="">Existing tiered production rules</option>
+                {"ABCDEFGHIJKLMN".split("").map((formula, index) => <option key={formula} value={formula}>Profile {index + 1} ({formula})</option>)}
+              </select>
+            </label>}
+            <p className="text-[11px] leading-5 text-slate-500">{payment
+              ? payment.calculation_snapshot
+                ? "This paid period is read-only and uses its saved calculation snapshot."
+                : "This legacy paid period is read-only; its recorded amounts are preserved, but no calculation snapshot is available."
+              : "These settings also apply when recalculating unpaid historical periods. Paid records keep their saved calculation snapshot."}</p>
+          </div>
+          <Btn className="w-full rounded-lg" disabled={saving || !!payment} onClick={onSaveRate}>Save rate &amp; calculation settings</Btn>
           <div className="grid grid-cols-2 gap-2 rounded-xl bg-slate-50 p-3 text-xs">
-            <div><p className="text-slate-500">Balance at period start</p><p className="mt-1 font-mono font-semibold">{fmtMoney(employee.balance_before_period || 0)}</p></div>
-            <div><p className="text-slate-500">Balance remaining</p><p className="mt-1 font-mono font-semibold">{fmtMoney(employee.balance ?? employee.balance_after_period ?? 0)}</p></div>
+            <div><p className="text-slate-500">Balance at period start</p><p className="mt-1 font-mono font-semibold">{fmtMoney((employee.period_opening_balance ?? employee.balance_before_period) || 0)}</p></div>
+            <div><p className="text-slate-500">Balance remaining after cut</p><p className="mt-1 font-mono font-semibold">{fmtMoney((employee.period_remaining_balance ?? employee.balance ?? employee.balance_after_period) || 0)}</p></div>
+          </div>
+          <div className="rounded-xl border border-slate-200 p-3 text-xs text-slate-600">
+            <p className="font-semibold text-slate-800">Calculation rule</p>
+            <p className="mt-1">
+              {showPieces ? "Piecework" : monthly ? "Monthly fixed" : "Standard"} ·
+              {!monthly && !showPieces && ` divisor ${employee.pay_divisor || 48}`}
+            </p>
+            <p className="mt-1">{employee.overtime_rate == null
+              ? "Overtime fallback: R21/hour"
+              : `Overtime rate: R${Number(employee.overtime_rate).toLocaleString("en-ZA", { minimumFractionDigits: 2 })}/hour`}</p>
+            {!showPieces && <p className="mt-1">Half day: {Number(employee.half_day_hours ?? 5)} hours</p>}
+            {showPieces && employee.piecework_formula && <p className="mt-1">Piecework formula: {employee.piecework_formula}</p>}
           </div>
         </section>
 
@@ -293,11 +388,24 @@ function PayrollEmployeeCard({
 
 export default function SalariesManagement() {
   const { user } = useAuth();
+  const isSuperIqFoam = user?.company_id === "superiqfoam";
   const [periodType, setPeriodType] = useState("weekly");
   const [weekStart, setWeekStart] = useState(() => mondayOf(today()));
   const [monthValue, setMonthValue] = useState(() => today().slice(0, 7));
+  const [monthWeekIndex, setMonthWeekIndex] = useState(() => {
+    const month = today().slice(0, 7);
+    const weeks = monthSalaryWeeks(month);
+    const index = weeks.findIndex((week) => today() >= week.start && today() <= week.end);
+    return index >= 0 ? index : 0;
+  });
   const [report, setReport] = useState(null);
   const [payments, setPayments] = useState([]);
+  const [weeklyPlan, setWeeklyPlan] = useState(null);
+  const [weeklySalaryDrafts, setWeeklySalaryDrafts] = useState({});
+  const [weeklyOvertimeDrafts, setWeeklyOvertimeDrafts] = useState({});
+  const [weeklyOvertimeRateDrafts, setWeeklyOvertimeRateDrafts] = useState({});
+  const [weeklyPlanSaving, setWeeklyPlanSaving] = useState(false);
+  const [weeklyPaymentModal, setWeeklyPaymentModal] = useState(null);
   const [history, setHistory] = useState([]);
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const [historyCompanyId, setHistoryCompanyId] = useState(user?.company_id || "");
@@ -310,8 +418,10 @@ export default function SalariesManagement() {
   const [monthlyIncluded, setMonthlyIncluded] = useState({});
   const [cutDrafts, setCutDrafts] = useState({});
   const [rateDrafts, setRateDrafts] = useState({});
+  const [configurationDrafts, setConfigurationDrafts] = useState({});
   const [paymentDates, setPaymentDates] = useState({});
   const [savingIds, setSavingIds] = useState({});
+  const [tableDrafts, setTableDrafts] = useState({});
   const [totalWasRecalculated, setTotalWasRecalculated] = useState(false);
   const [advanceModal, setAdvanceModal] = useState(null);
   const [cutModal, setCutModal] = useState(null);
@@ -320,14 +430,23 @@ export default function SalariesManagement() {
   const [calendarMonth, setCalendarMonth] = useState(() => today().slice(0, 7));
   const [filtersOpen, setFiltersOpen] = useState(false);
 
-  const period = useMemo(
-    () => periodType === "monthly" ? monthRange(monthValue) : weekRange(weekStart),
-    [periodType, monthValue, weekStart],
-  );
+  const monthWeeks = useMemo(() => monthSalaryWeeks(monthValue), [monthValue]);
+  const period = useMemo(() => {
+    if (periodType === "monthly") return monthRange(monthValue);
+    const selectedMonthWeek = monthWeeks[monthWeekIndex];
+    return selectedMonthWeek ? weekRange(selectedMonthWeek.start) : weekRange(weekStart);
+  }, [periodType, monthValue, monthWeekIndex, monthWeeks, weekStart]);
   const payrollKey = period ? periodKey(periodType, period.start) : "";
+  useEffect(() => {
+    if (periodType === "weekly" && monthWeeks[monthWeekIndex]) {
+      setWeekStart(monthWeeks[monthWeekIndex].start);
+    }
+  }, [periodType, monthWeekIndex, monthWeeks]);
+  const weeklySplitView = false;
   const calendarGrid = useMemo(() => calendarDays(calendarMonth), [calendarMonth]);
   const selectedSunday = addDays(weekStart, 6);
-  const selectedWeekNumber = isoWeek(weekStart);
+  const selectedMonthWeekNumber = periodType === "weekly" ? monthWeekIndex + 1 : 0;
+  const selectedWeekNumber = selectedMonthWeekNumber || isoWeek(weekStart);
   const selectedWeekYear = isoWeekYear(weekStart);
 
   const openCalendar = () => {
@@ -335,8 +454,16 @@ export default function SalariesManagement() {
     setCalendarOpen((current) => !current);
   };
   const selectCalendarDate = (value) => {
-    if (periodType === "weekly") setWeekStart(mondayOf(value));
-    else setMonthValue(value.slice(0, 7));
+    if (periodType === "weekly") {
+      const month = value.slice(0, 7);
+      const weeks = monthSalaryWeeks(month);
+      const index = weeks.findIndex((week) => value >= week.start && value <= week.end);
+      setMonthValue(month);
+      setMonthWeekIndex(index >= 0 ? index : 0);
+      setWeekStart(index >= 0 ? mondayOf(weeks[index].start) : mondayOf(value));
+    } else {
+      setMonthValue(value.slice(0, 7));
+    }
     setCalendarOpen(false);
   };
 
@@ -352,12 +479,28 @@ export default function SalariesManagement() {
         end_date: period.end,
         include_monthly_salaries: true,
       };
-      const [nextReport, nextPayments] = await Promise.all([
+      const [nextReport, nextPayments, nextWeeklyPlan] = await Promise.all([
         api.getUncached("/salaries", params),
-        fetchPeriodPayments(period, periodType),
+        fetchPeriodPayments(period, periodType).catch(() => []),
+        isSuperIqFoam && periodType === "weekly"
+          ? api.getUncached("/salaries/weekly-plan", {
+            period_start: period.start,
+            period_end: period.end,
+          }).catch(() => null)
+          : Promise.resolve(null),
       ]);
       setReport(nextReport);
       setPayments(nextPayments || []);
+      setWeeklyPlan(nextWeeklyPlan);
+      setWeeklySalaryDrafts(Object.fromEntries(weeklyPlanEmployees(nextWeeklyPlan).map((employee) => [
+        employee.employee_id, String(employee.weekly_salary ?? ""),
+      ])));
+      setWeeklyOvertimeDrafts(Object.fromEntries(weeklyPlanEmployees(nextWeeklyPlan).map((employee) => [
+        employee.employee_id, String(employee.overtime_hours ?? 0),
+      ])));
+      setWeeklyOvertimeRateDrafts(Object.fromEntries(weeklyPlanEmployees(nextWeeklyPlan).map((employee) => [
+        employee.employee_id, String(employee.overtime_rate ?? 21),
+      ])));
       const paidByEmployee = Object.fromEntries((nextPayments || []).map((payment) => [payment.employee_id, payment]));
       setCutDrafts(Object.fromEntries((nextReport.employees || []).map((employee) => [
         employee.employee_id, String(paidByEmployee[employee.employee_id]?.deduction_amount ?? employee.cut ?? 0),
@@ -365,6 +508,9 @@ export default function SalariesManagement() {
       setRateDrafts(Object.fromEntries((nextReport.employees || []).map((employee) => [
         employee.employee_id,
         String(monthlyEmployee(employee) ? (employee.monthly_salary ?? "") : (employee.weekly_salary ?? "")),
+      ])));
+      setConfigurationDrafts(Object.fromEntries((nextReport.employees || []).map((employee) => [
+        employee.employee_id, payrollConfigFromEmployee(employee),
       ])));
       setMonthlyIncluded((current) => Object.fromEntries((nextReport.employees || [])
         .filter(monthlyEmployee)
@@ -389,14 +535,23 @@ export default function SalariesManagement() {
     if (!period) {
       setReport(null);
       setPayments([]);
+      setWeeklyPlan(null);
+      setWeeklySalaryDrafts({});
+      setWeeklyOvertimeDrafts({});
+      setWeeklyOvertimeRateDrafts({});
       setLoading(false);
       return () => { active = false; };
     }
     setReport(null);
     setPayments([]);
+    setWeeklyPlan(null);
+    setWeeklySalaryDrafts({});
+    setWeeklyOvertimeDrafts({});
+    setWeeklyOvertimeRateDrafts({});
     setMonthlyIncluded({});
     setCutDrafts({});
     setRateDrafts({});
+    setConfigurationDrafts({});
     setPaymentDates({});
     setTotalWasRecalculated(false);
     setAdvanceModal(null);
@@ -408,11 +563,27 @@ export default function SalariesManagement() {
     };
     Promise.all([
       api.getUncached("/salaries", params),
-      fetchPeriodPayments(period, periodType),
-    ]).then(([nextReport, nextPayments]) => {
+      fetchPeriodPayments(period, periodType).catch(() => []),
+      isSuperIqFoam && periodType === "weekly"
+        ? api.getUncached("/salaries/weekly-plan", {
+          period_start: period.start,
+          period_end: period.end,
+        }).catch(() => null)
+        : Promise.resolve(null),
+    ]).then(([nextReport, nextPayments, nextWeeklyPlan]) => {
       if (!active) return;
       setReport(nextReport);
       setPayments(nextPayments || []);
+      setWeeklyPlan(nextWeeklyPlan);
+      setWeeklySalaryDrafts(Object.fromEntries(weeklyPlanEmployees(nextWeeklyPlan).map((employee) => [
+        employee.employee_id, String(employee.weekly_salary ?? ""),
+      ])));
+      setWeeklyOvertimeDrafts(Object.fromEntries(weeklyPlanEmployees(nextWeeklyPlan).map((employee) => [
+        employee.employee_id, String(employee.overtime_hours ?? 0),
+      ])));
+      setWeeklyOvertimeRateDrafts(Object.fromEntries(weeklyPlanEmployees(nextWeeklyPlan).map((employee) => [
+        employee.employee_id, String(employee.overtime_rate ?? 21),
+      ])));
       const paidByEmployee = Object.fromEntries((nextPayments || []).map((payment) => [payment.employee_id, payment]));
       setCutDrafts(Object.fromEntries((nextReport.employees || []).map((employee) => [
         employee.employee_id, String(paidByEmployee[employee.employee_id]?.deduction_amount ?? employee.cut ?? 0),
@@ -420,6 +591,9 @@ export default function SalariesManagement() {
       setRateDrafts(Object.fromEntries((nextReport.employees || []).map((employee) => [
         employee.employee_id,
         String(monthlyEmployee(employee) ? (employee.monthly_salary ?? "") : (employee.weekly_salary ?? "")),
+      ])));
+      setConfigurationDrafts(Object.fromEntries((nextReport.employees || []).map((employee) => [
+        employee.employee_id, payrollConfigFromEmployee(employee),
       ])));
       setMonthlyIncluded((current) => Object.fromEntries((nextReport.employees || [])
         .filter(monthlyEmployee)
@@ -436,7 +610,7 @@ export default function SalariesManagement() {
       if (active) setLoading(false);
     });
     return () => { active = false; };
-  }, [period?.start, period?.end, periodType, user?.company_id]);
+  }, [period?.start, period?.end, periodType, user?.company_id, isSuperIqFoam]);
 
   useEffect(() => {
     if (view !== "history" || (historyLoaded && historyCompanyId === user?.company_id)) return;
@@ -455,29 +629,39 @@ export default function SalariesManagement() {
     return () => { active = false; };
   }, [view, historyLoaded, historyCompanyId, user?.company_id]);
 
-  const paymentByEmployee = useMemo(
-    () => Object.fromEntries((payments || []).map((payment) => [payment.employee_id, payment])),
-    [payments],
-  );
+  const paymentByEmployee = useMemo(() => Object.fromEntries(
+    (report?.employees || []).map((employee) => {
+      const expectedType = periodType === "monthly" || monthlyEmployee(employee) ? "monthly" : "weekly";
+      const payment = (payments || []).find((item) =>
+        item.employee_id === employee.employee_id && item.period_type === expectedType,
+      ) || null;
+      return [employee.employee_id, payment];
+    }),
+  ), [payments, report, periodType]);
   const rows = useMemo(() => (report?.employees || []).map((employee) => {
-    const monthly = monthlyEmployee(employee);
-    const included = !monthly || (monthlyIncluded[employee.employee_id] ?? periodType === "monthly");
     const payment = paymentByEmployee[employee.employee_id] || null;
-    const grossCents = cents(employee.gross_salary);
-    const cutCents = cents(employee.cut);
+    const monthly = payment ? payment.period_type === "monthly" : monthlyEmployee(employee);
+    const included = !monthly || (monthlyIncluded[employee.employee_id] ?? periodType === "monthly");
+    const snapshot = payment?.calculation_snapshot;
+    const displayEmployee = snapshot ? { ...employee, ...snapshot } : employee;
+    const grossCents = cents(payment?.gross_amount ?? employee.gross_salary);
+    const cutCents = cents(payment?.deduction_amount ?? employee.cut);
     return {
-      employee,
+      employee: displayEmployee,
       monthly,
       included,
       grossCents,
       cutCents,
-      netCents: grossCents - cutCents,
+      netCents: payment?.net_amount != null ? cents(payment.net_amount) : grossCents - cutCents,
       payment,
     };
-  }).sort((a, b) =>
-    salaryDepartment(a.employee).localeCompare(salaryDepartment(b.employee))
-    || String(a.employee.name || "").localeCompare(String(b.employee.name || "")),
-  ), [report, monthlyIncluded, periodType, paymentByEmployee]);
+  }).sort((a, b) => {
+    const fixedNameA = /^(AMEENA|YASSINE)$/i.test(String(a.employee.name || "").trim());
+    const fixedNameB = /^(AMEENA|YASSINE)$/i.test(String(b.employee.name || "").trim());
+    if (fixedNameA !== fixedNameB) return fixedNameA ? 1 : -1;
+    return salaryDepartment(a.employee).localeCompare(salaryDepartment(b.employee))
+      || String(a.employee.name || "").localeCompare(String(b.employee.name || ""));
+  }), [report, monthlyIncluded, periodType, paymentByEmployee]);
 
   const reportRows = rows.filter((row) => row.included);
   const totals = sumPayrollRows(reportRows);
@@ -494,21 +678,193 @@ export default function SalariesManagement() {
 
   const changePeriodType = (nextType) => {
     setPeriodType(nextType);
+    if (nextType === "weekly") {
+      const weeks = monthSalaryWeeks(monthValue);
+      const index = weeks.findIndex((week) => today() >= week.start && today() <= week.end);
+      setMonthWeekIndex(index >= 0 ? index : 0);
+    }
     setView("payroll");
     setSearch("");
     setDepartment("");
   };
 
   const saveRate = async (employee) => {
-    const amount = Number(rateDrafts[employee.employee_id]);
-    if (!Number.isFinite(amount) || amount <= 0) return toast.error("Enter a salary rate greater than zero.");
+    const config = configurationDrafts[employee.employee_id] || payrollConfigFromEmployee(employee);
+    const rateText = String(rateDrafts[employee.employee_id] ?? "").trim();
+    const amount = Number(rateText);
+    if (rateText && (!Number.isFinite(amount) || amount <= 0)) {
+      return toast.error("Enter a salary rate greater than zero, or leave it blank to keep it unchanged.");
+    }
+    const overtimeRate = config.overtime_rate === "" ? null : Number(config.overtime_rate);
+    const divisor = Number(config.pay_divisor);
+    const halfDayHours = Number(config.half_day_hours);
+    if (overtimeRate !== null && (!Number.isFinite(overtimeRate) || overtimeRate < 0)) {
+      return toast.error("Overtime rate must be zero or greater.");
+    }
+    if (config.pay_mode !== "monthly" && config.pay_mode !== "piecework"
+      && (!Number.isFinite(divisor) || divisor < 1)) {
+      return toast.error("Salary divisor must be at least one.");
+    }
+    if (config.pay_mode !== "monthly"
+      && (!Number.isFinite(halfDayHours) || halfDayHours < 1 || halfDayHours > 8)) {
+      return toast.error("Half-day hours must be between one and eight.");
+    }
+    if (config.pay_mode === "monthly" && !rateText && employee.monthly_salary == null) {
+      return toast.error("Enter a monthly salary before switching to monthly fixed pay.");
+    }
     setSavingIds((current) => ({ ...current, [employee.employee_id]: true }));
     try {
-      await api.put("/salaries/rates/" + employee.employee_id, monthlyEmployee(employee)
-        ? { monthly_salary: amount }
-        : { weekly_salary: amount });
-      toast.success("Salary rate saved for " + employee.name);
+      const payload = {
+        pay_mode: config.pay_mode,
+        overtime_rate: overtimeRate,
+        pay_divisor: config.pay_mode === "monthly" ? undefined : divisor,
+        half_day_hours: config.pay_mode === "monthly" ? undefined : halfDayHours,
+        piecework_formula: config.piecework_formula || null,
+      };
+      if (rateText) {
+        if (config.pay_mode === "monthly") payload.monthly_salary = amount;
+        else if (config.pay_mode !== "piecework") payload.weekly_salary = amount;
+      }
+      await api.put("/salaries/rates/" + employee.employee_id, payload);
+      toast.success("Salary and calculation settings saved for " + employee.name);
       await reload();
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setSavingIds((current) => ({ ...current, [employee.employee_id]: false }));
+    }
+  };
+
+  const saveWeeklySalary = async (employee) => {
+    const value = String(weeklySalaryDrafts[employee.employee_id] ?? "").trim();
+    const salary = Number(value);
+    if (!value || !Number.isFinite(salary) || salary <= 0) {
+      return toast.error("Enter a fixed weekly salary greater than zero.");
+    }
+    setSavingIds((current) => ({ ...current, [employee.employee_id]: true }));
+    try {
+      await api.put("/salaries/rates/" + employee.employee_id, { weekly_salary: salary });
+      toast.success("Fixed weekly salary saved for " + employee.employee_name);
+      await reload({ showLoading: false, resetExpanded: false });
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setSavingIds((current) => ({ ...current, [employee.employee_id]: false }));
+    }
+  };
+
+  const saveWeeklyOvertime = async (employee) => {
+    const hoursText = String(weeklyOvertimeDrafts[employee.employee_id] ?? "").trim();
+    const rateText = String(weeklyOvertimeRateDrafts[employee.employee_id] ?? "").trim();
+    const hours = Number(hoursText);
+    const rate = Number(rateText);
+    if (!hoursText || !Number.isFinite(hours) || hours < 0 || hours > 168) {
+      return toast.error("Overtime hours must be between 0 and 168.");
+    }
+    if (!rateText || !Number.isFinite(rate) || rate < 0) {
+      return toast.error("Overtime rate must be zero or greater.");
+    }
+    if (employee.salary_rate_missing) {
+      return toast.error("Save the fixed weekly salary before setting overtime.");
+    }
+    setSavingIds((current) => ({ ...current, [employee.employee_id]: true }));
+    try {
+      await api.put("/salaries/weekly-overtime", {
+        employee_id: employee.employee_id,
+        period_start: period.start,
+        period_end: period.end,
+        overtime_hours: hours,
+        overtime_rate: rate,
+      });
+      toast.success("Overtime saved and payroll recalculated for " + employee.employee_name);
+      await reload({ showLoading: false, resetExpanded: false });
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setSavingIds((current) => ({ ...current, [employee.employee_id]: false }));
+    }
+  };
+
+  const saveTableSalary = async (employee, value) => {
+    const salary = Number(value);
+    if (!Number.isFinite(salary) || salary <= 0) return toast.error("Enter a salary greater than zero.");
+    setSavingIds((current) => ({ ...current, [employee.employee_id]: true }));
+    try {
+      await api.put("/salaries/rates/" + employee.employee_id, { weekly_salary: salary });
+      await reload({ showLoading: false, resetExpanded: false });
+      toast.success("Weekly salary saved.");
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setSavingIds((current) => ({ ...current, [employee.employee_id]: false }));
+    }
+  };
+
+  const saveTableOvertime = async (employee, _hoursValue, rateValue) => {
+    const overtimeRate = Number(rateValue);
+    if (!Number.isFinite(overtimeRate) || overtimeRate < 0) return toast.error("Overtime rate must be zero or greater.");
+    setSavingIds((current) => ({ ...current, [employee.employee_id]: true }));
+    try {
+      await api.put("/salaries/rates/" + employee.employee_id, { overtime_rate: overtimeRate });
+      await reload({ showLoading: false, resetExpanded: false });
+      toast.success("Overtime rate saved.");
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setSavingIds((current) => ({ ...current, [employee.employee_id]: false }));
+    }
+  };
+
+  const saveTableAttendance = async (employee, date, value) => {
+    const normalized = String(value ?? "").trim().toLowerCase();
+    const status = normalized === "1" || normalized === "x" ? "Present"
+      : normalized === "0.5" ? "Half Day"
+        : normalized === "0" ? "Absent"
+          : "";
+    if (!status) return toast.error("Use 1, 0.5, x or 0 for attendance.");
+    setSavingIds((current) => ({ ...current, [employee.employee_id]: true }));
+    try {
+      await api.post("/attendance", {
+        employee_id: employee.employee_id,
+        date,
+        status,
+        overtime_hours: normalized === "0" ? 0 : undefined,
+      });
+      await reload({ showLoading: false, resetExpanded: false });
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setSavingIds((current) => ({ ...current, [employee.employee_id]: false }));
+    }
+  };
+
+  const saveTableProduction = async (employee, date, value) => {
+    const pieces = Number(value);
+    if (!Number.isInteger(pieces) || pieces < 0) return toast.error("Pieces must be a whole number of zero or more.");
+    setSavingIds((current) => ({ ...current, [employee.employee_id]: true }));
+    try {
+      await api.post("/piece-production", { employee_id: employee.employee_id, date, pieces });
+      await reload({ showLoading: false, resetExpanded: false });
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setSavingIds((current) => ({ ...current, [employee.employee_id]: false }));
+    }
+  };
+
+  const saveTableCut = async (employee, value) => {
+    const amount = Number(value);
+    if (!Number.isFinite(amount) || amount < 0) return toast.error("Balance cut must be zero or greater.");
+    setSavingIds((current) => ({ ...current, [employee.employee_id]: true }));
+    try {
+      await api.post("/salaries/cuts", {
+        employee_id: employee.employee_id,
+        start_date: period.start,
+        end_date: period.end,
+        amount,
+        notes: "Entered in Salary table",
+      });
+      await reload({ showLoading: false, resetExpanded: false });
     } catch (error) {
       toast.error(apiError(error));
     } finally {
@@ -629,11 +985,14 @@ export default function SalariesManagement() {
     const previousGrossCents = totals.grossCents;
     setSavingIds((current) => ({ ...current, [employee.employee_id]: true }));
     try {
+      const paymentPeriod = row.monthly
+        ? monthRange(monthValue)
+        : period;
       await api.post("/salaries/payments", {
         employee_id: employee.employee_id,
-        period_type: periodType,
-        period_start: period.start,
-        period_end: period.end,
+        period_type: row.monthly ? "monthly" : "weekly",
+        period_start: paymentPeriod.start,
+        period_end: paymentPeriod.end,
         payment_date: paymentDate,
       });
       toast.success("Payment recorded for " + employee.name);
@@ -651,6 +1010,67 @@ export default function SalariesManagement() {
       toast.error(apiError(error));
     } finally {
       setSavingIds((current) => ({ ...current, [employee.employee_id]: false }));
+    }
+  };
+
+  const updateWeeklyFridaySelection = async (employeeId, assignFriday) => {
+    if (!isSuperIqFoam || !period || periodType !== "weekly" || weeklyPlanSaving) return;
+    const fridayIds = new Set(weeklyPlan?.friday_employee_ids || []);
+    if (assignFriday) fridayIds.add(employeeId);
+    else fridayIds.delete(employeeId);
+    setWeeklyPlanSaving(true);
+    try {
+      const updatedPlan = await api.put("/salaries/weekly-plan", {
+        period_start: period.start,
+        period_end: period.end,
+        friday_employee_ids: [...fridayIds],
+      });
+      setWeeklyPlan(updatedPlan);
+      toast.success(assignFriday ? "Assigned to Friday payment group" : "Assigned to Saturday payment group");
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setWeeklyPlanSaving(false);
+    }
+  };
+
+  const recordWeeklySalaryPayment = async () => {
+    if (!weeklyPaymentModal || !period) return;
+    const amountText = String(weeklyPaymentModal.amount || "").trim();
+    if (!/^\d+(?:\.\d{1,2})?$/.test(amountText)) {
+      return toast.error("Enter an amount with no more than two decimal places.");
+    }
+    const amount = Number(amountText);
+    const amountCents = cents(amount);
+    if (!Number.isSafeInteger(amountCents) || amountCents <= 0) {
+      return toast.error("Enter an amount greater than zero.");
+    }
+    if (amountCents > weeklyPaymentModal.employee.remaining_cents) {
+      return toast.error("Payment cannot exceed the remaining salary balance.");
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(weeklyPaymentModal.paymentDate)) {
+      return toast.error("Choose a valid payment date.");
+    }
+    const employeeId = weeklyPaymentModal.employee.employee_id;
+    setSavingIds((current) => ({ ...current, [employeeId]: true }));
+    try {
+      await api.post("/salaries/weekly-payments", {
+        employee_id: employeeId,
+        period_start: period.start,
+        period_end: period.end,
+        payment_date: weeklyPaymentModal.paymentDate,
+        amount: amountCents / 100,
+        idempotency_key: globalThis.crypto?.randomUUID?.() || `${employeeId}-${Date.now()}-${Math.random()}`,
+        notes: weeklyPaymentModal.notes || "",
+      });
+      toast.success(`Payment recorded for ${weeklyPaymentModal.employee.employee_name}`);
+      setWeeklyPaymentModal(null);
+      setHistoryLoaded(false);
+      await reload({ showLoading: false, resetExpanded: false });
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setSavingIds((current) => ({ ...current, [employeeId]: false }));
     }
   };
 
@@ -774,33 +1194,45 @@ export default function SalariesManagement() {
       {view === "payroll" ? <>
         <section className="relative rounded-3xl border border-slate-200/80 bg-white p-4 shadow-[0_8px_32px_rgba(15,23,42,0.045)] sm:p-6" aria-label="Pay period selector">
           <div className="flex flex-wrap items-center justify-between gap-4">
-            <div className="inline-flex w-full rounded-xl bg-slate-100 p-1 sm:w-auto">
-              <button type="button" onClick={() => changePeriodType("weekly")} className={"flex-1 rounded-lg px-5 py-2.5 text-xs font-bold tracking-[0.12em] transition-all sm:flex-none " + (periodType === "weekly" ? "bg-white text-slate-950 shadow-sm" : "text-slate-500 hover:text-slate-900")} data-testid="salary-weekly-mode">Week</button>
-              <button type="button" onClick={() => changePeriodType("monthly")} className={"flex-1 rounded-lg px-5 py-2.5 text-xs font-bold tracking-[0.12em] transition-all sm:flex-none " + (periodType === "monthly" ? "bg-white text-slate-950 shadow-sm" : "text-slate-500 hover:text-slate-900")} data-testid="salary-monthly-mode">Month</button>
-            </div>
-            <button type="button" onClick={() => periodType === "weekly" ? setWeekStart(mondayOf(today())) : setMonthValue(today().slice(0, 7))} className="rounded-lg px-3 py-2 text-xs font-semibold text-[#34725c] transition-colors hover:bg-[#eff9f4]" data-testid="salary-today">Today</button>
+            <button type="button" onClick={() => {
+              const month = today().slice(0, 7);
+              const weeks = monthSalaryWeeks(month);
+              const index = weeks.findIndex((week) => today() >= week.start && today() <= week.end);
+              setMonthValue(month);
+              setMonthWeekIndex(index >= 0 ? index : 0);
+              setWeekStart(index >= 0 ? weeks[index].start : mondayOf(today()));
+              if (periodType === "monthly") setMonthValue(month);
+            }} className="hidden rounded-lg px-3 py-2 text-xs font-semibold text-[#34725c] transition-colors hover:bg-[#eff9f4]" data-testid="salary-today">Today</button>
           </div>
 
           <div className="mt-5 flex items-center justify-center gap-2 sm:mt-6 sm:gap-4">
             <button
               type="button"
-              onClick={() => periodType === "weekly" ? setWeekStart(addDays(weekStart, -7)) : setMonthValue(shiftMonth(monthValue, -1))}
+              onClick={() => periodType === "weekly"
+                ? monthWeekIndex > 0
+                  ? setMonthWeekIndex((current) => current - 1)
+                  : (() => { const month = shiftMonth(monthValue, -1); setMonthValue(month); setMonthWeekIndex(Math.max(0, monthSalaryWeeks(month).length - 1)); })()
+                : setMonthValue(shiftMonth(monthValue, -1))}
               aria-label={periodType === "weekly" ? "Previous week" : "Previous month"}
               className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-slate-200 text-slate-600 transition-colors hover:border-[#cbe7db] hover:bg-[#f1faf6] hover:text-[#286a56]"
             ><ChevronLeft size={18} /></button>
             <div className="min-w-0 flex-1 text-center sm:flex-none sm:min-w-[280px]">
               <p className="truncate text-lg font-semibold tracking-tight text-slate-950 sm:text-2xl" data-testid="salary-period-label">
                 {periodType === "weekly"
-                  ? `${displayDate(weekStart)} – ${displayDate(selectedSunday)}`
+                  ? `${displayDate(period?.start)} – ${displayDate(period?.end)}`
                   : displayMonth(monthValue)}
               </p>
               <p className="mt-1 text-xs font-medium text-slate-500">
-                {periodType === "weekly" ? `Week ${selectedWeekNumber} · ${selectedWeekYear} · Payroll runs Monday–Saturday` : "Full calendar month"}
+                {periodType === "weekly" ? `Settimana ${selectedMonthWeekNumber} di ${displayMonth(monthValue)} · Payroll runs Monday–Saturday` : "Full calendar month"}
               </p>
             </div>
             <button
               type="button"
-              onClick={() => periodType === "weekly" ? setWeekStart(addDays(weekStart, 7)) : setMonthValue(shiftMonth(monthValue, 1))}
+              onClick={() => periodType === "weekly"
+                ? monthWeekIndex < monthWeeks.length - 1
+                  ? setMonthWeekIndex((current) => current + 1)
+                  : (() => { const month = shiftMonth(monthValue, 1); setMonthValue(month); setMonthWeekIndex(0); })()
+                : setMonthValue(shiftMonth(monthValue, 1))}
               aria-label={periodType === "weekly" ? "Next week" : "Next month"}
               className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-slate-200 text-slate-600 transition-colors hover:border-[#cbe7db] hover:bg-[#f1faf6] hover:text-[#286a56]"
             ><ChevronRight size={18} /></button>
@@ -845,7 +1277,20 @@ export default function SalariesManagement() {
             </div>
           </div>
 
-          {periodType === "weekly" && <div className="mt-5 grid grid-cols-7 gap-1.5 sm:mt-6 sm:gap-2" aria-label="Selected week days">
+          {periodType === "weekly" && <div className="mt-5 flex flex-wrap gap-2" aria-label="Month salary weeks">
+            {monthWeeks.map((week, index) => <button
+              type="button"
+              key={week.start}
+              onClick={() => { setMonthWeekIndex(index); setWeekStart(week.start); }}
+              aria-pressed={monthWeekIndex === index}
+              className={"rounded-lg border px-3 py-2 text-xs font-semibold transition-colors " + (monthWeekIndex === index
+                ? "border-[#34725c] bg-[#34725c] text-white"
+                : "border-slate-200 bg-white text-slate-600 hover:border-[#cbe7db] hover:bg-[#f1faf6]")}
+              data-testid={`salary-month-week-${index + 1}`}
+            >Settimana {index + 1}</button>)}
+          </div>}
+
+          {periodType === "weekly" && <div className="mt-3 grid grid-cols-7 gap-1.5 sm:mt-4 sm:gap-2" aria-label="Selected week days">
             {Array.from({ length: 7 }, (_, index) => {
               const date = addDays(weekStart, index);
               return <button type="button" key={date} onClick={() => { setCalendarMonth(date.slice(0, 7)); setCalendarOpen(true); }} className="min-w-0 rounded-xl bg-[#eff8f3] px-1 py-2 text-center transition-colors hover:bg-[#dff2e9] sm:px-2 sm:py-2.5" data-testid={"salary-week-day-" + date}>
@@ -856,7 +1301,202 @@ export default function SalariesManagement() {
           </div>}
         </section>
 
-        <section className="overflow-hidden rounded-3xl bg-[#111312] p-5 text-white shadow-[0_16px_40px_rgba(15,23,42,0.16)] sm:p-7" aria-label="Payroll summary">
+        {period && <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5" aria-label="Salary period KPIs">
+          <div className="rounded-lg border border-slate-200 bg-white px-4 py-3 shadow-[0_5px_16px_rgba(15,23,42,0.06)]"><p className="text-[10px] font-bold uppercase text-slate-500">Period</p><p className="mt-1 text-sm font-bold text-slate-950">{displayDate(period.start)} – {displayDate(period.end)}</p></div>
+          <div className="rounded-lg border border-slate-200 bg-white px-4 py-3 shadow-[0_5px_16px_rgba(15,23,42,0.06)]"><p className="text-[10px] font-bold uppercase text-slate-500">Total employees</p><p className="mt-1 text-2xl font-bold tabular-nums text-slate-950">{rows.length}</p></div>
+          <div className="rounded-lg border border-slate-200 bg-white px-4 py-3 shadow-[0_5px_16px_rgba(15,23,42,0.06)]"><p className="text-[10px] font-bold uppercase text-slate-500">Total output</p><p className="mt-1 text-2xl font-bold tabular-nums text-slate-950">{fmtMoney(totals.grossCents / 100)}</p></div>
+          <div className="rounded-lg border border-slate-200 bg-white px-4 py-3 shadow-[0_5px_16px_rgba(15,23,42,0.06)]"><p className="text-[10px] font-bold uppercase text-slate-500">Final payment made</p><p className="mt-1 text-2xl font-bold tabular-nums text-slate-950">{fmtMoney(paidCents / 100)}</p></div>
+          <div className="rounded-lg border border-slate-200 bg-[#f5f7ff] px-4 py-3 shadow-[0_5px_16px_rgba(15,23,42,0.06)]"><p className="text-[10px] font-bold uppercase text-[#314b8f]">Payment progress</p><p className="mt-1 text-2xl font-bold tabular-nums text-[#1d3477]">{rows.length ? Math.round(includedPaidRows.length / rows.length * 100) : 0}%</p></div>
+        </section>}
+
+        {period && <section className="overflow-hidden rounded-lg border border-slate-300 bg-white shadow-[0_8px_24px_rgba(15,23,42,0.08)]" aria-label="Excel salary table">
+          <div className="overflow-x-auto">
+            <table className="min-w-[1500px] border-collapse text-[11px] text-slate-950" data-testid="salary-excel-table">
+              <thead>
+                <tr className="bg-[#dce8ff] text-center font-bold">
+                  <th className="w-12 border border-slate-400 px-2 py-2">S/N</th>
+                  <th className="w-44 border border-slate-400 px-2 py-2">EMPLOYEE NAME</th>
+                  <th className="w-44 border border-slate-400 px-2 py-2">DEPARTMENTS</th>
+                  <th className="w-20 border border-slate-400 px-2 py-2">SALARY R</th>
+                  <th className="w-20 border border-slate-400 px-2 py-2">OVERTIME HOURS</th>
+                  <th className="w-20 border border-slate-400 px-2 py-2">OVERTIME RATE</th>
+                  <th className="w-20 border border-slate-400 px-2 py-2">BALANCE</th>
+                  <th className="w-20 border border-slate-400 px-2 py-2">WORKING HOURS</th>
+                  <th className="w-20 border border-slate-400 px-2 py-2">WORKING DAYS</th>
+                  <th className="w-20 border border-slate-400 px-2 py-2">TOTAL</th>
+                  <th className="w-20 border border-slate-400 px-2 py-2">BALANCE CUT</th>
+                  <th className="w-24 border border-slate-400 px-2 py-2">FINAL PAYMENT MADE</th>
+                  {["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"].map((day) => <th key={day} className="w-16 border border-slate-400 px-2 py-2">{day}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row, index) => {
+                  const employee = row.employee;
+                  const salaryCents = cents(employee.weekly_salary || employee.monthly_salary || 0);
+                  const automaticOvertimeHours = (employee.days || []).reduce(
+                    (sum, day) => sum + Number(day.overtime_hours || 0),
+                    0,
+                  );
+                  const values = excelAttendanceValues(employee, period);
+                  return <tr key={employee.employee_id} className="text-center">
+                    <td className="border border-slate-300 px-2 py-1 tabular-nums">{index + 1}</td>
+                    <td className="border border-slate-300 px-2 py-1 text-left font-bold text-[#2633a0]">{employee.name}</td>
+                    <td className="border border-slate-300 px-2 py-1 font-bold text-[#2633a0]">{salaryDepartment(employee)}</td>
+                    <td className="border border-slate-300 px-1 py-1 font-mono">
+                      <input
+                        type="number" min="0.01" step="0.01"
+                        value={tableDrafts[employee.employee_id + ":salary"] ?? (salaryCents / 100 || "")}
+                        onChange={(event) => setTableDrafts((current) => ({ ...current, [employee.employee_id + ":salary"]: event.target.value }))}
+                        onBlur={(event) => saveTableSalary(employee, event.target.value)}
+                        disabled={!!row.payment || !!savingIds[employee.employee_id]}
+                        className="w-16 bg-transparent px-1 text-center outline-none"
+                        aria-label={`Salary for ${employee.name}`}
+                      />
+                    </td>
+                    <td className="border border-slate-300 px-1 py-1 bg-[#f4f8f5] font-mono text-slate-700" title="Calculated automatically from Attendance">
+                      <span className="block px-1 py-1 text-center" aria-label={`Automatic overtime hours for ${employee.name}: ${automaticOvertimeHours}`}>
+                        {automaticOvertimeHours}
+                      </span>
+                      <span className="block text-[8px] font-bold uppercase text-[#34725c]">AUTO</span>
+                    </td>
+                    <td className="border border-slate-300 px-1 py-1 font-mono">
+                      <input
+                        type="number" min="0" step="0.01"
+                        value={tableDrafts[employee.employee_id + ":overtime_rate"] ?? (employee.overtime_rate ?? 21)}
+                        onChange={(event) => setTableDrafts((current) => ({ ...current, [employee.employee_id + ":overtime_rate"]: event.target.value }))}
+                        onBlur={(event) => saveTableOvertime(employee, automaticOvertimeHours, event.target.value)}
+                        disabled={!!row.payment || !!savingIds[employee.employee_id]}
+                        className="w-16 bg-transparent px-1 text-center outline-none"
+                        aria-label={`Overtime rate for ${employee.name}`}
+                      />
+                    </td>
+                    <td className="border border-slate-300 px-1 py-1 font-mono">
+                      <button
+                        type="button"
+                        onClick={() => setAdvanceModal({ employee_id: employee.employee_id, employee_name: employee.name, amount: "", date: today(), notes: "" })}
+                        className="w-full px-1 py-1 text-center text-[#2633a0] hover:underline"
+                        title="Add balance"
+                      >{employee.balance_before_period || 0}</button>
+                    </td>
+                    <td className="border border-slate-300 px-2 py-1 font-mono">{employee.worked_hours || 0}</td>
+                    <td className="border border-slate-300 px-2 py-1 font-mono">{Number(employee.present_days || 0) + Number(employee.half_days || 0) * 0.5}</td>
+                    <td className="border border-slate-300 px-2 py-1 font-mono font-bold">{employee.gross_salary || 0}</td>
+                    <td className="border border-slate-300 px-1 py-1 font-mono text-red-700">
+                      <input
+                        type="number" min="0" step="0.01"
+                        value={tableDrafts[employee.employee_id + ":cut"] ?? (employee.cut || 0)}
+                        onChange={(event) => setTableDrafts((current) => ({ ...current, [employee.employee_id + ":cut"]: event.target.value }))}
+                        onBlur={(event) => saveTableCut(employee, event.target.value)}
+                        disabled={!!row.payment || !!savingIds[employee.employee_id]}
+                        className="w-16 bg-transparent px-1 text-center text-red-700 outline-none"
+                        aria-label={`Balance cut for ${employee.name}`}
+                      />
+                    </td>
+                    <td className="border border-slate-300 px-1 py-1 font-mono font-bold">
+                      {row.payment
+                        ? fmtMoney(row.payment.net_amount)
+                        : <button
+                            type="button"
+                            onClick={() => {
+                              if (isSuperIqFoam) {
+                                const dueCents = cents(employee.net_salary) * 1;
+                                setWeeklyPaymentModal({
+                                  employee: {
+                                    employee_id: employee.employee_id,
+                                    employee_name: employee.name,
+                                    due_cents: dueCents,
+                                    remaining_cents: dueCents,
+                                  },
+                                  paymentDate: period.start ? addDays(period.start, 5) : today(),
+                                  amount: String(dueCents / 100),
+                                  notes: "",
+                                });
+                              } else {
+                                markPaid(row);
+                              }
+                            }}
+                            disabled={!!savingIds[employee.employee_id] || Number(employee.net_salary || 0) <= 0}
+                            className="w-full rounded bg-slate-950 px-2 py-1 text-[10px] font-bold text-white disabled:cursor-not-allowed disabled:opacity-40"
+                          >PAY</button>}
+                    </td>
+                    {values.map((value, dayIndex) => {
+                      const date = addDays(period.start, dayIndex);
+                      const draftKey = employee.employee_id + ":day:" + date;
+                      return <td key={dayIndex} className="border border-slate-300 px-1 py-1 font-mono">
+                        {isPieceworkTailor(employee)
+                          ? <input
+                              type="number" min="0" step="1"
+                              value={tableDrafts[draftKey] ?? (value === "" ? 0 : value)}
+                              onChange={(event) => setTableDrafts((current) => ({ ...current, [draftKey]: event.target.value }))}
+                              onBlur={(event) => saveTableProduction(employee, date, event.target.value)}
+                              disabled={!!row.payment || !!savingIds[employee.employee_id]}
+                              className="w-12 bg-transparent px-1 text-center outline-none"
+                              aria-label={`Pieces for ${employee.name} on ${date}`}
+                            />
+                          : <select
+                              value={tableDrafts[draftKey] ?? (value === 1 ? "1" : value === 0.5 ? "0.5" : value === 0 ? "0" : "")}
+                              onChange={(event) => {
+                                setTableDrafts((current) => ({ ...current, [draftKey]: event.target.value }))
+                                saveTableAttendance(employee, date, event.target.value);
+                              }}
+                              disabled={!!row.payment || !!savingIds[employee.employee_id]}
+                              className="w-12 bg-transparent text-center outline-none"
+                              aria-label={`Attendance for ${employee.name} on ${date}`}
+                            >
+                              <option value="">-</option>
+                              <option value="1">1</option>
+                              <option value="0.5">0.5</option>
+                              <option value="x">x</option>
+                              <option value="0">0</option>
+                            </select>}
+                      </td>;
+                    })}
+                  </tr>;
+                })}
+              </tbody>
+              <tfoot>
+                <tr className="bg-[#0f5b87] text-center font-bold text-white">
+                  <td className="border border-slate-300 px-2 py-2" colSpan={3}>TOTALS</td>
+                  <td className="border border-slate-300 px-2 py-2 font-mono">{fmtMoney(rows.reduce((sum, row) => sum + cents(row.employee.weekly_salary || row.employee.monthly_salary || 0), 0) / 100)}</td>
+                  <td className="border border-slate-300 px-2 py-2">{rows.reduce((sum, row) => sum + Number(row.employee.overtime_hours || 0), 0)}</td>
+                  <td className="border border-slate-300 px-2 py-2 font-mono">{fmtMoney(rows.reduce((sum, row) => sum + cents(row.employee.overtime_pay), 0) / 100)}</td>
+                  <td className="border border-slate-300 px-2 py-2 font-mono">{fmtMoney(rows.reduce((sum, row) => sum + cents(row.employee.balance_before_period), 0) / 100)}</td>
+                  <td className="border border-slate-300 px-2 py-2">{rows.reduce((sum, row) => sum + Number(row.employee.worked_hours || 0), 0)}</td>
+                  <td className="border border-slate-300 px-2 py-2">{rows.reduce((sum, row) => sum + Number(row.employee.present_days || 0) + Number(row.employee.half_days || 0) * 0.5, 0)}</td>
+                  <td className="border border-slate-300 px-2 py-2 font-mono">{fmtMoney(totals.grossCents / 100)}</td>
+                  <td className="border border-slate-300 px-2 py-2 font-mono">{fmtMoney(totals.cutCents / 100)}</td>
+                  <td className="border border-slate-300 px-2 py-2 font-mono">{fmtMoney(totals.netCents / 100)}</td>
+                  {[0, 1, 2, 3, 4, 5, 6].map((day) => <td key={day} className="border border-slate-300 px-2 py-2">—</td>)}
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </section>}
+
+        {weeklySplitView ? weeklyPlan ? <section className="space-y-4" aria-label="Weekly salary payment summary" data-testid="weekly-salary-payment-summary">
+          <div>
+            <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-[#39806b]">WEEKLY SALARY PAYMENT SUMMARY</p>
+            <p className="mt-1 text-xs text-slate-500">Cycle {weeklyPlan.period_start} – {weeklyPlan.period_end} · Friday {weeklyPlan.friday_date} · Saturday {weeklyPlan.saturday_date}</p>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            {[
+              ["Total Friday salaries", weeklyPlan.friday.due_cents],
+              ["Total Saturday salaries", weeklyPlan.saturday.due_cents],
+              ["Total weekly salaries", weeklyPlan.total_salaries_cents],
+              ["Cash required Friday", weeklyPlan.friday.cash_required_cents],
+              ["Cash required Saturday", weeklyPlan.saturday.cash_required_cents],
+              ["Actually paid Friday", weeklyPlan.friday.actually_paid_cents],
+              ["Actually paid Saturday", weeklyPlan.saturday.actually_paid_cents],
+              ["Total actually paid", weeklyPlan.total_paid_cents],
+              ["Outstanding balance", weeklyPlan.outstanding_cents],
+            ].map(([label, amount]) => <div key={label} className="rounded-2xl border border-slate-200 bg-white p-4" data-testid={`weekly-summary-${label.toLowerCase().replaceAll(" ", "-")}`}>
+              <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">{label}</p>
+              <p className="mt-2 font-mono text-xl font-bold tabular-nums text-slate-950">{fmtMoney(Number(amount || 0) / 100)}</p>
+            </div>)}
+          </div>
+        </section> : <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900" role="alert">
+          Weekly payment assignments are unavailable. Reload the payroll before recording a payment.
+        </div> : <section className="hidden overflow-hidden rounded-3xl bg-[#111312] p-5 text-white shadow-[0_16px_40px_rgba(15,23,42,0.16)] sm:p-7" aria-label="Payroll summary">
           <div className="grid gap-5 sm:grid-cols-3 sm:gap-0">
             <div className="sm:px-5 sm:first:pl-0">
               <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-white/55">Total salaries</p>
@@ -874,19 +1514,203 @@ export default function SalariesManagement() {
               <p className="mt-1 text-xs text-white/45">{fmtMoney(paidGrossCents / 100)} salary · {fmtMoney(paidCents / 100)} net paid</p>
             </div>
           </div>
-        </section>
+        </section>}
 
         {totalWasRecalculated && <p role="status" className="text-xs text-amber-800" data-testid="salary-total-recalculated">
           Please recalculate salaries. The total shown before payment was incorrect and has been updated.
         </p>}
 
-        <section className="space-y-4" aria-label="Employee payroll">
+        {weeklySplitView ? <section className="hidden space-y-5" aria-label="Friday and Saturday salary groups">
+          <div className="flex flex-wrap items-end justify-between gap-3">
+            <div>
+              <h3 className="font-display text-xl font-semibold text-slate-950">Friday &amp; Saturday payments</h3>
+              <p className="mt-1 text-xs text-slate-500">PAY assigns a worker to Friday. All others are scheduled for Saturday. Assignment never marks a salary as paid.</p>
+            </div>
+            <Input type="search" label="Search employee" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Name or employee ID" data-testid="salary-search" />
+          </div>
+          {weeklyPlan ? <div className="grid gap-4 xl:grid-cols-2">
+            {[
+              { key: "friday", title: "FRIDAY", group: weeklyPlan.friday, date: weeklyPlan.friday_date },
+              { key: "saturday", title: "SATURDAY", group: weeklyPlan.saturday, date: weeklyPlan.saturday_date },
+            ].map(({ key, title, group, date }) => {
+              const dateCaption = date === today()
+                ? `${title} – TODAY`
+                : date === addDays(today(), 1)
+                  ? `${title} – TOMORROW`
+                  : `${title} – ${displayDate(date, { weekday: "long", day: "2-digit", month: "short" })}`;
+              const visibleEmployees = group.employees.filter((employee) =>
+                (department === "" || salaryDepartment(employee) === department)
+                && (`${employee.employee_name} ${employee.employee_id} ${employee.department || ""}`)
+                  .toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()),
+              );
+              return <Card key={key} className="overflow-hidden p-0" data-testid={`salary-group-${key}`}>
+                <header className="flex flex-wrap items-end justify-between gap-3 border-b border-slate-200 bg-slate-50 p-5">
+                  <div>
+                    <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-[#39806b]">{dateCaption}</p>
+                    <p className="mt-1 text-xs text-slate-500">{group.employee_count} employees · Salary total {fmtMoney(group.due_cents / 100)}</p>
+                  </div>
+                  <div className="text-right">
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Cash required</p>
+                    <p className="font-mono text-2xl font-bold tabular-nums text-slate-950">{fmtMoney(group.cash_required_cents / 100)}</p>
+                  </div>
+                </header>
+                {visibleEmployees.length === 0
+                  ? <p className="p-5 text-sm text-slate-500">No employees in this group match the search.</p>
+                  : <div className="divide-y divide-slate-100">
+                    {visibleEmployees.map((employee) => {
+                      const paymentsForEmployee = employee.payment_history || [];
+                      const hasPayment = employee.paid_cents > 0;
+                      const statusClass = employee.payment_status === "Paid"
+                        ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                        : employee.payment_status === "Partially Paid"
+                          ? "border-orange-200 bg-orange-50 text-orange-800"
+                          : employee.payment_status === "Scheduled"
+                            ? "border-sky-200 bg-sky-50 text-sky-800"
+                            : "border-amber-200 bg-amber-50 text-amber-900";
+                      return <article key={employee.employee_id} className="space-y-3 p-4 sm:p-5" data-testid={`weekly-salary-row-${employee.employee_id}`}>
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <h4 className="font-semibold text-slate-950">{employee.employee_name}</h4>
+                              <Badge cls={statusClass}>{employee.payment_status}</Badge>
+                              {employee.salary_rate_missing && <Badge cls="border-amber-200 bg-amber-50 text-amber-900">Rate missing</Badge>}
+                            </div>
+                            <p className="mt-1 text-xs text-slate-500">{employee.department || "Other"} · {key === "friday" ? weeklyPlan.friday_date : weeklyPlan.saturday_date}</p>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            <Btn
+                              variant="outline" className="h-9 px-3 text-xs"
+                              onClick={() => setAdvanceModal({
+                                employee_id: employee.employee_id,
+                                employee_name: employee.employee_name,
+                                amount: "",
+                                date: today(),
+                                notes: "",
+                              })}
+                              disabled={!!savingIds[employee.employee_id]}
+                            >Add balance</Btn>
+                            <Btn
+                              variant="outline" className="h-9 px-3 text-xs"
+                              onClick={() => setCutModal({
+                                employee: {
+                                  ...employee,
+                                  name: employee.employee_name,
+                                  weekly_salary: employee.weekly_salary,
+                                  gross_salary: employee.gross_salary,
+                                  cut: employee.balance_cut,
+                                  pay_frequency: employee.pay_frequency,
+                                },
+                                amount: employee.balance_cut ? String(employee.balance_cut) : "",
+                                notes: "",
+                              })}
+                              disabled={!!savingIds[employee.employee_id] || hasPayment}
+                            >Cut balance</Btn>
+                            <Btn
+                              variant="outline" className="h-9 px-3 text-xs"
+                              onClick={() => setBalanceHistoryModal({
+                                ...employee,
+                                name: employee.employee_name,
+                              })}
+                              disabled={!!savingIds[employee.employee_id]}
+                            >Balance history</Btn>
+                            {!hasPayment && <Btn variant="outline" className="h-9 px-3 text-xs" onClick={() => updateWeeklyFridaySelection(employee.employee_id, key === "saturday")} disabled={weeklyPlanSaving} data-testid={`salary-assign-${key === "saturday" ? "friday" : "saturday"}-${employee.employee_id}`}>
+                              {key === "saturday" ? "PAY · Friday" : "Move to Saturday"}
+                            </Btn>}
+                            {employee.remaining_cents > 0 && !employee.salary_rate_missing && <Btn className="h-9 px-3 text-xs" onClick={() => setWeeklyPaymentModal({
+                              employee,
+                              paymentDate: key === "friday" ? weeklyPlan.friday_date : weeklyPlan.saturday_date,
+                              amount: String(employee.remaining_cents / 100),
+                              notes: "",
+                            })} disabled={!!savingIds[employee.employee_id]} data-testid={`salary-record-payment-${employee.employee_id}`}>
+                              Record payment
+                            </Btn>}
+                          </div>
+                        </div>
+                        <div className="grid gap-3 rounded-xl border border-slate-200 bg-slate-50/70 p-3 sm:grid-cols-[1fr_auto]">
+                          <label className="block text-xs font-semibold text-slate-600">
+                            Fixed weekly salary (R)
+                            <span className="mt-1 flex gap-2">
+                              <input
+                                type="number" min="0.01" step="0.01"
+                                value={weeklySalaryDrafts[employee.employee_id] ?? ""}
+                                onChange={(event) => setWeeklySalaryDrafts((current) => ({
+                                  ...current, [employee.employee_id]: event.target.value,
+                                }))}
+                                disabled={!!savingIds[employee.employee_id] || hasPayment}
+                                className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-sm"
+                                data-testid={`salary-fixed-rate-${employee.employee_id}`}
+                              />
+                              <Btn
+                                variant="outline" className="h-9 px-3 text-xs"
+                                onClick={() => saveWeeklySalary(employee)}
+                                disabled={!!savingIds[employee.employee_id] || hasPayment}
+                                data-testid={`salary-fixed-rate-save-${employee.employee_id}`}
+                              >Save</Btn>
+                            </span>
+                          </label>
+                          <div className="grid grid-cols-2 gap-2 sm:min-w-[320px]">
+                            <label className="block text-xs font-semibold text-slate-600">
+                              Overtime hours
+                              <input
+                                type="number" min="0" max="168" step="0.25"
+                                value={weeklyOvertimeDrafts[employee.employee_id] ?? "0"}
+                                onChange={(event) => setWeeklyOvertimeDrafts((current) => ({
+                                  ...current, [employee.employee_id]: event.target.value,
+                                }))}
+                                disabled={!!savingIds[employee.employee_id] || hasPayment}
+                                className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-sm"
+                                data-testid={`salary-overtime-hours-${employee.employee_id}`}
+                              />
+                            </label>
+                            <label className="block text-xs font-semibold text-slate-600">
+                              Overtime rate (R/hour)
+                              <input
+                                type="number" min="0" step="0.01"
+                                value={weeklyOvertimeRateDrafts[employee.employee_id] ?? "21"}
+                                onChange={(event) => setWeeklyOvertimeRateDrafts((current) => ({
+                                  ...current, [employee.employee_id]: event.target.value,
+                                }))}
+                                disabled={!!savingIds[employee.employee_id] || hasPayment}
+                                className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-sm"
+                                data-testid={`salary-overtime-rate-${employee.employee_id}`}
+                              />
+                            </label>
+                            <Btn
+                              className="col-span-2 h-9 px-3 text-xs"
+                              onClick={() => saveWeeklyOvertime(employee)}
+                              disabled={!!savingIds[employee.employee_id] || hasPayment}
+                              data-testid={`salary-overtime-save-${employee.employee_id}`}
+                            >Save overtime</Btn>
+                          </div>
+                          {hasPayment && <p className="text-[11px] text-slate-500 sm:col-span-2">Payroll is locked after the first payment; saved salary and overtime values remain unchanged.</p>}
+                        </div>
+                        <div className="grid grid-cols-2 gap-3 border-y border-slate-100 py-3 sm:grid-cols-3">
+                          <div><p className="text-[10px] font-semibold uppercase text-slate-500">Balance</p><p className="mt-1 font-mono font-semibold">{fmtMoney(Number(employee.balance_before_period || 0))}</p></div>
+                          <div><p className="text-[10px] font-semibold uppercase text-slate-500">Balance cut</p><p className="mt-1 font-mono font-semibold text-red-600">−{fmtMoney(Number(employee.balance_cut || 0))}</p></div>
+                          <div><p className="text-[10px] font-semibold uppercase text-slate-500">Balance after cut</p><p className="mt-1 font-mono font-semibold">{fmtMoney(Number(employee.balance_after_period || 0))}</p></div>
+                          <div><p className="text-[10px] font-semibold uppercase text-slate-500">Gross salary</p><p className="mt-1 font-mono font-semibold">{fmtMoney(Number(employee.gross_salary || 0))}</p></div>
+                          <div className="rounded-lg bg-red-50 p-2"><p className="text-[10px] font-semibold uppercase text-red-700">Salary after balance cut</p><p className="mt-1 font-mono font-bold text-red-700">{fmtMoney(employee.due_cents / 100)}</p></div>
+                          <div className="rounded-lg bg-lime-950 p-2 ring-1 ring-lime-400/50 shadow-[0_0_16px_rgba(163,230,53,0.2)]"><p className="text-[10px] font-bold uppercase text-lime-300">Take-home salary</p><p className="mt-1 font-mono text-lg font-extrabold text-lime-300">{fmtMoney(employee.remaining_cents / 100)}</p></div>
+                          <div><p className="text-[10px] font-semibold uppercase text-slate-500">Actually paid</p><p className="mt-1 font-mono font-semibold">{fmtMoney(employee.paid_cents / 100)}</p></div>
+                          <div><p className="text-[10px] font-semibold uppercase text-slate-500">Outstanding</p><p className="mt-1 font-mono font-semibold">{fmtMoney(employee.remaining_cents / 100)}</p></div>
+                          <div><p className="text-[10px] font-semibold uppercase text-slate-500">Payment date</p><p className="mt-1 text-sm font-medium">{paymentsForEmployee.length ? paymentsForEmployee.map((payment) => payment.payment_date).join(", ") : "Not paid"}</p></div>
+                        </div>
+                        {paymentsForEmployee.length > 0 && <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-500" aria-label={`Payment history for ${employee.employee_name}`}>
+                          {paymentsForEmployee.map((payment) => <span key={payment.id}>{payment.payment_date}: {fmtMoney(Number(payment.amount_cents || 0) / 100)}{payment.legacy ? " · legacy payment" : ""}</span>)}
+                        </div>}
+                      </article>;
+                    })}
+                  </div>}
+              </Card>;
+            })}
+          </div> : <div className="rounded-2xl border border-slate-200 bg-white p-8 text-center text-sm text-slate-500" role="status">Loading Friday and Saturday groups…</div>}
+        </section> : <section className="hidden space-y-4" aria-label="Employee payroll">
           <div className="flex flex-wrap items-end justify-between gap-3">
             <div>
               <h3 className="font-display text-xl font-semibold text-slate-950">Employee payroll</h3>
               <p className="mt-1 text-xs text-slate-500">
                 {periodType === "weekly"
-                  ? `${displayDate(weekStart)} – ${displayDate(selectedSunday)}`
+                  ? `${displayDate(period?.start)} – ${displayDate(period?.end)}`
                   : displayMonth(monthValue)}
                 {report ? ` · ${report.employees.length} employees` : ""}
               </p>
@@ -936,8 +1760,28 @@ export default function SalariesManagement() {
                         [employee.employee_id]: forceOpen ? true : !current[employee.employee_id],
                       }))}
                       onIncludeChange={(included) => setMonthlyIncluded((current) => ({ ...current, [employee.employee_id]: included }))}
-                      rateValue={rateDrafts[employee.employee_id] ?? ""}
+                      rateValue={row.payment?.calculation_snapshot
+                        ? String(row.monthly ? (employee.monthly_salary ?? "") : (employee.weekly_salary ?? ""))
+                        : rateDrafts[employee.employee_id] ?? ""}
                       onRateChange={(value) => setRateDrafts((current) => ({ ...current, [employee.employee_id]: value }))}
+                      configuration={row.payment?.calculation_snapshot
+                        ? payrollConfigFromEmployee(employee)
+                        : configurationDrafts[employee.employee_id] || payrollConfigFromEmployee(employee)}
+                      onConfigurationChange={(field, value) => {
+                        setConfigurationDrafts((current) => ({
+                          ...current,
+                          [employee.employee_id]: {
+                            ...(current[employee.employee_id] || payrollConfigFromEmployee(employee)),
+                            [field]: value,
+                          },
+                        }));
+                        if (field === "pay_mode") {
+                          const nextRate = value === "monthly"
+                            ? employee.monthly_salary ?? ""
+                            : employee.weekly_salary ?? "";
+                          setRateDrafts((current) => ({ ...current, [employee.employee_id]: String(nextRate) }));
+                        }
+                      }}
                       paymentDate={paymentDates[employee.employee_id] || today()}
                       onPaymentDateChange={(value) => setPaymentDates((current) => ({ ...current, [employee.employee_id]: value }))}
                       saving={!!savingIds[employee.employee_id]}
@@ -957,7 +1801,7 @@ export default function SalariesManagement() {
             <span>{reportRows.length} employees included · {includedPaidRows.length} settled</span>
             <span>Attendance and cuts update current payroll; recorded payments stay unchanged.</span>
           </div>
-        </section>
+        </section>}
 
       </> : <Card className="overflow-hidden">
         <div className="border-b border-border p-4">
@@ -993,6 +1837,26 @@ export default function SalariesManagement() {
           <div className="flex justify-end gap-2">
             <Btn variant="outline" onClick={() => setAdvanceModal(null)}>Cancel</Btn>
             <Btn onClick={saveAdvance}>Save borrowed balance</Btn>
+          </div>
+        </div>}
+      </Modal>
+      <Modal open={!!weeklyPaymentModal} onClose={() => !savingIds[weeklyPaymentModal?.employee?.employee_id] && setWeeklyPaymentModal(null)} title={"Record salary payment — " + (weeklyPaymentModal?.employee?.employee_name || "")}>
+        {weeklyPaymentModal && <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-3 rounded-xl bg-slate-50 p-4 text-sm">
+            <div><p className="text-xs text-slate-500">Salary due</p><p className="mt-1 font-mono font-semibold">{fmtMoney(weeklyPaymentModal.employee.due_cents / 100)}</p></div>
+            <div><p className="text-xs text-slate-500">Outstanding before payment</p><p className="mt-1 font-mono font-semibold">{fmtMoney(weeklyPaymentModal.employee.remaining_cents / 100)}</p></div>
+          </div>
+          <Input label="Amount actually paid (R)" type="number" min="0.01" max={weeklyPaymentModal.employee.remaining_cents / 100} step="0.01" value={weeklyPaymentModal.amount}
+            onChange={(event) => setWeeklyPaymentModal((current) => ({ ...current, amount: event.target.value }))} data-testid="weekly-salary-payment-amount" />
+          <Input label="Actual payment date" type="date" min={weeklyPlan?.friday_date} max={weeklyPlan?.saturday_date} value={weeklyPaymentModal.paymentDate}
+            onChange={(event) => setWeeklyPaymentModal((current) => ({ ...current, paymentDate: event.target.value }))} data-testid="weekly-salary-payment-date" />
+          <Input label="Notes (optional)" value={weeklyPaymentModal.notes}
+            onChange={(event) => setWeeklyPaymentModal((current) => ({ ...current, notes: event.target.value }))} data-testid="weekly-salary-payment-notes" />
+          <div className="flex justify-end gap-2">
+            <Btn variant="outline" onClick={() => setWeeklyPaymentModal(null)} disabled={!!savingIds[weeklyPaymentModal.employee.employee_id]}>Cancel</Btn>
+            <Btn onClick={recordWeeklySalaryPayment} disabled={!!savingIds[weeklyPaymentModal.employee.employee_id]} data-testid="weekly-salary-payment-confirm">
+              {savingIds[weeklyPaymentModal.employee.employee_id] ? "Recording..." : "Confirm payment"}
+            </Btn>
           </div>
         </div>}
       </Modal>

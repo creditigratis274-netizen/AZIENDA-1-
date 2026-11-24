@@ -50,6 +50,7 @@ export default function Attendance() {
   const [newDepartmentName, setNewDepartmentName] = useState("");
   const [departmentSaving, setDepartmentSaving] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [employeeSearch, setEmployeeSearch] = useState("");
   const [attendanceReportDownloading, setAttendanceReportDownloading] = useState(false);
   const [attendanceSaving, setAttendanceSaving] = useState({});
   const [section, setSection] = useState("attendance");
@@ -99,7 +100,11 @@ export default function Attendance() {
     return () => { activeRequest = false; };
   }, [date]);
 
-  const active = employees.filter((e) => e.active !== false);
+  const active = employees.filter((e) => e.active !== false).filter((e) => {
+    const search = employeeSearch.trim().toLocaleLowerCase();
+    if (!search) return true;
+    return `${e.name || ""} ${e.id || ""} ${employeeDepartment(e) || ""}`.toLocaleLowerCase().includes(search);
+  });
   const employeeDepartmentOptions = isIqfoamWholesaler || isImraanPlastics
     ? companyDepartments
     : DEPTS;
@@ -565,6 +570,7 @@ export default function Attendance() {
       <>
       <div className="flex flex-wrap items-end gap-4">
         <div className="w-48"><Input label="Date" type="date" value={date} onChange={(e) => { setDate(e.target.value); setWorkTimeDraft({}); setShiftModeDraft({}); }} data-testid="attendance-date-input" /></div>
+        <div className="w-72"><Input label="Search employee" value={employeeSearch} onChange={(e) => setEmployeeSearch(e.target.value)} placeholder="Name, ID or department" data-testid="attendance-employee-search" /></div>
       </div>
       <div className={`grid grid-cols-2 ${isSuperIqFoam ? "lg:grid-cols-4" : "lg:grid-cols-5"} gap-4`}>
         <Stat l="Present (day)" v={loading ? "..." : present} cls="text-emerald-600" k="day-present" />

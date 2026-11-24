@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { api, apiError } from "@/lib/api";
@@ -22,6 +22,47 @@ const MOVE_TYPES = [
 ];
 const TYPE_LABEL = { production: "Production Received", production_consumption: "Production Material Used", purchase: "Purchase Received", dispatch: "Delivery Dispatched", invoice: "Invoice Submitted", adjustment_in: "Adjustment In", adjustment_out: "Adjustment Out", return: "Return", damage: "Damage/Waste", reversal: "Reversal" };
 const sign = (m) => (m.direction ? m.direction : ["production", "purchase", "adjustment_in", "return"].includes(m.type) ? 1 : -1);
+const STOCK_PRODUCT_ORDER = ["Simple", "Ribbon Black", "Ribbon Pink", "Strong Boy", "Candy", "Uncovered", "Uncovered Blue 16 Density"];
+const STOCK_SIZE_ORDER = ["50", "75", "100", "120", "125", "150"];
+const PCS_OUT_SIZES = [760, 910, 1070, 1370].flatMap((width) =>
+  STOCK_SIZE_ORDER.map((depth) => `${width}x${depth}`)
+);
+
+const stockSizeValue = (size) => {
+  const match = String(size || "").match(/(?:^|x)(50|75|100|120|125|150)(?:$|x)/i);
+  return match ? match[1] : "";
+};
+
+const compareStockProducts = (a, b) => {
+  const normalize = (value) => canonicalStockProduct(value, STOCK_CATEGORY).toLocaleLowerCase();
+  const indexA = STOCK_PRODUCT_ORDER.findIndex((name) => normalizeStockLabel(normalize(name)) === normalize(a));
+  const indexB = STOCK_PRODUCT_ORDER.findIndex((name) => normalizeStockLabel(normalize(name)) === normalize(b));
+  if (indexA >= 0 || indexB >= 0) {
+    if (indexA < 0) return 1;
+    if (indexB < 0) return -1;
+    if (indexA !== indexB) return indexA - indexB;
+  }
+  return String(a || "").localeCompare(String(b || ""));
+};
+
+const compareStockSizes = (a, b) => {
+  const widthValue = (size) => {
+    const match = String(size || "").match(/^(760|910|1070|1370)[x×](50|75|100|120|125|150)$/i);
+    return match ? Number(match[1]) : 0;
+  };
+  const widthA = widthValue(a);
+  const widthB = widthValue(b);
+  if (widthA !== widthB) return widthA - widthB;
+  const indexA = STOCK_SIZE_ORDER.indexOf(stockSizeValue(a));
+  const indexB = STOCK_SIZE_ORDER.indexOf(stockSizeValue(b));
+  if (indexA !== indexB) {
+    if (indexA < 0) return 1;
+    if (indexB < 0) return -1;
+    return indexA - indexB;
+  }
+  return String(a || "").localeCompare(String(b || ""), undefined, { numeric: true });
+};
+
 const STOCK_CATEGORY = {
   "Ribbon Black": ["Ribbon Black", "Ribbon Balck", "Black"],
   "Ribbon Balck": ["Ribbon Black", "Black"],
@@ -54,6 +95,49 @@ export default function Stock() {
   const [pcsOutDraft, setPcsOutDraft] = useState({ product: "", size: "", quantity: "" });
   const [savingPcsOut, setSavingPcsOut] = useState(false);
   const [downloadingRangeReport, setDownloadingRangeReport] = useState(false);
+
+  const pcsOutCatalog = useMemo(() => {
+    const standardCategories = ["Simple", "Ribbon Black", "Ribbon Pink", "Strong Boy", "Candy", "Uncovered", "Uncovered Blue 16 Density"];
+    const categories = new Map();
+    (list || []).forEach((stock) => {
+      const rawProduct = String(stock.product || "").trim();
+      const product = canonicalStockProduct(rawProduct === "Standard" ? "Simple" : rawProduct, STOCK_CATEGORY);
+      if (product) categories.set(normalizeStockLabel(product), product);
+    });
+    (prices || []).forEach((price) => {
+      const rawCategory = String(price.category || "");
+      const normalizedCategory = ["Standard", "Simple/Mix color", "Simple/Mix Color"].includes(rawCategory) ? "Simple" : rawCategory;
+      const product = canonicalStockProduct(normalizedCategory, STOCK_CATEGORY);
+      if (product) categories.set(normalizeStockLabel(product), product);
+    });
+    standardCategories.forEach((product) => {
+      categories.set(normalizeStockLabel(product), product);
+    });
+    const sortedCategories = standardCategories
+      .filter((product) => [...categories.values()].some((value) => normalizeStockLabel(value) === normalizeStockLabel(product)))
+      .sort(compareStockProducts);
+    const sizesByCategory = new Map();
+    sortedCategories.forEach((product) => {
+      const sizes = new Map();
+      (list || []).filter((stock) => {
+        const rawProduct = String(stock.product || "").trim();
+        return canonicalStockProduct(rawProduct === "Standard" ? "Simple" : rawProduct, STOCK_CATEGORY) === product;
+      }).forEach((stock) => { if (stock.size) sizes.set(normalizeStockLabel(stock.size), String(stock.size)); });
+      (prices || []).filter((price) => {
+        const rawCategory = String(price.category || "");
+        const normalizedCategory = ["Standard", "Simple/Mix color", "Simple/Mix Color"].includes(rawCategory) ? "Simple" : rawCategory;
+        return canonicalStockProduct(normalizedCategory, STOCK_CATEGORY) === product;
+      }).forEach((price) => { if (price.size) sizes.set(normalizeStockLabel(price.size), String(price.size)); });
+      const widthOrder = [760, 910, 1070, 1370];
+      const sizeOrder = [50, 75, 100, 120, 125, 150];
+      const allowedSizes = [];
+      widthOrder.forEach((width) => sizeOrder.forEach((depth) => {
+        allowedSizes.push(`${width}x${depth}`);
+      }));
+      sizesByCategory.set(product, allowedSizes.sort(compareStockSizes));
+    });
+    return { categories: sortedCategories, sizesByCategory };
+  }, [list, prices]);
   const [valueZone, setValueZone] = useState(1);
   const canManagePcsOut = isSuperIqFoam && user?.is_primary_owner && user?.is_owner;
 
@@ -507,7 +591,6 @@ export default function Stock() {
                   <tr>
                     <th className="p-2">Category</th>
                     <th className="p-2">Size</th>
-                    <th className="p-2">Product ID</th>
                     <th className="p-2 text-right">Book balance</th>
                     <th className="p-2">Pieces made to stock today</th>
                     <th className="p-2 text-right">Pcs Out</th>
@@ -519,11 +602,12 @@ export default function Stock() {
                   </tr>
                 </thead>
                 <tbody>
-                  {dailyCountSheet.rows.map((row) => (
+                  {[...dailyCountSheet.rows].sort((a, b) =>
+                    compareStockProducts(a.product, b.product) || compareStockSizes(a.size, b.size)
+                  ).map((row) => (
                     <tr key={row.key} className="border-b border-slate-100">
                       <td className="p-2 font-medium">{row.product}</td>
                       <td className="p-2">{row.size}</td>
-                      <td className="p-2 font-mono">{row.product_id || "—"}</td>
                       <td className="p-2 text-right font-mono">{row.book_quantity}</td>
                       <td className="p-2">
                         <Input
@@ -605,18 +689,24 @@ export default function Stock() {
             </p>
           </div>
           <div className="grid items-end gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_10rem_auto]">
-            <Input
+            <Select
               label="Product"
               value={pcsOutDraft.product}
-              onChange={(event) => setPcsOutDraft((current) => ({ ...current, product: event.target.value }))}
+              onChange={(event) => setPcsOutDraft((current) => ({ ...current, product: event.target.value, size: "" }))}
               data-testid="pcs-out-product"
-            />
-            <Input
+            >
+              <option value="">Select product</option>
+              {pcsOutCatalog.categories.map((product) => <option key={product} value={product}>{product}</option>)}
+            </Select>
+            <Select
               label="Size"
               value={pcsOutDraft.size}
               onChange={(event) => setPcsOutDraft((current) => ({ ...current, size: event.target.value }))}
               data-testid="pcs-out-size"
-            />
+            >
+              <option value="">Select size</option>
+              {PCS_OUT_SIZES.map((size) => <option key={size} value={size}>{size}</option>)}
+            </Select>
             <Input
               label="Pieces"
               type="number"
