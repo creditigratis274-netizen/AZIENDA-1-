@@ -564,6 +564,8 @@ def test_superiqfoam_worker_can_only_write_orders_with_explicit_permissions():
     # Explicit worker permissions allow only order creation and editing.
     server.enforce_superiqfoam_read_only(request("POST", "/api/orders"), worker)
     server.enforce_superiqfoam_read_only(request("PUT", "/api/orders/order-1"), worker)
+    server.enforce_worker_api_access(request("POST", "/api/orders"), worker)
+    server.enforce_worker_api_access(request("PUT", "/api/orders/order-1"), worker)
 
     # No permission, a denied operation, other sections, and deletion stay blocked.
     with pytest.raises(HTTPException) as denied_delete:
