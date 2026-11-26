@@ -69,6 +69,7 @@ export default function InvoiceList({ express = false }) {
   const [printPreviewLoading, setPrintPreviewLoading] = useState(false);
   const [printPreviewOpen, setPrintPreviewOpen] = useState(false);
   const [batchPrintResult, setBatchPrintResult] = useState(null);
+  const [batchDownloadBusy, setBatchDownloadBusy] = useState(false);
   const [viewOpen, setViewOpen] = useState(false);
   const [viewLoading, setViewLoading] = useState(false);
   const [viewInvoice, setViewInvoice] = useState(null);
@@ -528,6 +529,36 @@ export default function InvoiceList({ express = false }) {
       setPrintPreviewLoading(false);
     }
   };
+  const downloadSelectedInvoices = async () => {
+    if (!printPreview.length || batchDownloadBusy) return;
+    setBatchDownloadBusy(true);
+    let downloaded = 0;
+    let failed = 0;
+    try {
+      for (let index = 0; index < printPreview.length; index += 1) {
+        const document = printPreview[index];
+        const element = batchPrintRefs.current.get(index);
+        if (!element) {
+          failed += 1;
+          continue;
+        }
+        try {
+          await elementToPdf(
+            element,
+            `${documentFilename("Invoice", document.invoice.customer_name || "Customer", document.invoice.number || "Draft")}.pdf`,
+          );
+          downloaded += 1;
+        } catch (error) {
+          failed += 1;
+        }
+      }
+      if (downloaded) toast.success(`${downloaded} invoice PDF(s) downloaded${failed ? `; ${failed} failed` : ""}`);
+      else toast.error("Could not download the selected invoices.");
+    } finally {
+      setBatchDownloadBusy(false);
+    }
+  };
+
   const printSelectedInvoices = () => {
     if (!printPreview.length) return;
     if (!window.confirm(`Print ${printPreview.length} invoice(s)? Check the preview to avoid accidental duplicate printing.`)) return;
@@ -804,11 +835,16 @@ export default function InvoiceList({ express = false }) {
           <Trash2 size={15} /> {showArchived ? "Permanently delete selected" : "Delete selected"}
         </Btn>
       </div>}
-      {printSel.length > 0 && <div className="flex items-center justify-between rounded-xl border border-blue-200 bg-blue-50 px-4 py-2" data-testid="batch-print-bar">
-        <span className="text-sm font-semibold text-blue-900">{printSel.length} invoice(s) selected for printing</span>
-        <Btn onClick={prepareBatchPrint} disabled={printPreviewLoading} data-testid="print-selected-invoices">
-          <Printer size={15} /> {printPreviewLoading ? "Preparing preview..." : "Print Selected"}
-        </Btn>
+      {printSel.length > 0 && <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-blue-200 bg-blue-50 px-4 py-2" data-testid="batch-print-bar">
+        <span className="text-sm font-semibold text-blue-900">{printSel.length} invoice(s) selected</span>
+        <div className="flex flex-wrap gap-2">
+          <Btn variant="outline" onClick={prepareBatchPrint} disabled={printPreviewLoading || batchDownloadBusy} data-testid="download-selected-invoices">
+            <Download size={15} /> {printPreviewLoading ? "Preparing preview..." : batchDownloadBusy ? "Downloading..." : "Download Selected"}
+          </Btn>
+          <Btn onClick={prepareBatchPrint} disabled={printPreviewLoading || batchDownloadBusy} data-testid="print-selected-invoices">
+            <Printer size={15} /> {printPreviewLoading ? "Preparing preview..." : "Print Selected"}
+          </Btn>
+        </div>
       </div>}
 
       <Card className="overflow-hidden">
@@ -1223,6 +1259,9 @@ export default function InvoiceList({ express = false }) {
           </div>
           <div className="flex flex-wrap justify-end gap-2">
             <Btn variant="outline" onClick={() => setPrintPreviewOpen(false)}>Close</Btn>
+            <Btn variant="outline" onClick={downloadSelectedInvoices} disabled={!printPreview.length || batchDownloadBusy} data-testid="confirm-download-selected">
+              <Download size={15} /> {batchDownloadBusy ? "Downloading..." : "Download Selected"}
+            </Btn>
             <Btn onClick={printSelectedInvoices} disabled={!printPreview.length} data-testid="confirm-print-selected">
               <Printer size={15} /> Print Selected
             </Btn>

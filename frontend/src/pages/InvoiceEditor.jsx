@@ -17,7 +17,7 @@ import {
 import { PAYMENT_METHODS } from "@/lib/paymentMethods";
 import { useAuth } from "@/context/AuthContext";
 import { Card, Btn, Input, Select, Textarea, Badge, Modal } from "@/components/common";
-import { Copy, Download, Save, Send, CreditCard, Plus, Trash2, ArrowLeft, Ban, Printer, AlertTriangle, Pencil, X, History, Eye, EyeOff, Archive, Check, SlidersHorizontal } from "lucide-react";
+import { Copy, Download, Save, Send, CreditCard, Plus, Trash2, ArrowLeft, Ban, Printer, AlertTriangle, Pencil, X, History, Eye, EyeOff, Archive } from "lucide-react";
 import {
   canonicalInvoiceCategory,
   canonicalInvoiceSize,
@@ -150,10 +150,6 @@ export default function InvoiceEditor({ express = false }) {
   const [pendingInvoiceAction, setPendingInvoiceAction] = useState(null);
   const [authorizingEdit, setAuthorizingEdit] = useState(false);
   const [compactPreview, setCompactPreview] = useState(false);
-  const [invoiceLayoutMode, setInvoiceLayoutMode] = useState(() => {
-    return localStorage.getItem("invoice-layout-mode") === "legacy" ? "legacy" : "current";
-  });
-  const [invoiceLayoutMenuOpen, setInvoiceLayoutMenuOpen] = useState(false);
   const deliveryNoteRef = useRef(null);
   const locked = !!id && !editing;
   const invoiceItemPriceLocked = user?.is_worker && !user?.can_edit_invoice_prices;
@@ -1165,37 +1161,9 @@ export default function InvoiceEditor({ express = false }) {
           <Btn variant="outline" onClick={downloadDeliveryNote} disabled={pdfBusy || !inv.customer_name || !invoiceDeliveryNote.items.length} data-testid="download-delivery-note-btn">
             <Download size={15} /> {pdfBusy ? "Generating PDF..." : "Download Delivery Note PDF"}
           </Btn>
-          <div className="relative">
-            <button
-              type="button"
-              onClick={() => setInvoiceLayoutMenuOpen((open) => !open)}
-              aria-expanded={invoiceLayoutMenuOpen}
-              className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 hover:border-primary hover:text-primary transition-colors"
-              data-testid="invoice-layout-menu"
-            >
-              <SlidersHorizontal size={15} /> Invoice Layout: {invoiceLayoutMode === "legacy" ? "Legacy" : "Current"}
-            </button>
-            {invoiceLayoutMenuOpen && <div className="absolute right-0 top-11 z-40 w-56 rounded-xl border border-slate-200 bg-white p-2 shadow-lg" data-testid="invoice-layout-options">
-              {[['current', 'Current layout'], ['legacy', 'Legacy layout']].map(([mode, label]) => <button
-                type="button"
-                key={mode}
-                onClick={() => {
-                  setInvoiceLayoutMode(mode);
-                  localStorage.setItem("invoice-layout-mode", mode);
-                  setInvoiceLayoutMenuOpen(false);
-                  toast.success(`${label} selected`);
-                }}
-                className={`flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm font-semibold ${invoiceLayoutMode === mode ? 'bg-emerald-50 text-emerald-800' : 'text-slate-700 hover:bg-slate-50'}`}
-                data-testid={`invoice-layout-${mode}`}
-              >
-                {label}
-                {invoiceLayoutMode === mode && <Check size={15} />}
-              </button>)}
-            </div>}
-          </div>
           <button onClick={() => setCompactPreview((v) => !v)} className="inline-flex items-center gap-1.5 h-9 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 hover:border-primary hover:text-primary transition-colors" data-testid="toggle-invoice-preview-mode">
             {compactPreview ? <Eye size={15} /> : <EyeOff size={15} />}
-            {compactPreview ? "Show invoice form" : "Hide invoice form"}
+            {compactPreview ? "Show sections" : "Hide sections"}
           </button>
           <Badge cls={st.cls}>{st.label}</Badge>
           {inv.opening_balance && <Badge cls="bg-violet-50 text-violet-700 border-violet-200">Opening Balance</Badge>}
@@ -1227,24 +1195,9 @@ export default function InvoiceEditor({ express = false }) {
         </div>
       )}
 
-      <div className={`grid items-start gap-6 ${invoiceLayoutMode === "legacy"
-        ? "grid-cols-1 xl:grid-cols-5"
-        : compactPreview
-          ? "grid-cols-1 lg:grid-cols-[minmax(0,1fr)_560px]"
-          : "grid-cols-1 lg:grid-cols-[minmax(0,1fr)_560px]"}`}>
+      <div className={`grid gap-6 ${compactPreview ? "grid-cols-1 xl:grid-cols-[1fr_420px]" : "grid-cols-1 xl:grid-cols-5"}`}>
         {!compactPreview && (
-          <div
-            className={invoiceLayoutMode === "legacy"
-              ? "xl:col-span-3 space-y-6 min-w-0"
-              : "invoice-form-scroll-zone h-[calc(100vh-200px)] min-h-[680px] max-h-[860px] space-y-6 overflow-y-auto overscroll-contain rounded-lg border border-slate-200/80 bg-white p-4 pr-3 shadow-[0_5px_18px_rgba(15,23,42,0.04)] [&::-webkit-scrollbar]:w-3 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-white [&::-webkit-scrollbar-thumb]:bg-slate-300 [&::-webkit-scrollbar-track]:rounded-full [&::-webkit-scrollbar-track]:bg-slate-100"}
-          >
-          <div className="mb-4 flex items-center justify-between border-b border-slate-100 pb-3">
-            <div>
-              <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-[#39806b]">Invoice details</p>
-              <h3 className="mt-0.5 font-display text-lg font-semibold text-slate-950">Customer, products &amp; payment</h3>
-            </div>
-            <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-semibold text-slate-500">{inv.status === "draft" ? "Draft" : inv.status}</span>
-          </div>
+          <div className="xl:col-span-3 space-y-6 min-w-0">
           <fieldset disabled={locked} className="space-y-6 min-w-0" data-testid="invoice-form">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <Card className="p-5"><h3 className="font-bold text-slate-800 font-display mb-4 flex items-center gap-2">1. Customer Information</h3>
@@ -1486,27 +1439,15 @@ export default function InvoiceEditor({ express = false }) {
             </div>
           </div>
         )}
-        <div className={invoiceLayoutMode === "legacy" ? "xl:col-span-2 min-w-0" : (compactPreview ? "lg:col-start-2 lg:row-start-1 min-w-0" : "min-w-0")}>
-          <div className="space-y-3 no-print" data-testid="invoice-preview">
+        <div className={compactPreview ? "xl:col-start-2 xl:row-start-1 min-w-0" : "xl:col-span-2 min-w-0"}>
+          <div className="xl:sticky xl:top-20 space-y-3 no-print" data-testid="invoice-preview">
             <div className="grid grid-cols-2 rounded-lg bg-white border border-border p-1">
               <button className="rounded-md bg-primary text-white py-2 text-sm font-semibold" data-testid="tab-preview">Invoice Preview</button>
               <button onClick={downloadPDF} disabled={busy || pdfBusy} className="rounded-md py-2 text-sm font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-50" data-testid="tab-pdf">{busy ? "Issuing..." : pdfBusy ? "Generating PDF..." : "Download PDF"}</button>
             </div>
-            <Card className="p-3">
-              <div
-                className={invoiceLayoutMode === "legacy"
-                  ? "overflow-hidden"
-                  : "invoice-preview-scroll h-[calc(100vh-200px)] min-h-[680px] max-h-[860px] overflow-y-scroll overflow-x-auto overscroll-contain rounded-md border border-slate-200 bg-slate-100 p-2 [&::-webkit-scrollbar]:w-3 [&::-webkit-scrollbar]:h-3 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-400 [&::-webkit-scrollbar-track]:rounded-full [&::-webkit-scrollbar-track]:bg-slate-100"}
-                tabIndex={0}
-                role="region"
-                aria-label="Scrollable invoice preview"
-                style={{ scrollbarGutter: "stable" }}
-              >
-                <FitPreview>
-                  <InvoiceDocument inv={inv} totals={totals} settings={settings} customer={custObj} previousInvoices={previousInvoices} customerBalanceBeforeInvoice={customerBalanceBeforeInvoice} showCustomerBalance={showCustomerBalance} />
-                </FitPreview>
-              </div>
-            </Card>
+            <Card className="p-3 overflow-hidden"><FitPreview>
+              <InvoiceDocument inv={inv} totals={totals} settings={settings} customer={custObj} previousInvoices={previousInvoices} customerBalanceBeforeInvoice={customerBalanceBeforeInvoice} showCustomerBalance={showCustomerBalance} />
+            </FitPreview></Card>
           </div>
           {loadingPreviousInvoices && !id && inv.customer_id && <p className="no-print text-xs text-slate-500" role="status">Loading previous invoice balances...</p>}
           {showCustomerBalance && !id && !inv.opening_balance && previousInvoices.length > 0 && <div className="no-print rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950" data-testid="previous-invoices-pending-summary">
