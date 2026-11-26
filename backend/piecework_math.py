@@ -122,24 +122,10 @@ def calculate_piecework(
             weekday_pay += Decimal(str(row["pay"]))
             daily.append(row)
 
-        saturday_rate = (
-            PIECEWORK_LOW_RATE
-            if daily_rate_tiers
-            else PIECEWORK_HIGH_RATE
-            if saturday_recorded and saturday_pieces >= SATURDAY_PIECEWORK_THRESHOLD
-            else PIECEWORK_LOW_RATE
-        )
-        saturday_high_pieces = (
-            0 if daily_rate_tiers
-            else saturday_pieces
-            if saturday_recorded and saturday_pieces >= SATURDAY_PIECEWORK_THRESHOLD
-            else 0
-        )
-        saturday_low_pieces = (
-            saturday_pieces
-            if daily_rate_tiers or saturday_recorded and saturday_pieces < SATURDAY_PIECEWORK_THRESHOLD
-            else 0
-        )
+        saturday_achieved = saturday_recorded and saturday_pieces >= SATURDAY_PIECEWORK_THRESHOLD
+        saturday_rate = PIECEWORK_HIGH_RATE if saturday_achieved else PIECEWORK_LOW_RATE
+        saturday_high_pieces = saturday_pieces if saturday_achieved else 0
+        saturday_low_pieces = 0 if saturday_achieved else saturday_pieces
         saturday_pay = Decimal(saturday_high_pieces) * PIECEWORK_HIGH_RATE + Decimal(saturday_low_pieces) * PIECEWORK_LOW_RATE
         daily.append({
             "date": saturday.isoformat(),

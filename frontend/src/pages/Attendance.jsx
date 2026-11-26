@@ -58,6 +58,8 @@ export default function Attendance() {
   const [workTimeDraft, setWorkTimeDraft] = useState({});
   const [shiftModeDraft, setShiftModeDraft] = useState({});
   const [workTimeSaving, setWorkTimeSaving] = useState({});
+  const [overtimeModal, setOvertimeModal] = useState(null);
+  const [overtimeSaving, setOvertimeSaving] = useState(false);
   const loadRequest = useRef(0);
   const attendanceSavingRef = useRef(new Set());
   const pieceSavingRef = useRef(new Set());
@@ -169,7 +171,7 @@ export default function Attendance() {
       department: employee.department || "",
       date,
       status,
-      overtime_hours: 0,
+      overtime_hours: status === "Absent" ? 0 : (previous?.overtime_hours ?? 0),
       start_time: status === "Absent" ? null : times.start_time,
       end_time: status === "Absent" ? null : times.end_time,
     };
@@ -228,6 +230,40 @@ export default function Attendance() {
       if (saved && startTime && endTime) toast.success(`Work times saved for ${employee.name}`);
     } finally {
       setWorkTimeSaving((current) => ({ ...current, [employee.id]: false }));
+    }
+  };
+  const saveOvertime = async () => {
+    if (!overtimeModal || overtimeSaving) return;
+    const employee = overtimeModal.employee;
+    const record = records.find((item) => item.employee_id === employee.id && item.date === date);
+    if (!record || !["Present", "Half Day"].includes(record.status)) {
+      toast.error("Mark the employee present before adding overtime.");
+      return;
+    }
+    const hours = Number(overtimeModal.hours);
+    if (!Number.isFinite(hours) || hours < 0 || hours > 24) {
+      toast.error("Overtime hours must be between 0 and 24.");
+      return;
+    }
+    const next = { ...record, overtime_hours: hours };
+    setOvertimeSaving(true);
+    setRecords((current) => current.map((item) =>
+      item.employee_id === employee.id && item.date === date ? next : item,
+    ));
+    try {
+      const saved = await api.post("/attendance", next);
+      setRecords((current) => current.map((item) =>
+        item.employee_id === employee.id && item.date === date ? saved : item,
+      ));
+      setOvertimeModal(null);
+      toast.success(`${hours} overtime hours saved for ${employee.name}`);
+    } catch (error) {
+      setRecords((current) => current.map((item) =>
+        item.employee_id === employee.id && item.date === date ? record : item,
+      ));
+      toast.error(apiError(error));
+    } finally {
+      setOvertimeSaving(false);
     }
   };
   const savePieceCount = async (employee) => {
@@ -652,6 +688,17 @@ export default function Attendance() {
                   <button disabled={!!attendanceSaving[e.id]} onClick={() => mark(e, "Present")} data-testid={`present-btn-${e.id}`} className={`h-12 w-32 rounded-xl text-sm font-bold border-2 transition-colors disabled:opacity-60 ${s === "Present" ? "bg-emerald-600 border-emerald-600 text-white" : "border-emerald-200 text-emerald-700 hover:bg-emerald-50"}`}>{attendanceSaving[e.id] && s === "Present" ? "Saving…" : "Present"}</button>
                   <button disabled={!!attendanceSaving[e.id]} onClick={() => mark(e, "Absent")} data-testid={`absent-btn-${e.id}`} className={`h-12 w-32 rounded-xl text-sm font-bold border-2 transition-colors disabled:opacity-60 ${s === "Absent" ? "bg-red-600 border-red-600 text-white" : "border-red-200 text-red-700 hover:bg-red-50"}`}>{attendanceSaving[e.id] && s === "Absent" ? "Saving…" : "Absent"}</button>
                 </>}
+                {["Present", "Half Day"].includes(s) && <>
+                  <Btn
+                    variant="outline"
+                    disabled={!!attendanceSaving[e.id]}
+                    onClick={() => setOvertimeModal({
+                      employee: e,
+                      hours: String(record?.overtime_hours ?? 0),
+                    })}
+                    data-testid={`attendance-overtime-${e.id}`}
+                  >Overtime: {Number(record?.overtime_hours || 0)} h</Btn>
+                </>}
                 {e.pay_type !== "piece" && ["Present", "Half Day"].includes(s) && <>
                   <div className="w-40"><Select label="Work shift" value={shiftMode} disabled={!!attendanceSaving[e.id] || !!workTimeSaving[e.id]}
                     onChange={(event) => {
@@ -691,6 +738,31 @@ export default function Attendance() {
               </div>);
           })}</div>
         </Card>))}
+      <Modal open={!!overtimeModal} onClose={() => !overtimeSaving && setOvertimeModal(null)} title="Add overtime hours">
+        {overtimeModal && <div className="space-y-4">
+          <p className="text-sm text-slate-700">
+            Enter overtime for <strong>{overtimeModal.employee.name}</strong> on <strong>{date}</strong>.
+          </p>
+          <Input
+            label="Overtime hours"
+            type="number"
+            min="0"
+            max="24"
+            step="0.25"
+            value={overtimeModal.hours}
+            onChange={(event) => setOvertimeModal((current) => current ? { ...current, hours: event.target.value } : current)}
+            disabled={overtimeSaving}
+            data-testid="attendance-overtime-input"
+          />
+          <div className="flex justify-end gap-2">
+            <Btn variant="outline" onClick={() => setOvertimeModal(null)} disabled={overtimeSaving}>Cancel</Btn>
+            <Btn onClick={saveOvertime} disabled={overtimeSaving} data-testid="attendance-overtime-save">
+              {overtimeSaving ? "Saving..." : "Save overtime"}
+            </Btn>
+          </div>
+        </div>}
+      </Modal>
+
       <Modal open={!!deleteEmployeeModal} onClose={() => setDeleteEmployeeModal(null)} title="Permanently delete employee">
         {deleteEmployeeModal && <div className="space-y-5">
           <p className="text-sm text-slate-700">

@@ -7,9 +7,9 @@ import { ClipboardList, Plus, Trash2, Pencil, ArrowRight, Eye, FileText, Printer
 import { useRef } from "react";
 import { useAuth } from "@/context/AuthContext";
 import { DeliveryNote, orderLines } from "@/components/DeliveryNote";
-import SmartProductionPlanner from "@/components/SmartProductionPlanner";
-import { elementToPdf, printElement } from "@/lib/pdf";
+import { elementToPdf, printElement, printElements } from "@/lib/pdf";
 import BarcodeScanner from "@/components/BarcodeScanner";
+import { invoiceMatchesCustomer, invoiceOrderItems } from "@/lib/orderInvoiceSelection.mjs";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -308,9 +308,11 @@ export default function Orders() {
   const [settings, setSettings] = useState({});
   const [viewInvoice, setViewInvoice] = useState(null);
   const [formDataLoading, setFormDataLoading] = useState(false);
-  const [selectedOrders, setSelectedOrders] = useState({});
-  const [smartArrangement, setSmartArrangement] = useState(null);
-  const [smartArrangementLoading, setSmartArrangementLoading] = useState(false);
+  const [printSelectedOrders, setPrintSelectedOrders] = useState({});
+  const [batchPrintOpen, setBatchPrintOpen] = useState(false);
+  const [batchPrintOrders, setBatchPrintOrders] = useState([]);
+  const [batchPrintLoading, setBatchPrintLoading] = useState(false);
+  const batchPrintRefs = useRef(new Map());
   const detailRequest = useRef(0);
   const products = useMemo(() => {
     const byName = new Map();
@@ -381,7 +383,7 @@ export default function Orders() {
     setFormDataLoading(true);
     Promise.all([
       api.get("/customers"),
-      api.get("/invoices"),
+      api.getUncached("/invoices"),
       api.get("/stock"),
       api.get("/prices"),
     ]).then(([customerData, invoiceData, stockData, priceData]) => {
@@ -399,21 +401,17 @@ export default function Orders() {
   }, [Boolean(modal), user?.company_id]);
 
   const vName = (id) => vehicles.find((v) => v.id === id)?.name;
-  const shown = list;
+  const shown = [...list].sort((left, right) => {
+    const leftTime = Date.parse(left.created_at || "") || 0;
+    const rightTime = Date.parse(right.created_at || "") || 0;
+    return rightTime - leftTime || String(right.reference || "").localeCompare(String(left.reference || ""), undefined, { numeric: true });
+  });
   const count = (status) => statusCounts[status] || 0;
   const load = () => setReload((current) => current + 1);
-  const canMakeSmartArrangement = user?.company_id === "superiqfoam"
-    && !user?.is_worker
-    && (user?.is_owner || user?.is_admin || user?.is_company_owner);
-  const selectableOrders = shown.filter((order) =>
-    ["To Send", "Preparing", "Assigned", "Partially Delivered"].includes(order.status),
-  );
-  const selectedOrderList = Object.values(selectedOrders);
-  const allVisibleSelected = selectableOrders.length > 0
-    && selectableOrders.every((order) => selectedOrders[order.id]);
+  const printSelectedOrderList = Object.values(printSelectedOrders);
 
-  const toggleOrderSelection = (order, checked) => {
-    setSelectedOrders((current) => {
+  const togglePrintOrderSelection = (order, checked) => {
+    setPrintSelectedOrders((current) => {
       const next = { ...current };
       if (checked) next[order.id] = order;
       else delete next[order.id];
@@ -421,10 +419,10 @@ export default function Orders() {
     });
   };
 
-  const toggleVisibleOrderSelection = (checked) => {
-    setSelectedOrders((current) => {
+  const toggleVisiblePrintSelection = (checked) => {
+    setPrintSelectedOrders((current) => {
       const next = { ...current };
-      for (const order of selectableOrders) {
+      for (const order of shown) {
         if (checked) next[order.id] = order;
         else delete next[order.id];
       }
@@ -432,47 +430,45 @@ export default function Orders() {
     });
   };
 
-  const generateSmartArrangement = async () => {
-    if (!canMakeSmartArrangement) return toast.error("Smart Production Planner is only available to SUPERIQFOAM administrators.");
-    if (!selectedOrderList.length) return toast.error("Select at least one open order.");
-    setSmartArrangementLoading(true);
+  const prepareBatchOrderPrint = async () => {
+    if (!printSelectedOrderList.length || batchPrintLoading) return;
+    setBatchPrintLoading(true);
+    batchPrintRefs.current.clear();
     try {
-      const plan = await api.post("/orders/smart-production-arrangements", {
-        order_ids: selectedOrderList.map((order) => order.id),
-      });
-      setSmartArrangement(plan);
-    } catch (error) {
-      toast.error(apiError(error));
+      const documents = await Promise.all(printSelectedOrderList.map(async (order) => {
+        let invoiceSnapshot = null;
+        if (order.invoice_id) {
+          try {
+            const invoice = await api.get(`/invoices/${order.invoice_id}`);
+            invoiceSnapshot = {
+              invoice_number: invoice.number || invoice.reference || order.invoice_number || "",
+              items: (invoice.items || []).map((item) => ({
+                qty: item.qty,
+                category: item.category || "",
+                size: item.size || "",
+                description: item.description || "",
+              })),
+            };
+          } catch (error) {
+            toast.error(`Could not load invoice for ${order.reference}: ${apiError(error)}`);
+          }
+        }
+        return { order, invoiceSnapshot };
+      }));
+      setBatchPrintOrders(documents);
+      setBatchPrintOpen(true);
     } finally {
-      setSmartArrangementLoading(false);
+      setBatchPrintLoading(false);
     }
   };
 
-  const revalidateSmartArrangement = async () => {
-    if (!smartArrangement?.order_ids?.length) return;
-    setSmartArrangementLoading(true);
-    try {
-      const plan = await api.post("/orders/smart-production-arrangements", {
-        order_ids: smartArrangement.order_ids,
-      });
-      setSmartArrangement(plan);
-      toast.success("Order and floor-stock availability revalidated.");
-    } catch (error) {
-      toast.error(apiError(error));
-    } finally {
-      setSmartArrangementLoading(false);
-    }
-  };
-
-  const releaseSmartArrangement = async () => {
-    if (!smartArrangement?.id) return;
-    if (!window.confirm("Release this arrangement proposal and its planning-only stock allocations? No production or inventory records will be changed.")) return;
-    try {
-      await api.del("/orders/smart-production-arrangements/" + smartArrangement.id);
-      toast.success("Arrangement proposal released.");
-      setSmartArrangement(null);
-    } catch (error) {
-      toast.error(apiError(error));
+  const printSelectedOrdersNow = () => {
+    if (!batchPrintOrders.length) return;
+    if (!window.confirm(`Print ${batchPrintOrders.length} order delivery note(s)?`)) return;
+    const elements = batchPrintOrders.map((_, index) => batchPrintRefs.current.get(index));
+    if (!elements.every(Boolean)) return toast.error("The order previews are still loading. Try again.");
+    if (!printElements(elements, `Order delivery notes (${elements.length})`)) {
+      toast.error("The browser blocked the print window. Allow pop-ups and try again.");
     }
   };
 
@@ -493,26 +489,45 @@ export default function Orders() {
     });
   };
 
-  const pickInvoice = (id) => {
+  const pickInvoice = async (id) => {
     const invoice = invoices.find((item) => item.id === id);
     if (!invoice) {
-      setModal({ ...modal, invoice_id: "", invoice_number: "", items: [{ qty: "", category: "", size: "" }], products: "" });
+      setModal((current) => current ? {
+        ...current,
+        invoice_id: "",
+        invoice_number: "",
+        items: [{ qty: "", category: "", size: "" }],
+        products: "",
+      } : current);
       return;
     }
-    const items = (invoice.items || []).filter((item) => Number(item.qty) > 0 && (item.category || item.size || item.description)).map((item) => ({
-      qty: item.qty,
-      category: item.category || "",
-      size: item.size || "",
-      description: item.description || "",
-    }));
-    setModal({
-      ...modal,
+
+    setModal((current) => current ? {
+      ...current,
       invoice_id: invoice.id,
       invoice_number: invoice.number || invoice.reference || "",
-      destination: invoice.destination || modal.destination,
+      destination: invoice.destination || current.destination,
+    } : current);
+
+    let detail = invoice;
+    if (!Array.isArray(detail.items)) {
+      try {
+        detail = await api.getUncached(`/invoices/${invoice.id}`);
+      } catch (error) {
+        toast.error(`Invoice details could not be loaded: ${apiError(error)}`);
+        return;
+      }
+    }
+
+    const items = invoiceOrderItems(detail);
+    setModal((current) => current?.invoice_id === invoice.id ? {
+      ...current,
+      invoice_id: detail.id || invoice.id,
+      invoice_number: detail.number || detail.reference || invoice.number || invoice.reference || "",
+      destination: detail.destination || invoice.destination || current.destination,
       items,
       products: items.map((item) => `${item.qty} x ${[item.category, item.size, item.description].filter(Boolean).join(" ")}`).join("\n"),
-    });
+    } : current);
   };
   const openOrder = async (order) => {
     const requestId = ++detailRequest.current;
@@ -603,23 +618,26 @@ export default function Orders() {
         ))}
         <div className="ml-auto w-48"><Input label="Order date" type="date" value={orderDate} onChange={(event) => { setOrderDate(event.target.value); setPage(1); }} data-testid="order-date-filter" /></div>
       </div>
-      {canMakeSmartArrangement && <Card className="flex flex-col gap-3 p-3 sm:flex-row sm:items-center sm:justify-between">
-        <label className="flex items-center gap-2 text-sm text-slate-700">
+      <Card className="flex flex-wrap items-center justify-between gap-3 p-3">
+        <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
           <input
             type="checkbox"
-            checked={allVisibleSelected}
-            onChange={(event) => toggleVisibleOrderSelection(event.target.checked)}
-            disabled={!selectableOrders.length || loading}
-            data-testid="select-visible-orders"
-            aria-label="Select all visible open orders"
+            className="h-5 w-5 accent-primary"
+            checked={shown.length > 0 && shown.every((order) => !!printSelectedOrders[order.id])}
+            onChange={(event) => toggleVisiblePrintSelection(event.target.checked)}
+            disabled={!shown.length || loading}
+            aria-label="Select all visible orders for printing"
+            data-testid="select-visible-orders-for-print"
           />
-          Select visible open orders
+          Select all visible orders for printing
         </label>
-        <div className="flex flex-wrap items-center gap-2">
-          {selectedOrderList.length > 0 && <span className="text-xs font-medium text-slate-600">{selectedOrderList.length} selected</span>}
-          <Btn variant="outline" onClick={() => setSelectedOrders({})} disabled={!selectedOrderList.length} data-testid="clear-order-selection">Clear selection</Btn>
-          <Btn onClick={generateSmartArrangement} disabled={!selectedOrderList.length || smartArrangementLoading} data-testid="make-arrangement">
-            <Factory size={15} /> Make Arrangement
+      </Card>
+      {printSelectedOrderList.length > 0 && <Card className="flex flex-wrap items-center justify-between gap-3 border-blue-200 bg-blue-50 p-3">
+        <span className="text-sm font-semibold text-blue-900">{printSelectedOrderList.length} order(s) selected for printing</span>
+        <div className="flex gap-2">
+          <Btn variant="outline" onClick={() => setPrintSelectedOrders({})} data-testid="clear-print-order-selection">Clear</Btn>
+          <Btn onClick={prepareBatchOrderPrint} disabled={batchPrintLoading} data-testid="print-selected-orders">
+            <Printer size={15} /> {batchPrintLoading ? "Preparing..." : "Print Selected"}
           </Btn>
         </div>
       </Card>}
@@ -638,16 +656,17 @@ export default function Orders() {
                 <article key={o.id} className="rounded-lg border border-border bg-white p-3 shadow-sm" data-testid={`order-card-${o.id}`}>
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
-                      {canMakeSmartArrangement && ["To Send", "Preparing", "Assigned", "Partially Delivered"].includes(o.status) && <label className="mb-1 flex items-center gap-2 text-xs font-medium text-slate-500">
+                      <label className="mb-1 flex items-center gap-2 text-xs font-medium text-slate-500">
                         <input
                           type="checkbox"
-                          checked={!!selectedOrders[o.id]}
-                          onChange={(event) => toggleOrderSelection(o, event.target.checked)}
-                          data-testid={`select-order-${o.id}`}
-                          aria-label={`Select order ${o.reference}`}
+                          className="h-5 w-5 accent-primary"
+                          checked={!!printSelectedOrders[o.id]}
+                          onChange={(event) => togglePrintOrderSelection(o, event.target.checked)}
+                          data-testid={`select-order-print-${o.id}`}
+                          aria-label={`Select ${o.reference} for printing`}
                         />
-                        Select for arrangement
-                      </label>}
+                        Print delivery note
+                      </label>
                       <p className="break-all font-mono text-sm font-bold text-slate-800">{o.reference}</p>
                       {o.invoice_number && <p className="mt-0.5 text-xs text-slate-500">Invoice {o.invoice_number}</p>}
                     </div>
@@ -695,12 +714,12 @@ export default function Orders() {
             <div className="hidden overflow-x-auto sm:block">
             <table className="w-full text-sm min-w-[960px]">
               <thead><tr className="text-left text-xs text-slate-400 bg-slate-50 border-b border-border">
-                {canMakeSmartArrangement && <th className="w-10 px-3 py-3"><input type="checkbox" checked={allVisibleSelected} onChange={(event) => toggleVisibleOrderSelection(event.target.checked)} disabled={!selectableOrders.length || loading} aria-label="Select all visible open orders" data-testid="select-visible-orders-table" /></th>}
+                <th className="w-10 px-3 py-3"><input type="checkbox" className="h-5 w-5 accent-primary" checked={shown.length > 0 && shown.every((order) => !!printSelectedOrders[order.id])} onChange={(event) => toggleVisiblePrintSelection(event.target.checked)} disabled={!shown.length || loading} aria-label="Select all visible orders for printing" data-testid="select-visible-orders-for-print-table" /></th>
                 <th className="px-4 py-3 font-semibold">Ref</th><th className="px-4 font-semibold">Customer</th><th className="px-4 font-semibold">City</th><th className="px-4 font-semibold">Products</th><th className="px-4 font-semibold">Priority</th><th className="px-4 font-semibold">Status</th><th className="px-4 font-semibold">Ship Date</th><th className="px-4 font-semibold">Vehicle</th><th className="px-4 font-semibold text-right">Actions</th>
               </tr></thead>
               <tbody>{shown.map((o) => (
                 <tr key={o.id} className="border-b border-border/60 hover:bg-slate-50 align-top" data-testid={`order-row-${o.id}`}>
-                  {canMakeSmartArrangement && <td className="px-3 py-3">{["To Send", "Preparing", "Assigned", "Partially Delivered"].includes(o.status) && <input type="checkbox" checked={!!selectedOrders[o.id]} onChange={(event) => toggleOrderSelection(o, event.target.checked)} aria-label={`Select order ${o.reference}`} data-testid={`select-order-table-${o.id}`} />}</td>}
+                  <td className="px-3 py-3"><input type="checkbox" className="h-5 w-5 accent-primary" checked={!!printSelectedOrders[o.id]} onChange={(event) => togglePrintOrderSelection(o, event.target.checked)} aria-label={`Select ${o.reference} for printing`} data-testid={`select-order-print-table-${o.id}`} /></td>
                   <td className="px-4 py-3 font-mono font-semibold text-slate-800 whitespace-nowrap">{o.reference}{o.invoice_number && <span className="block font-sans text-[10px] font-medium text-slate-400">Invoice {o.invoice_number}</span>}</td>
                   <td className="px-4 py-3 font-semibold text-slate-700">{o.customer_name || "-"}</td>
                   <td className="px-4 py-3 text-slate-500">{o.destination}</td>
@@ -794,6 +813,34 @@ export default function Orders() {
         </div>}
       </Modal>
 
+      <Modal open={batchPrintOpen} onClose={() => setBatchPrintOpen(false)} title={`Print ${batchPrintOrders.length} delivery note(s)`} wide>
+        {batchPrintOpen && <div className="space-y-4">
+          <p className="text-sm text-slate-600">Each selected order is rendered as one A4 delivery note.</p>
+          <div className="max-h-[calc(100vh-13rem)] overflow-y-auto space-y-5 rounded-lg bg-slate-100 p-3">
+            {batchPrintOrders.map((document, index) => (
+              <div key={document.order.id} className="mx-auto w-fit bg-white shadow-md">
+                <DeliveryNote
+                  ref={(element) => {
+                    if (element) batchPrintRefs.current.set(index, element);
+                    else batchPrintRefs.current.delete(index);
+                  }}
+                  order={document.order}
+                  signature={null}
+                  invoiceSnapshot={document.invoiceSnapshot}
+                  lang="en"
+                  vehicleName={vName(document.order.vehicle_id)}
+                  settings={settings}
+                />
+              </div>
+            ))}
+          </div>
+          <div className="flex justify-end gap-2">
+            <Btn variant="outline" onClick={() => setBatchPrintOpen(false)}>Close</Btn>
+            <Btn onClick={printSelectedOrdersNow} data-testid="confirm-print-selected-orders"><Printer size={15} /> Print Selected</Btn>
+          </div>
+        </div>}
+      </Modal>
+
       <Modal open={!!modal} onClose={() => setModal(null)} title={modal?.id ? `Edit Order ${modal.reference}` : "New Order"} wide>
         {modal && <div className="space-y-4">
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -802,7 +849,12 @@ export default function Orders() {
             </Select>
             {!modal.id && <Select label="Invoice" value={modal.invoice_id || ""} onChange={(e) => pickInvoice(e.target.value)} disabled={!modal.customer_id} data-testid="order-invoice-select">
               <option value="">Select an invoice...</option>
-              {invoices.filter((invoice) => invoice.customer_id === modal.customer_id && !invoice.opening_balance && invoice.status !== "void").map((invoice) => (
+              {invoices.filter((invoice) => {
+                const customer = customers.find((item) => item.id === modal.customer_id);
+                return invoiceMatchesCustomer(invoice, customer)
+                  && !invoice.opening_balance
+                  && invoice.status !== "void";
+              }).map((invoice) => (
                 <option key={invoice.id} value={invoice.id}>{invoice.number || invoice.reference || invoice.id} · {invoice.date || "Undated"}</option>
               ))}
             </Select>}
@@ -840,13 +892,6 @@ export default function Orders() {
         </div>}
       </Modal>
       <NoteModal order={note} vehicleName={note ? vName(note.vehicle_id) : ""} settings={settings} onClose={() => setNote(null)} />
-      {(smartArrangement || smartArrangementLoading) && <SmartProductionPlanner
-        plan={smartArrangement}
-        loading={smartArrangementLoading}
-        onRefresh={revalidateSmartArrangement}
-        onRelease={releaseSmartArrangement}
-        onClose={() => setSmartArrangement(null)}
-      />}
     </div>
   );
 }

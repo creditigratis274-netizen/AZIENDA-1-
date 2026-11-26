@@ -9,7 +9,6 @@ from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Respons
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 import json, re
-from urllib.parse import quote
 import shutil
 import calendar
 from starlette.middleware.cors import CORSMiddleware
@@ -35,6 +34,9 @@ from salary_math import (
     STANDARD_PAID_DAYS_PER_WEEK,
     STANDARD_WEEKLY_HOURS,
     calculate_salary_hours,
+    calculate_piecework_formula,
+    calculate_salary_rule,
+    calculate_net_and_balance,
 )
 from grv_math import (
     aggregate_accepted_stock_lines,
@@ -88,7 +90,6 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 api = APIRouter(prefix="/api")
 backup_scheduler_task = None
 fleet_notification_scheduler_task = None
-daily_report_whatsapp_scheduler_task = None
 legacy_migration_task = None
 
 
@@ -130,7 +131,6 @@ WORKER_SUPERVISOR_ACTIONS = set(WORKER_SUPERVISOR_ACTION_SECTIONS)
 WORKER_SECTION_PREFIXES = {
     "customers": "customers",
     "suppliers": "suppliers",
-    "buyings": "buyings",
     "invoices": "invoices",
     "express-invoices": "express-invoices",
     "express-client-payments": "express-client-payments",
@@ -497,7 +497,7 @@ async def find_worker_by_access_token(token):
 USER_PROJ = {"_id": 0, "password_hash": 0}
 OWNER_EMAIL_ALIASES = {"2j2skp87z8@privaterelay.appleid.com"}
 WORKER_SECTIONS = {
-    "customers", "suppliers", "buyings", "invoices", "orders", "stock",
+    "customers", "suppliers", "invoices", "orders", "stock",
     "production", "attendance", "deliveries", "fleet", "expenses",
     "costs", "grv", "daily-report", "client-payments", "settings", "warehouses",
     "express-invoices", "express-client-payments", "intercompany", "company-inventory",
@@ -718,7 +718,7 @@ def enforce_worker_api_access(request, user):
         raise HTTPException(403, "This stock-only account cannot access other sections or destructive stock actions")
 
     if "invoices" in allowed:
-        if path in {"customers", "prices", "settings"} and method == "GET":
+        if path in {"customers", "prices", "settings", "print-templates"} and method == "GET":
             return
         if re.fullmatch(r"customers/[^/]+/summary", path) and method == "GET":
             return
@@ -755,11 +755,11 @@ def enforce_worker_api_access(request, user):
         return
 
     support_rules = {
-        "invoices": [("drivers", "GET")],
+        "invoices": [("drivers", "GET"), ("print-templates", "GET")],
         "express-invoices": [
-            ("customers", "GET"), ("prices", "GET"), ("settings", "GET"), ("drivers", "GET"),
+            ("customers", "GET"), ("prices", "GET"), ("settings", "GET"),
+            ("drivers", "GET"), ("print-templates", "GET"),
         ],
-        "buyings": [("suppliers", "GET"), ("stock", "GET")],
         "grv": [
             ("suppliers", "GET"), ("stock", "GET"),
             ("purchase-orders", "GET"), ("settings", "GET"),
@@ -774,10 +774,11 @@ def enforce_worker_api_access(request, user):
         "attendance": [("piece-production", "GET"), ("piece-production", "POST")],
         "orders": [
             ("customers", "GET"), ("prices", "GET"), ("settings", "GET"),
-            ("stock", "GET"), ("vehicles", "GET"),
+            ("stock", "GET"), ("vehicles", "GET"), ("print-templates", "GET"),
         ],
         "deliveries": [
-            ("customers", "GET"), ("drivers", "GET"), ("vehicles", "GET"), ("stock", "GET"),
+            ("customers", "GET"), ("drivers", "GET"), ("vehicles", "GET"),
+            ("stock", "GET"), ("print-templates", "GET"),
         ],
         "expenses": [("vehicles", "GET"), ("reports/profit", "GET"), ("reports/costs", "GET")],
         "client-payments": [
@@ -1120,25 +1121,15 @@ class OwnerPromotionIn(BaseModel):
 class SupervisorPasswordIn(BaseModel):
     password: str
 
+class GlobalOwnerPasswordIn(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=8, max_length=256)
+
 class SupervisorWriteAuthorizationIn(BaseModel):
     password: str
     action: Optional[str] = None
-
-class DailyReportWhatsAppPrepareIn(BaseModel):
-    report_date: str
-    pdf_base64: str = Field(min_length=1)
-    filename: str = Field(min_length=1, max_length=180)
-    phone: str
-    message_template: str = Field(min_length=1, max_length=2000)
-
-    @field_validator("report_date")
-    @classmethod
-    def valid_report_date(cls, value):
-        try:
-            date.fromisoformat(value)
-        except ValueError:
-            raise ValueError("Report date must be a valid YYYY-MM-DD date")
-        return value
 
 class BackupRestoreIn(BaseModel):
     key: str = Field(min_length=12, max_length=50)
@@ -3535,6 +3526,37 @@ async def get_monthly_chemical_sheet(month: str = Query(pattern=r"^\d{4}-(0[1-9]
     }
 
 
+def monthly_chemical_capacity_kg(capacity, unit):
+    normalized_unit = str(unit or "").strip().casefold()
+    if normalized_unit in {"kg", "kgs", "kilogram", "kilograms"}:
+        return capacity
+    if normalized_unit in {"l", "liter", "liters", "litre", "litres"}:
+        # Use the sheet's 1 L = 1 kg convention where no chemical density is stored.
+        return capacity
+    return None
+
+
+def monthly_chemical_grv_line(line_index, line):
+    try:
+        capacity = float(line.get("size", 0) or 0)
+        accepted = float(line.get("accepted_quantity", 0) or 0)
+    except (TypeError, ValueError):
+        capacity, accepted = 0, 0
+    capacity_kg = monthly_chemical_capacity_kg(capacity, line.get("unit", ""))
+    valid_capacity_kg = capacity_kg if capacity_kg is not None and capacity_kg > 0 else None
+    return {
+        "line_index": line_index,
+        "product": line.get("product", ""),
+        "accepted_quantity": accepted,
+        "capacity": capacity,
+        "capacity_kg": valid_capacity_kg,
+        "container_type": line.get("container_type") or "Container",
+        "unit": line.get("unit", ""),
+        "quantity_kg": round(accepted * valid_capacity_kg, 4)
+        if valid_capacity_kg is not None and accepted > 0 else None,
+    }
+
+
 @api.get("/production/monthly-chemical-sheet/grvs")
 @api.get("/warehouses/production-chemical-balance/grvs")
 async def get_monthly_chemical_sheet_grvs(
@@ -3559,21 +3581,7 @@ async def get_monthly_chemical_sheet_grvs(
         "received_date": grv.get("received_date", ""),
         "supplier_name": grv.get("supplier_name", ""),
         "items": [
-            {
-                "line_index": index,
-                "product": line.get("product", ""),
-                "accepted_quantity": float(line.get("accepted_quantity", 0) or 0),
-                "capacity": float(line.get("size", 0) or 0),
-                "container_type": line.get("container_type") or "Container",
-                "unit": line.get("unit", ""),
-                "accepted_quantity": float(line.get("accepted_quantity", 0) or 0),
-                "quantity_kg": round(
-                    float(line.get("accepted_quantity", 0) or 0) * float(line.get("size", 0) or 0),
-                    4,
-                ) if str(line.get("unit", "")).strip().casefold() in {
-                    "kg", "kgs", "kilogram", "kilograms",
-                } and float(line.get("size", 0) or 0) > 0 else None,
-            }
+            monthly_chemical_grv_line(index, line)
             for index, line in enumerate(grv.get("items", []))
         ],
     } for grv in records]
@@ -3602,17 +3610,18 @@ async def validate_monthly_sheet_arrival_sources(month, sources):
                 accepted = float(line.get("accepted_quantity", 0) or 0)
             except (TypeError, ValueError):
                 capacity, accepted = 0, 0
-            if unit not in {"kg", "kgs", "kilogram", "kilograms"} or capacity <= 0 or accepted <= 0:
-                raise HTTPException(422, f"GRV line {mapping.line_index + 1} must have accepted quantity and capacity in kg")
+            capacity_kg = monthly_chemical_capacity_kg(capacity, unit)
+            if capacity_kg is None or capacity_kg <= 0 or accepted <= 0:
+                raise HTTPException(422, f"GRV line {mapping.line_index + 1} must have accepted quantity and capacity in kg or L")
             mapped_lines.append({
                 "line_index": mapping.line_index,
                 "chemical_key": mapping.chemical_key,
                 "product": line.get("product", ""),
                 "container_type": line.get("container_type") or "Container",
-                "container_capacity": capacity,
+                "container_capacity": capacity_kg,
                 "container_count": accepted,
-                "unit": line.get("unit", ""),
-                "quantity_kg": round(accepted * capacity, 4),
+                "unit": "kg",
+                "quantity_kg": round(accepted * capacity_kg, 4),
             })
         validated.append({
             "grv_id": grv["id"],
@@ -5084,7 +5093,6 @@ class CustomerIn(BaseModel):
 class CustomerInvoiceContactIn(BaseModel):
     phone: Optional[str] = Field(default=None, max_length=100)
     city: Optional[str] = Field(default=None, max_length=120)
-    client_number: Optional[str] = Field(default=None, max_length=100)
 
 @api.get("/customers")
 async def get_customers(
@@ -5210,8 +5218,8 @@ async def update_customer_invoice_contact(
     record = await update_doc("customers", cid, contact)
     await log_audit(
         "customer", cid, "invoice_contact_updated", user,
-        before={key: before.get(key, "") for key in ("phone", "city", "client_number")},
-        after={key: record.get(key, "") for key in ("phone", "city", "client_number")},
+        before={key: before.get(key, "") for key in ("phone", "city")},
+        after={key: record.get(key, "") for key in ("phone", "city")},
     )
     await emit_workflow_event("customer.updated", record)
     return record
@@ -5244,10 +5252,7 @@ async def pay_other_balance(cid: str, body: OtherBalancePayIn, user=Depends(get_
         "amount": float(amount), "method": body.method, "receiving_on": body.receiving_on or "",
         "date": body.date, "reference": body.reference or "", "notes": body.note or "",
         "invoice_id": None, "invoice_number": "Other balance", "other_balance_payment": True,
-        "express": body.express,
-        "include_on_daily_report": True if body.express else False,
-        "daily_report_inclusion_set": False,
-        "customer_id": cid, "customer_name": customer.get("name"),
+        "express": body.express, "customer_id": cid, "customer_name": customer.get("name"),
         "reversed": False, "user": user["email"],
     })
     history[-1]["payment_id"] = pay_rec["id"]
@@ -5381,6 +5386,67 @@ class PriceIn(BaseModel):
         if not value:
             raise ValueError("Category and size are required")
         return value
+
+class CustomerInvoicePriceIn(BaseModel):
+    zone: int = Field(ge=1, le=2)
+    category: str = Field(min_length=1, max_length=100)
+    size: str = Field(min_length=1, max_length=100)
+    price: float = Field(ge=0, allow_inf_nan=False)
+
+    @field_validator("category", "size")
+    @classmethod
+    def customer_price_label_required(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("Category and size are required")
+        return value
+
+class CustomerInvoicePricesIn(BaseModel):
+    items: List[CustomerInvoicePriceIn] = Field(default_factory=list, max_length=500)
+
+@api.get("/invoices/customer-prices/{cid}")
+async def get_customer_invoice_prices(cid: str, user=Depends(get_current_user)):
+    if (active_company_id.get() or DEFAULT_COMPANY_ID) != DEFAULT_COMPANY_ID:
+        raise HTTPException(404, "Customer-specific invoice prices are not available")
+    customer = await db.customers.find_one({"id": cid}, {"_id": 0, "invoice_prices": 1})
+    if customer is None:
+        raise HTTPException(404, "Customer not found")
+    return customer.get("invoice_prices", [])
+
+@api.put("/invoices/customer-prices/{cid}")
+async def save_customer_invoice_prices(
+    cid: str,
+    body: CustomerInvoicePricesIn,
+    user=Depends(get_current_user),
+):
+    if (active_company_id.get() or DEFAULT_COMPANY_ID) != DEFAULT_COMPANY_ID:
+        raise HTTPException(404, "Customer-specific invoice prices are not available")
+    before = await db.customers.find_one({"id": cid}, {"_id": 0, "invoice_prices": 1})
+    if before is None:
+        raise HTTPException(404, "Customer not found")
+    prices = [item.model_dump() for item in body.items]
+    keys = [
+        (item["zone"], item["category"].casefold(), item["size"].casefold())
+        for item in prices
+    ]
+    if len(keys) != len(set(keys)):
+        raise HTTPException(422, "Each customer price must have a unique zone, category and size")
+    merged = {
+        (item["zone"], item["category"].casefold(), item["size"].casefold()): item
+        for item in before.get("invoice_prices", [])
+    }
+    merged.update(dict(zip(keys, prices)))
+    saved = sorted(
+        merged.values(),
+        key=lambda item: (item["zone"], item["category"].casefold(), item["size"].casefold()),
+    )
+    await update_doc("customers", cid, {"invoice_prices": saved})
+    await log_audit(
+        "customer", cid, "invoice_prices_updated", user,
+        before={"invoice_prices": before.get("invoice_prices", [])},
+        after={"invoice_prices": saved},
+    )
+    return saved
 
 @api.get("/prices")
 async def get_prices(user=Depends(get_current_user)):
@@ -6382,8 +6448,26 @@ async def validate_invoice_order_ids(order_ids, customer_id, customer_name):
     return normalized_ids
 
 
-async def link_invoice_orders(invoice):
+async def link_invoice_orders(invoice, user=None):
     for order_id in invoice.get("order_ids") or []:
+        before = await db.orders.find_one({"id": order_id}, {"_id": 0})
+        if not before:
+            raise HTTPException(409, "Selected order no longer exists")
+        auto_archive = (
+            (active_company_id.get() or DEFAULT_COMPANY_ID) == DEFAULT_COMPANY_ID
+            and invoice.get("status") != "draft"
+        )
+        order_updates = {
+            "invoice_id": invoice["id"],
+            "invoice_number": invoice.get("number") or invoice.get("reference") or "",
+            "updated_at": now_iso(),
+        }
+        if auto_archive and not before.get("archived"):
+            order_updates.update({
+                "archived": True,
+                "archived_at": now_iso(),
+                "archived_by": (user or {}).get("id"),
+            })
         result = await db.orders.update_one(
             {
                 "id": order_id,
@@ -6392,14 +6476,18 @@ async def link_invoice_orders(invoice):
                     {"invoice_id": invoice["id"]},
                 ],
             },
-            {"$set": {
-                "invoice_id": invoice["id"],
-                "invoice_number": invoice.get("number") or invoice.get("reference") or "",
-                "updated_at": now_iso(),
-            }},
+            {"$set": order_updates},
         )
         if result.matched_count == 0:
             raise HTTPException(409, "Selected order is already linked to another invoice")
+        if auto_archive and not before.get("archived"):
+            archived = {**before, **order_updates}
+            await log_audit(
+                "order", order_id, "archived_after_invoice", user,
+                before=before, after=archived,
+                reason="Automatically archived after invoicing its delivery note",
+            )
+            await emit_workflow_event("order.updated", archived)
 
 
 async def _prepare_invoice(body: InvoiceIn, user=None, existing=None):
@@ -6550,10 +6638,10 @@ async def create_invoice(body: InvoiceIn, user=Depends(get_current_user)):
         if existing_submission:
             if existing_submission.get("submission_payload_hash") != invoice_submission_hash(body):
                 raise HTTPException(409, "This invoice submission key was already used for different invoice data")
-            await link_invoice_orders(existing_submission)
+            await link_invoice_orders(existing_submission, user)
             return invoice_for_user(existing_submission, user)
 
-    deduct_stock = body.deduct_stock and invoice_stock_deduction_enabled(user.get("_active_company_id"), user)
+    deduct_stock = body.deduct_stock
     inv = await _prepare_invoice(body, user=user)
     if body.idempotency_key:
         inv["idempotency_key"] = body.idempotency_key
@@ -6590,9 +6678,9 @@ async def create_invoice(body: InvoiceIn, user=Depends(get_current_user)):
                 raise
             if existing_submission.get("submission_payload_hash") != invoice_submission_hash(body):
                 raise HTTPException(409, "This invoice submission key was already used for different invoice data") from error
-            await link_invoice_orders(existing_submission)
+            await link_invoice_orders(existing_submission, user)
             return invoice_for_user(existing_submission, user)
-        await link_invoice_orders(record)
+        await link_invoice_orders(record, user)
         await emit_workflow_event("invoice.created", record)
         if record.get("status") != "draft":
             await emit_workflow_event("invoice.issued", record)
@@ -6616,11 +6704,11 @@ async def create_invoice(body: InvoiceIn, user=Depends(get_current_user)):
                 raise
             if existing_submission.get("submission_payload_hash") != invoice_submission_hash(body):
                 raise HTTPException(409, "This invoice submission key was already used for different invoice data") from error
-            await link_invoice_orders(existing_submission)
+            await link_invoice_orders(existing_submission, user)
             return invoice_for_user(existing_submission, user)
         await post_invoice_stock_deductions(rec, deductions, user)
         rec = await update_doc("invoices", rec["id"], {"stock_deducted": True})
-    await link_invoice_orders(rec)
+    await link_invoice_orders(rec, user)
     await emit_workflow_event("invoice.created", rec)
     if rec.get("status") != "draft":
         await emit_workflow_event("invoice.issued", rec)
@@ -6664,7 +6752,6 @@ async def update_invoice(iid: str, body: InvoiceIn, user=Depends(get_current_use
             inv.get("customer_id"),
             iid,
         )
-    deduct_stock = body.deduct_stock and invoice_stock_deduction_enabled(user.get("_active_company_id"), user)
     inv.pop("edit_reason", None)
     inv["amount_paid"] = existing.get("amount_paid", 0)
     compute_invoice(inv)
@@ -6702,7 +6789,7 @@ async def update_invoice(iid: str, body: InvoiceIn, user=Depends(get_current_use
         inv["audit"].append({"action": "edited", "at": now_iso(), "by": user["email"], "reason": reason, "changes": changes})
     if existing.get("stock_deducted"):
         inv["stock_deducted"] = True
-    if not deduct_stock:
+    if not body.deduct_stock:
         rec = await update_doc("invoices", iid, inv)
     else:
         stock_changes = await invoice_stock_changes({**inv, "id": iid})
@@ -6711,6 +6798,8 @@ async def update_invoice(iid: str, body: InvoiceIn, user=Depends(get_current_use
             rec = await update_doc("invoices", iid, inv)
             await post_invoice_stock_changes(rec, stock_changes, stocks, user)
             rec = await update_doc("invoices", iid, {"stock_deducted": True, "stock_restored": False})
+    if existing.get("status") == "draft" and rec.get("status") != "draft":
+        await link_invoice_orders(rec, user)
     if "opening_balance" in existing and body.opening_balance is False:
         await db.invoices.update_one({"id": iid}, {"$unset": {"opening_balance": ""}})
         rec.pop("opening_balance", None)
@@ -6816,8 +6905,7 @@ async def issue_invoice(iid: str, body: InvoiceIssueIn = InvoiceIssueIn(), user=
     if inv.get("status") == "void":
         raise HTTPException(400, "Cannot issue a voided invoice")
     await validate_for_issue(inv)
-    deduct_stock = body.deduct_stock and invoice_stock_deduction_enabled(user.get("_active_company_id"), user)
-    if deduct_stock and inv.get("stock_deducted"):
+    if body.deduct_stock and inv.get("stock_deducted"):
         raise HTTPException(409, "Stock has already been deducted for this invoice")
     upd = {"items": inv["items"]}
     if not inv.get("number"):
@@ -6837,7 +6925,7 @@ async def issue_invoice(iid: str, body: InvoiceIssueIn = InvoiceIssueIn(), user=
     audit = inv.get("audit", [])
     audit.append({"action": "issued", "at": now_iso(), "by": user["email"]})
     upd["audit"] = audit
-    if not deduct_stock:
+    if not body.deduct_stock:
         rec = await update_doc("invoices", iid, upd)
     else:
         deductions = await invoice_stock_deductions(inv)
@@ -6846,6 +6934,7 @@ async def issue_invoice(iid: str, body: InvoiceIssueIn = InvoiceIssueIn(), user=
             rec = await update_doc("invoices", iid, upd)
             await post_invoice_stock_deductions(rec, deductions, user)
             rec = await update_doc("invoices", iid, {"stock_deducted": True})
+    await link_invoice_orders({**inv, **upd}, user)
     await emit_workflow_event("invoice.issued", rec)
     await log_audit(
         "invoice", iid, "invoice_issued", user,
@@ -6934,8 +7023,6 @@ async def record_advance_payment(cid: str, body: AdvancePaymentIn, user=Depends(
         "invoice_number": "Advance payment",
         "advance_payment": True,
         "express": body.express,
-        "include_on_daily_report": True if body.express else payment.get("include_on_daily_report", False),
-        "daily_report_inclusion_set": False,
         "customer_id": cid,
         "customer_name": customer.get("name"),
         "reversed": False,
@@ -7123,12 +7210,9 @@ async def record_payment(iid: str, body: PaymentIn, user=Depends(get_current_use
         pay = body.model_dump()
         if not pay.get("idempotency_key"):
             pay.pop("idempotency_key")
-        is_express = inv.get("invoice_type") == "express"
         pay.update({"amount": amt, "invoice_id": iid, "invoice_number": inv.get("number"),
                     "customer_id": inv.get("customer_id"), "customer_name": inv.get("customer_name"),
-                    "reversed": False, "user": user["email"],
-                    "include_on_daily_report": True if is_express else False,
-                    "daily_report_inclusion_set": False})
+                    "reversed": False, "user": user["email"]})
         try:
             pay_rec = await insert("payments", pay)
         except DuplicateKeyError:
@@ -7310,11 +7394,7 @@ async def get_express_payments(payment_date: str, user=Depends(get_current_user)
             "receiving_on": payment.get("receiving_on") or "", "reference": payment.get("reference") or "",
             "notes": payment.get("notes") or "", "invoice_number": "Other balance",
             "customer_name": payment.get("customer_name") or "",
-            "include_on_daily_report": bool(
-                payment.get("include_on_daily_report")
-                if payment.get("daily_report_inclusion_set")
-                else True
-            ),
+            "include_on_daily_report": True,
         }
         for payment in payments
         if payment.get("other_balance_payment") and payment.get("express")
@@ -7326,11 +7406,7 @@ async def get_express_payments(payment_date: str, user=Depends(get_current_user)
             "receiving_on": payment.get("receiving_on") or "", "reference": payment.get("reference") or "",
             "notes": payment.get("notes") or "", "invoice_number": "Advance payment",
             "customer_name": payment.get("customer_name") or "",
-            "include_on_daily_report": bool(
-                payment.get("include_on_daily_report")
-                if payment.get("daily_report_inclusion_set")
-                else True
-            ),
+            "include_on_daily_report": True,
         }
         for payment in payments
         if payment.get("advance_payment") and payment.get("express")
@@ -7365,11 +7441,7 @@ async def get_express_payments(payment_date: str, user=Depends(get_current_user)
             "notes": payment.get("notes") or "",
             "invoice_number": payment.get("invoice_number") or invoice_by_id[payment["invoice_id"]].get("number") or "",
             "customer_name": payment.get("customer_name") or invoice_by_id[payment["invoice_id"]].get("customer_name") or "",
-            "include_on_daily_report": bool(
-                payment.get("include_on_daily_report")
-                if payment.get("daily_report_inclusion_set")
-                else True
-            ),
+            "include_on_daily_report": True,
         }
         for payment in payments
         if payment.get("invoice_id") in invoice_by_id and not payment.get("advance_allocation")
@@ -8122,6 +8194,26 @@ def stock_for_user(stock, user):
         return redact_stock_costs(stock)
     return stock
 
+
+def stock_warning_threshold(stock):
+    product = re.sub(r"\s+", " ", str(stock.get("product") or "").strip()).casefold()
+    size = re.sub(r"\s+", "", str(stock.get("size") or "")).casefold().replace("×", "x")
+    if product == "simple":
+        return 150 if size in {"910x100", "760x100"} else 100
+    if product in {"ribbon black", "ribbon pink"}:
+        return 150
+    return None
+
+
+def stock_warning_is_active(stock, *, include_equal_for_existing_threshold=False):
+    threshold = stock_warning_threshold(stock)
+    if threshold is not None:
+        return float(stock.get("current") or 0) < threshold
+    threshold = float(stock.get("threshold") or 0)
+    current = float(stock.get("current") or 0)
+    return current <= threshold if include_equal_for_existing_threshold else current < threshold
+
+
 async def post_movement(stock, mtype, qty, user, reason="", reference="", notes="", dedupe_key=None, direction=None, allow_negative=False, extra=None, session=None):
     sign = direction or (1 if mtype in INC_TYPES else -1)
     if sign < 0 and not allow_negative:
@@ -8314,18 +8406,6 @@ async def invoice_return_batch_allocations(invoice_id, stock_id, quantity):
         })
     return result
 
-def invoice_stock_deduction_enabled(company_id=None, user=None):
-    # IMRAAN PLASTICS invoices use freeform descriptions, never finished-stock SKUs.
-    # Check both the active tenant and the authenticated profile so a stale or
-    # mismatched session context cannot trigger stock matching for this profile.
-    if company_id is None:
-        company_id = active_company_id.get()
-    return (
-        company_id != IMRAAN_PLASTICS_COMPANY_ID
-        and (not user or user.get("profile_id") != IMRAAN_PLASTICS_COMPANY_ID)
-    )
-
-
 def invoice_stock_product(item):
     category = (item.get("category") or "").strip()
     if category.casefold() in ("standard", "simple/mix color"):
@@ -8348,6 +8428,10 @@ def invoice_stock_text_key(value):
     return " ".join(str(value or "").split()).casefold()
 
 
+def invoice_stock_description_key(value):
+    return re.sub(r"(?<=\d)\s*[x×]\s*(?=\d)", "x", invoice_stock_text_key(value))
+
+
 def invoice_stock_size_key(value):
     return invoice_stock_text_key(canonical_price_size(value))
 
@@ -8361,11 +8445,29 @@ async def invoice_stock_deductions(invoice, allow_empty=False):
             invoice_stock_size_key(stock.get("size")),
         )
         stock_by_product_size.setdefault(key, []).append(stock)
+    imraan_freeform = uses_freeform_invoice_items(active_company_id.get())
     quantities = {}
     current_by_stock = {}
     for index, item in enumerate(invoice.get("items", []), 1):
-        products = invoice_stock_product_aliases(item)
+        category = (item.get("category") or "").strip()
         size = (item.get("size") or "").strip()
+        if imraan_freeform and (not category or not size):
+            description_key = invoice_stock_description_key(item.get("description"))
+            description_matches = {
+                (invoice_stock_text_key(stock.get("product")), invoice_stock_size_key(stock.get("size"))):
+                (stock.get("product"), stock.get("size"))
+                for stock in stock_items
+                if description_key in {
+                    invoice_stock_description_key(f"{stock.get('product', '')} {stock.get('size', '')}"),
+                    invoice_stock_description_key(f"{stock.get('product', '')} - {stock.get('size', '')}"),
+                    invoice_stock_description_key(f"{stock.get('product', '')} · {stock.get('size', '')}"),
+                }
+            }
+            if len(description_matches) == 1:
+                category, size = next(iter(description_matches.values()))
+        products = invoice_stock_product_aliases(item)
+        if category and not (item.get("category") or "").strip():
+            products = invoice_stock_product_aliases({**item, "category": category})
         if not products[0] or not size:
             continue
         normalized_size = invoice_stock_size_key(size)
@@ -8546,6 +8648,12 @@ async def get_stock(user=Depends(get_current_user)):
     movements_by_stock = await stock_movements_for_stock_ids([item["id"] for item in items])
     for s in items:
         apply_stock_movements(s, movements_by_stock.get(s["id"], []))
+        configured_threshold = stock_warning_threshold(s)
+        s["low_stock_threshold"] = (
+            configured_threshold if configured_threshold is not None
+            else s.get("threshold", 0)
+        )
+        s["low_stock"] = stock_warning_is_active(s)
     return [stock_for_user(item, user) for item in items]
 
 
@@ -8648,14 +8756,13 @@ class DailyStockCountLine(BaseModel):
 class PcsOutIn(BaseModel):
     product: str = Field(min_length=1, max_length=120)
     size: str = Field(min_length=1, max_length=80)
-    quantity: int = Field(gt=0, le=1_000_000_000)
+    quantity: int = Field(gt=0)
 
-    @field_validator("product", "size")
+    @field_validator("quantity")
     @classmethod
-    def pcs_out_value_required(cls, value):
-        value = value.strip()
-        if not value:
-            raise ValueError("Product and size are required")
+    def finite_pcs_out_quantity(cls, value):
+        if not math.isfinite(value):
+            raise ValueError("Pcs Out quantity must be finite")
         return value
 
 
@@ -8674,7 +8781,7 @@ class DailyStockReconciliationIn(BaseModel):
         return self
 
 
-def daily_stock_count_specs(stock_items, pcs_out_records=()):
+def daily_stock_count_specs(stock_items):
     specs = {}
     for product, size, _quantity in RIGHT_STOCK_UPDATE_ITEMS:
         canonical_product = right_stock_canonical_product(product)
@@ -8688,13 +8795,6 @@ def daily_stock_count_specs(stock_items, pcs_out_records=()):
         key = daily_stock_identity_key(product, size)
         specs.setdefault(key, {"product": product, "size": size, "records": []})
         specs[key]["records"].append(stock)
-    for record in pcs_out_records:
-        product = right_stock_canonical_product(record.get("product"))
-        size = str(record.get("size") or "").strip()
-        if not product or not size:
-            continue
-        key = daily_stock_identity_key(product, size)
-        specs.setdefault(key, {"product": product, "size": size, "records": []})
     return list(specs.values())
 
 
@@ -8705,7 +8805,6 @@ def daily_stock_movement_summary(movements):
         "other_out": 0.0,
         "received_in": 0.0,
         "production_in": 0.0,
-        "pcs_out": 0.0,
     }
     for movement in movements:
         quantity = float(movement.get("quantity") or 0)
@@ -8725,15 +8824,7 @@ def daily_stock_movement_summary(movements):
 
 async def daily_stock_reconciliation_data(report_date):
     stock_items = await listall("stock")
-    pcs_out_records = await listall("stock_pcs_out", {
-        "company_id": DEFAULT_COMPANY_ID,
-        "date": report_date,
-    })
-    specs = daily_stock_count_specs(stock_items, pcs_out_records)
-    pcs_out_by_key = {}
-    for record in pcs_out_records:
-        key = daily_stock_identity_key(record.get("product"), record.get("size"))
-        pcs_out_by_key[key] = pcs_out_by_key.get(key, 0) + int(record.get("quantity") or 0)
+    specs = daily_stock_count_specs(stock_items)
     stock_ids = [
         stock["id"]
         for spec in specs
@@ -8741,6 +8832,11 @@ async def daily_stock_reconciliation_data(report_date):
     ]
     movements_by_stock = await stock_movements_for_stock_ids(stock_ids)
     movements_today = await listall("stock_movements", {"date": report_date})
+    pcs_out_records = await listall("stock_pcs_out", {"date": report_date})
+    pcs_out_by_key = {}
+    for record in pcs_out_records:
+        key = daily_stock_identity_key(record.get("product"), record.get("size"))
+        pcs_out_by_key[key] = r2(pcs_out_by_key.get(key, 0) + float(record.get("quantity") or 0))
     movements_today_by_stock = {}
     for movement in movements_today:
         movements_today_by_stock.setdefault(movement.get("stock_id"), []).append(movement)
@@ -8776,18 +8872,18 @@ async def daily_stock_reconciliation_data(report_date):
                  if stock.get("product_id") or stock.get("code")),
                 "",
             ),
-            "has_stock_record": bool(spec["records"]),
             "book_quantity": r2(book_quantity),
             "quantity": saved_counts.get(key),
             "made_today": saved_production.get(key, 0),
-            "pcs_out": pcs_out_by_key.get(key, 0),
             "invoice_out": activity["invoice_out"],
             "dispatch_out": activity["dispatch_out"],
             "other_out": activity["other_out"],
             "received_in": activity["received_in"],
+            "pcs_out": pcs_out_by_key.get(key, 0),
+            "has_stock_record": bool(spec["records"]),
         })
     activity = daily_stock_movement_summary(summary_movements)
-    activity["pcs_out"] = sum(pcs_out_by_key.values())
+    activity["pcs_out"] = r2(sum(pcs_out_by_key.values()))
     return {
         "report_date": report_date,
         "already_submitted": bool(saved),
@@ -8812,41 +8908,43 @@ async def get_daily_stock_reconciliation(user, report_date=None):
         active_company_id.reset(company_context)
 
 
+@api.get("/stock/pcs-out")
+async def get_pcs_out_route(user=Depends(get_current_user)):
+    company_id = user.get("_active_company_id") or user.get("company_id")
+    if company_id != DEFAULT_COMPANY_ID:
+        raise HTTPException(403, "Pcs Out is only available in SuperIQFoam")
+    require_global_owner(user)
+    records = await listall("stock_pcs_out", {"date": today_str()}, sort=("created_at", -1))
+    return sorted(records, key=lambda record: str(record.get("created_at") or ""), reverse=True)
+
+
+@api.post("/stock/pcs-out")
+async def add_pcs_out_route(body: PcsOutIn, user=Depends(get_current_user)):
+    company_id = user.get("_active_company_id") or user.get("company_id")
+    if company_id != DEFAULT_COMPANY_ID:
+        raise HTTPException(403, "Pcs Out is only available in SuperIQFoam")
+    require_global_owner(user)
+    product = right_stock_canonical_product(body.product)
+    size = str(body.size).strip()
+    if not product or not size:
+        raise HTTPException(400, "Product and size are required")
+    record = await insert("stock_pcs_out", {
+        "date": today_str(),
+        "product": product,
+        "size": size,
+        "quantity": body.quantity,
+    })
+    await log_audit("stock_pcs_out", record["id"], "posted", user, after=record,
+                    reason="PCS OUT - PRODUCED AND SHIPPED IMMEDIATELY")
+    return record
+
+
 @api.get("/stock/daily-reconciliation")
 async def get_daily_stock_reconciliation_route(
     report_date: Optional[str] = None,
     user=Depends(get_current_user),
 ):
     return await get_daily_stock_reconciliation(user, report_date)
-
-
-@api.get("/stock/pcs-out")
-async def get_pcs_out_today(user=Depends(get_current_user)):
-    company_id = user.get("_active_company_id") or user.get("company_id")
-    if company_id != DEFAULT_COMPANY_ID:
-        raise HTTPException(403, "Pcs Out is only available in SuperIQFoam")
-    require_global_owner(user)
-    return await listall("stock_pcs_out", {
-        "company_id": DEFAULT_COMPANY_ID,
-        "date": today_str(),
-    }, sort=("created_at", -1))
-
-
-@api.post("/stock/pcs-out")
-async def add_pcs_out(body: PcsOutIn, user=Depends(get_current_user)):
-    company_id = user.get("_active_company_id") or user.get("company_id")
-    if company_id != DEFAULT_COMPANY_ID:
-        raise HTTPException(403, "Pcs Out is only available in SuperIQFoam")
-    require_global_owner(user)
-    record = await insert("stock_pcs_out", {
-        **body.model_dump(),
-        "company_id": DEFAULT_COMPANY_ID,
-        "date": today_str(),
-        "created_by": worker_display_name(user),
-        "created_by_user_id": user.get("id", ""),
-    })
-    await log_audit("stock_pcs_out", record["id"], "created", user, after=record)
-    return record
 
 
 @api.post("/stock/update-right-stock")
@@ -8992,22 +9090,14 @@ async def update_daily_stock_reconciliation(
                 "unexpected_count": len(unexpected),
             })
 
-        initial_pcs_out = await listall("stock_pcs_out", {
-            "company_id": DEFAULT_COMPANY_ID,
-            "date": body.report_date,
-        })
-        initial_stock_specs = daily_stock_count_specs(await listall("stock"), initial_pcs_out)
+        initial_stock_specs = daily_stock_count_specs(await listall("stock"))
         existing_ids = sorted(
             stock["id"]
             for spec in initial_stock_specs
             for stock in spec["records"]
         )
         async with StockLock(existing_ids):
-            pcs_out_records = await listall("stock_pcs_out", {
-                "company_id": DEFAULT_COMPANY_ID,
-                "date": body.report_date,
-            })
-            specs = daily_stock_count_specs(await listall("stock"), pcs_out_records)
+            specs = daily_stock_count_specs(await listall("stock"))
             current_ids = sorted(
                 stock["id"]
                 for spec in specs
@@ -9017,17 +9107,6 @@ async def update_daily_stock_reconciliation(
                 raise HTTPException(409, "Stock products changed while preparing the count sheet. Reload and retry.")
             if {daily_stock_identity_key(spec["product"], spec["size"]) for spec in specs} != set(submitted):
                 raise HTTPException(409, "Stock categories or sizes changed while preparing the count sheet. Reload and retry.")
-            pcs_out_keys = {
-                daily_stock_identity_key(record.get("product"), record.get("size"))
-                for record in pcs_out_records
-            }
-            if any(
-                not spec["records"]
-                and daily_stock_identity_key(spec["product"], spec["size"]) in pcs_out_keys
-                and submitted[daily_stock_identity_key(spec["product"], spec["size"])].quantity is not None
-                for spec in specs
-            ):
-                raise HTTPException(400, "Pcs Out items shipped immediately cannot be added to the physical stock count.")
 
             movements_by_stock = await stock_movements_for_stock_ids(current_ids)
             reconciliation_id = f"daily-stock-reconciliation:{body.report_date}"
@@ -9406,10 +9485,21 @@ async def get_production(include_archived: bool = False, user=Depends(get_curren
 class BlockCuttingIn(BaseModel):
     block: str
     size: Optional[str] = None
+    date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     pieces_recovered: int = Field(gt=0, le=1_000_000_000)
     has_sheet: bool = False
     sheet_mm: Optional[int] = Field(default=None, gt=0, le=1_000_000_000)
     sheet_pieces_recovered: Optional[int] = Field(default=None, gt=0, le=1_000_000_000)
+
+    @field_validator("date")
+    @classmethod
+    def block_cutting_date_valid(cls, value):
+        if value is not None:
+            try:
+                date.fromisoformat(value)
+            except ValueError as error:
+                raise ValueError("Enter a valid block cutting date") from error
+        return value
 
 def normalize_block_name(block):
     value = str(block or "").strip()
@@ -9439,6 +9529,7 @@ async def add_block_cutting(body: BlockCuttingIn, user=Depends(get_current_user)
     record = await insert("block_cuttings", {
         "block": block,
         "size": size or None,
+        "date": body.date or today_str(),
         "pieces_recovered": body.pieces_recovered,
         "has_sheet": body.has_sheet,
         "sheet_mm": body.sheet_mm if body.has_sheet else None,
@@ -9465,6 +9556,7 @@ async def edit_block_cutting(record_id: str, body: BlockCuttingIn, user=Depends(
     record = await update_doc("block_cuttings", record_id, {
         "block": block,
         "size": size or None,
+        "date": body.date or before.get("date") or str(before.get("created_at", today_str()))[:10],
         "pieces_recovered": body.pieces_recovered,
         "has_sheet": body.has_sheet,
         "sheet_mm": body.sheet_mm if body.has_sheet else None,
@@ -9675,7 +9767,14 @@ async def add_department(body: DepartmentIn, user=Depends(get_current_user)):
 async def get_employees(user=Depends(get_current_user)):
     employees = await listall("employees", sort=("name", 1))
     return [
-        {**employee, "pay_type": "piece" if is_piece_paid_employee(employee) else employee.get("pay_type", "hourly")}
+        {
+            **employee,
+            "pay_type": (
+                "piece" if is_piece_paid_employee(employee) else "hourly"
+            ) if employee.get("pay_mode") in {"standard", "piecework", "monthly"}
+            else "piece" if is_piece_paid_employee(employee)
+            else employee.get("pay_type", "hourly"),
+        }
         for employee in employees
     ]
 
@@ -9709,6 +9808,10 @@ def payroll_employee_name_key(name):
 
 def is_piece_paid_employee(employee):
     normalized_name = " ".join((employee.get("name") or "").split()).upper()
+    if employee.get("pay_mode") in {"standard", "monthly"}:
+        return False
+    if employee.get("pay_mode") == "piecework":
+        return True
     return (
         employee.get("pay_type") == "piece"
         or normalized_name in seed_data.PIECEWORK_EMPLOYEE_NAMES
@@ -9716,21 +9819,13 @@ def is_piece_paid_employee(employee):
 
 
 def is_monthly_fixed_salary_employee(employee):
+    if employee.get("pay_mode") is not None:
+        return employee.get("pay_mode") == "monthly"
     normalized_name = " ".join(
         "".join(character if character.isalnum() else " " for character in (employee.get("name") or "")).split()
     ).upper()
     tokens = set(normalized_name.split())
-    return normalized_name in {"AMEENA", "AMINA", "YASSINE", "MR YASEEN", "MR YASSINE"} or (
-        "UNCLE" in tokens and bool(tokens & {"YASEEN", "YASSEN", "YASSINE", "YASIN"})
-    )
-
-
-def is_always_present_salary_employee(employee):
-    normalized_name = " ".join(
-        "".join(character if character.isalnum() else " " for character in (employee.get("name") or "")).split()
-    ).upper()
-    tokens = set(normalized_name.split())
-    return normalized_name in {"AMEENA", "AMINA", "YASSINE", "MR YASEEN", "MR YASSINE"} or (
+    return normalized_name in {"AMEENA", "AMINA", "MR YASEEN", "MR YASSINE"} or (
         "UNCLE" in tokens and bool(tokens & {"YASEEN", "YASSEN", "YASSINE", "YASIN"})
     )
 
@@ -9740,7 +9835,8 @@ def piecework_includes_sunday(employee_name):
 
 
 def uses_daily_piecework_rates(employee):
-    normalized_name = " ".join((employee.get("name") or "").split()).upper()
+    employee_name = employee.get("name") if isinstance(employee, dict) else employee
+    normalized_name = " ".join((employee_name or "").split()).upper()
     return normalized_name in seed_data.PIECEWORK_EMPLOYEE_NAMES
 
 
@@ -9939,16 +10035,8 @@ async def delete_employee(eid: str, user=Depends(get_current_user)):
         **employee, "deleted_at": deleted_at, "deleted_by": user.get("id"),
     })
     await db.employees.delete_one({"id": eid})
-
-    for collection_name in ("attendance", "piece_production", "salary_advances", "salary_cuts"):
-        await db[collection_name].delete_many({"employee_id": eid})
-
     await log_audit("employee", eid, "permanently_deleted", user,
-                    before=employee, after={
-                        "deleted_at": deleted_at,
-                        "removed_salary_related_records": True,
-                        "payment_history_retained": True,
-                    })
+                    before=employee, after={"deleted_at": deleted_at})
     return {"ok": True, "deleted": True}
 
 def validate_iso_date(value):
@@ -10025,6 +10113,10 @@ async def add_attendance(body: AttendanceIn, user=Depends(get_current_user)):
         raise HTTPException(400, "Invalid attendance status")
     existing = await db.attendance.find_one({"employee_id": body.employee_id, "date": body.date})
     data = body.model_dump()
+    data.pop("salary_overtime_override", None)
+    data.pop("salary_overtime_rate_override", None)
+    data["salary_overtime_override"] = None
+    data["salary_overtime_rate_override"] = None
     if data["overtime_hours"] is None:
         data["overtime_hours"] = (existing or {}).get("overtime_hours", 0) if body.status in ("Present", "Half Day") else 0
     time_fields_set = body.model_fields_set.intersection({"start_time", "end_time"})
@@ -10075,6 +10167,23 @@ class SalaryRateIn(BaseModel):
     weekly_salary: Optional[float] = Field(default=None, gt=0)
     monthly_salary: Optional[float] = Field(default=None, gt=0)
     work_days_per_week: Optional[int] = Field(default=None, ge=6, le=6)
+    overtime_rate: Optional[float] = Field(default=None, ge=0)
+    pay_divisor: Optional[float] = Field(default=None, ge=1)
+    half_day_hours: Optional[float] = Field(default=None, ge=1, le=8)
+    piecework_formula: Optional[str] = Field(default=None)
+    pay_mode: Optional[Literal["standard", "piecework", "monthly"]] = None
+
+class WeeklyOvertimeIn(BaseModel):
+    employee_id: str = Field(min_length=1, max_length=120)
+    period_start: str
+    period_end: str
+    overtime_hours: float = Field(ge=0, le=168, allow_inf_nan=False)
+    overtime_rate: float = Field(ge=0, allow_inf_nan=False)
+
+    @field_validator("period_start", "period_end")
+    @classmethod
+    def weekly_overtime_dates_valid(cls, value):
+        return validate_iso_date(value)
 
 class SalaryPaymentIn(BaseModel):
     employee_id: str
@@ -10089,6 +10198,40 @@ class SalaryPaymentIn(BaseModel):
     def salary_payment_dates_valid(cls, value):
         return validate_iso_date(value)
 
+
+class WeeklySalaryPaymentPlanIn(BaseModel):
+    period_start: str
+    period_end: str
+    friday_employee_ids: List[str] = Field(default_factory=list, max_length=1000)
+
+    @field_validator("period_start", "period_end")
+    @classmethod
+    def weekly_salary_plan_dates_valid(cls, value):
+        return validate_iso_date(value)
+
+
+class WeeklySalaryPaymentIn(BaseModel):
+    employee_id: str = Field(min_length=1, max_length=120)
+    period_start: str
+    period_end: str
+    payment_date: str
+    amount: float = Field(gt=0, allow_inf_nan=False)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+    notes: Optional[str] = Field(default="", max_length=1000)
+
+    @field_validator("period_start", "period_end", "payment_date")
+    @classmethod
+    def weekly_salary_payment_dates_valid(cls, value):
+        return validate_iso_date(value)
+
+    @field_validator("amount")
+    @classmethod
+    def weekly_salary_payment_amount_is_cents(cls, value):
+        decimal_amount = Decimal(str(value))
+        if decimal_amount != decimal_amount.quantize(Decimal("0.01")):
+            raise ValueError("Payment amount must not include fractions of a cent")
+        return value
+
 class PieceProductionIn(BaseModel):
     employee_id: str
     date: str
@@ -10098,6 +10241,27 @@ class PieceProductionIn(BaseModel):
     @classmethod
     def piece_date_valid(cls, value):
         return validate_iso_date(value)
+
+async def ensure_piecework_period_unpaid(employee_id, work_date):
+    work_day = date.fromisoformat(work_date)
+    week_start = work_day - timedelta(days=work_day.weekday())
+    week_end = week_start + timedelta(days=5)
+    payroll_key = salary_payroll_key("weekly", week_start.isoformat(), week_end.isoformat())
+    account = None
+    payment = None
+    account_collection = getattr(db, "salary_weekly_payment_accounts", None)
+    payment_collection = getattr(db, "salary_payments", None)
+    if account_collection is not None:
+        account = await account_collection.find_one(
+            {"id": f"{payroll_key}:{employee_id}"}, {"_id": 0}
+        )
+    if payment_collection is not None:
+        payment = await payment_collection.find_one(
+            {"employee_id": employee_id, "payroll_key": payroll_key}, {"_id": 0}
+        )
+    if int((account or {}).get("paid_amount_cents") or 0) > 0 or payment:
+        raise HTTPException(409, "Piecework cannot be changed after a salary payment has been recorded")
+
 
 @api.get("/piece-production")
 async def get_piece_production(start_date: str, end_date: str, user=Depends(get_current_user)):
@@ -10117,6 +10281,7 @@ async def piecework_week_snapshot(employee_id, work_date, employee_name):
         include_sunday=piecework_includes_sunday(employee_name),
         start_date=week_start.isoformat(),
         end_date=week_end.isoformat(),
+        daily_rate_tiers=uses_daily_piecework_rates(employee_name),
     )
     return result["weeks"][0]
 
@@ -10132,6 +10297,9 @@ async def save_piece_production(body: PieceProductionIn, user=Depends(get_curren
         raise HTTPException(404, "Employee not found")
     if not is_piece_paid_employee(employee):
         raise HTTPException(400, "Piece production is only available for piece-paid employees")
+    if not uses_daily_piecework_rates(employee):
+        raise HTTPException(400, "This piecework editor is restricted to Ayanda Tailor and Asive Tailor")
+    await ensure_piecework_period_unpaid(body.employee_id, body.date)
     data = {**body.model_dump(), "employee_name": employee.get("name", "")}
     work_date = date.fromisoformat(body.date)
     previous_calculation = await piecework_week_snapshot(body.employee_id, work_date, employee.get("name", ""))
@@ -10143,6 +10311,26 @@ async def save_piece_production(body: PieceProductionIn, user=Depends(get_curren
     existing, saved = await _save_employee_day_record(
         "piece_production", body.employee_id, body.date, data,
     )
+    if body.pieces > 0:
+        attendance_record = await db.attendance.find_one(
+            {"employee_id": body.employee_id, "date": body.date},
+            {"_id": 0},
+        )
+        attendance_status = (attendance_record or {}).get("status")
+        if attendance_status not in ("Present", "Half Day"):
+            await _save_employee_day_record(
+                "attendance", body.employee_id, body.date,
+                {
+                    "employee_id": body.employee_id,
+                    "employee_name": employee.get("name", ""),
+                    "department": employee.get("department", ""),
+                    "date": body.date,
+                    "status": "Present",
+                    "overtime_hours": (attendance_record or {}).get("overtime_hours", 0),
+                    "salary_overtime_override": None,
+                    "salary_overtime_rate_override": None,
+                },
+            )
     next_calculation = await piecework_week_snapshot(body.employee_id, work_date, employee.get("name", ""))
     if existing:
         await log_audit(
@@ -10169,6 +10357,7 @@ async def delete_piece_production(record_id: str, user=Depends(get_current_user)
     employee = await db.employees.find_one({"id": record.get("employee_id")}, {"_id": 0})
     employee_name = (employee or {}).get("name") or record.get("employee_name", "")
     work_date = date.fromisoformat(record["date"])
+    await ensure_piecework_period_unpaid(record["employee_id"], record["date"])
     previous_calculation = await piecework_week_snapshot(record["employee_id"], work_date, employee_name)
     audit_reason = (
         "Historical production deletion preserves the prior weekly calculation in this audit entry."
@@ -10235,12 +10424,7 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
         payroll_month_end = payroll_month_start.replace(
             day=calendar.monthrange(payroll_month_start.year, payroll_month_start.month)[1]
         )
-        monthly_salary = (
-            employee.get("monthly_salary")
-            if is_monthly_fixed and employee.get("monthly_salary") is not None
-            else r2(employee.get("weekly_salary")) if is_monthly_fixed and employee.get("weekly_salary") is not None
-            else None
-        )
+        monthly_salary = employee.get("monthly_salary") if is_monthly_fixed else None
         configured_hourly_rate = employee.get("hourly_rate")
         hourly_rate = float(configured_hourly_rate) if configured_hourly_rate else 0
         weekly_salary = employee.get("weekly_salary") if not is_piece_paid and not is_monthly_fixed else None
@@ -10273,8 +10457,6 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
             [record for record in attendance if record.get("employee_id") == employee["id"]],
             key=lambda record: record.get("date", ""),
         )
-        if is_always_present_salary_employee(employee) and is_monthly_fixed:
-            rows = []
         employee_piecework = calculate_piecework([
             record for record in piece_records if record.get("employee_id") == employee["id"]
         ], include_sunday=piecework_includes_sunday(employee.get("name", "")),
@@ -10282,21 +10464,68 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
             start_date=start_date, end_date=end_date) if is_piece_paid else {
                 "days": [], "total_pieces": 0, "piece_rate": 0, "piece_pay": 0, "weeks": [],
             }
-        days = [] if is_piece_paid else calculate_salary_hours(rows)
+        days = calculate_salary_hours(
+            rows,
+            half_day_hours=float(employee.get("half_day_hours", 5)),
+        )
         worked_hours = sum(day["worked_hours"] for day in days)
         regular_hours = sum(day["regular_hours"] for day in days)
         overtime_hours = sum(day["overtime_hours"] for day in days)
         present_days = sum(day["status"] == "Present" for day in days)
         half_days = sum(day["status"] == "Half Day" for day in days)
         for day in days:
-            day["regular_pay"] = r2(
-                D(weekly_salary or 0) * D(day["attendance_fraction"]) / D(STANDARD_PAID_DAYS_PER_WEEK)
-            ) if not is_monthly_fixed else 0
-            day["overtime_pay"] = r2((
-                D(day["overtime_hours"] - day["overtime_after_17_hours"]) * D(OVERTIME_HOURLY_RATE)
-                + D(day["overtime_after_17_hours"]) * D(OVERTIME_AFTER_17_HOURLY_RATE)
-            )) if not is_monthly_fixed else 0
+            if is_monthly_fixed:
+                day["regular_pay"] = 0
+                day["overtime_pay"] = 0
+            else:
+                day["regular_pay"] = r2(
+                    D(weekly_salary or 0)
+                    * D(day.get("attendance_fraction", 0))
+                    / D(STANDARD_PAID_DAYS_PER_WEEK)
+                )
+                configured_overtime_rate = employee.get("overtime_rate")
+                if configured_overtime_rate is not None:
+                    day["overtime_pay"] = r2(D(day["overtime_hours"]) * D(configured_overtime_rate))
+                else:
+                    day["overtime_pay"] = r2((
+                        D(day["overtime_hours"] - day["overtime_after_17_hours"]) * D(OVERTIME_HOURLY_RATE)
+                        + D(day["overtime_after_17_hours"]) * D(OVERTIME_AFTER_17_HOURLY_RATE)
+                    ))
             day["pay"] = r2(D(day["regular_pay"]) + D(day["overtime_pay"]))
+        override_weeks = {}
+        effective_overtime_rate = employee.get("overtime_rate")
+        for day in days:
+            if day.get("salary_overtime_override") is None:
+                continue
+            work_date = date.fromisoformat(day["date"])
+            week_start = work_date - timedelta(days=work_date.weekday())
+            override_weeks[week_start] = (
+                D(day["salary_overtime_override"]),
+                D(day.get("salary_overtime_rate_override", employee.get(
+                    "overtime_rate", OVERTIME_HOURLY_RATE,
+                ))),
+            )
+        if override_weeks and not is_monthly_fixed:
+            for week_start, (override_hours, overtime_rate) in override_weeks.items():
+                week_days = [
+                    day for day in days
+                    if date.fromisoformat(day["date"]) - timedelta(
+                        days=date.fromisoformat(day["date"]).weekday()
+                    ) == week_start
+                ]
+                if not week_days:
+                    continue
+                override_pay = r2(override_hours * overtime_rate)
+                effective_overtime_rate = float(overtime_rate)
+                for day in week_days:
+                    day["overtime_hours"] = 0
+                    day["overtime_after_17_hours"] = 0
+                    day["overtime_pay"] = 0
+                    day["pay"] = day["regular_pay"]
+                week_days[-1]["overtime_hours"] = float(override_hours)
+                week_days[-1]["overtime_pay"] = override_pay
+                week_days[-1]["pay"] = r2(D(week_days[-1]["regular_pay"]) + D(override_pay))
+            overtime_hours = sum(day["overtime_hours"] for day in days)
         employee_advances = [item for item in advances if item.get("employee_id") == employee["id"]]
         employee_cuts = [item for item in cuts if item.get("employee_id") == employee["id"]]
         all_advance_total = sum((D(item.get("amount", 0)) for item in employee_advances), Decimal("0"))
@@ -10315,7 +10544,9 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
         ))
         regular_pay = r2(sum(
             (
-                D(weekly_salary) * D(day["attendance_fraction"]) / D(STANDARD_PAID_DAYS_PER_WEEK)
+                D(weekly_salary)
+                * D(day.get("attendance_fraction", 0))
+                / D(STANDARD_PAID_DAYS_PER_WEEK)
                 for day in days
             ),
             Decimal("0"),
@@ -10328,9 +10559,51 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
             is_monthly_fixed and monthly_salary is not None
             and (full_month_period or include_monthly_salaries)
         ) else 0
-        gross = employee_piecework["piece_pay"] if is_piece_paid else (
-            monthly_pay if is_monthly_fixed else r2(regular_pay + overtime_pay)
-        )
+        piece_formula = employee.get("piecework_formula")
+        piece_formula_details = []
+        if is_piece_paid and piece_formula:
+            piecework_by_week = {}
+            for record in piece_records:
+                if record.get("employee_id") != employee["id"]:
+                    continue
+                work_date = date.fromisoformat(record["date"])
+                week_start = work_date - timedelta(days=work_date.weekday())
+                quantities = piecework_by_week.setdefault(week_start, [0] * 6)
+                quantities[work_date.weekday()] += int(record.get("pieces", 0))
+            overtime_by_week = {}
+            for day in days:
+                if day.get("overtime_hours"):
+                    work_date = date.fromisoformat(day["date"])
+                    week_start = work_date - timedelta(days=work_date.weekday())
+                    overtime_by_week[week_start] = overtime_by_week.get(week_start, Decimal("0")) + D(day["overtime_pay"])
+            week_starts = set(piecework_by_week) | set(overtime_by_week)
+            week_start = date.fromisoformat(start_date)
+            week_start -= timedelta(days=week_start.weekday())
+            period_end = date.fromisoformat(end_date)
+            while week_start <= period_end:
+                week_starts.add(week_start)
+                week_start += timedelta(days=7)
+            for week_start in sorted(week_starts):
+                formula_result = calculate_piecework_formula(
+                    piecework_by_week.get(week_start, [0] * 6),
+                    piece_formula,
+                    overtime_amount=overtime_by_week.get(week_start, 0),
+                )
+                piece_formula_details.append({
+                    "week_start": week_start.isoformat(),
+                    "formula": piece_formula,
+                    "quantities": piecework_by_week.get(week_start, [0] * 6),
+                    **formula_result,
+                })
+            formula_piece_pay = sum((D(item["piece_pay"]) for item in piece_formula_details), Decimal("0"))
+            formula_overtime_pay = sum((D(item["overtime_amount"]) for item in piece_formula_details), Decimal("0"))
+            employee_piecework["piece_pay"] = r2(formula_piece_pay)
+            employee_piecework["overtime_pay"] = r2(formula_overtime_pay)
+            gross = r2(sum((D(item["gross"]) for item in piece_formula_details), Decimal("0")))
+        else:
+            gross = r2(D(employee_piecework["piece_pay"]) + D(overtime_pay)) if is_piece_paid else (
+                monthly_pay if is_monthly_fixed else r2(regular_pay + overtime_pay)
+            )
         cut = period_cut
         balance = all_advance_total - all_cut_total
         balance_period_start = (
@@ -10380,6 +10653,19 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
             running_balance += amount if transaction["type"] == "advance" else -amount
             transaction["balance_after"] = r2(running_balance)
             transaction.pop("_sort_at")
+        net_and_balance = calculate_net_and_balance(
+            gross,
+            cut,
+            opening_balance=balance_before_period,
+        )
+        standard_salary_detail = None
+        if not is_piece_paid and not is_monthly_fixed:
+            standard_salary_detail = calculate_salary_rule(
+                weekly_salary or 0,
+                worked_hours,
+                overtime_amount=overtime_pay,
+                divisor=float(employee.get("pay_divisor", 48)),
+            )
         result.append({
             "employee_id": employee["id"], "name": employee.get("name", ""),
             "department": employee.get("department", ""), "active": employee.get("active", True),
@@ -10394,9 +10680,15 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
             "is_full_month_period": full_month_period,
             "hours_per_week": hours_per_week, "work_days_per_week": work_days_per_week,
             "pay_type": "piece" if is_piece_paid else "hourly",
+            "pay_mode": "piecework" if is_piece_paid else ("monthly" if is_monthly_fixed else "standard"),
+            "pay_divisor": float(employee.get("pay_divisor", 48)),
+            "half_day_hours": float(employee.get("half_day_hours", 5)),
+            "overtime_rate": float(effective_overtime_rate) if effective_overtime_rate is not None else None,
+            "piecework_formula": employee.get("piecework_formula"),
             "total_pieces": employee_piecework["total_pieces"],
             "piece_rate": employee_piecework["piece_rate"],
             "piece_pay": employee_piecework["piece_pay"],
+            "piece_formula_details": piece_formula_details,
             "piece_days": employee_piecework["days"],
             "piece_weeks": employee_piecework["weeks"],
             "days": days, "present_days": present_days, "half_days": half_days,
@@ -10408,7 +10700,11 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
             "balance": r2(balance),
             "available_balance": r2(balance_through_period + D(cut)),
             "balance_history": balance_history,
-            "cut": cut, "net_salary": r2(gross - cut),
+            "cut": cut,
+            "net_salary": r2(net_and_balance["net_pay"]),
+            "period_opening_balance": r2(balance_before_period),
+            "period_remaining_balance": r2(net_and_balance["remaining_balance"]),
+            "standard_salary_detail": standard_salary_detail,
         })
     return {
         "start_date": start_date,
@@ -10488,6 +10784,445 @@ def salary_payroll_key(period_type, period_start, period_end):
     raise HTTPException(400, "Unsupported payroll period type")
 
 
+def require_superiqfoam_weekly_salary_access(user):
+    require_admin(user)
+    company_id = active_company_id.get() or user.get("_active_company_id") or DEFAULT_COMPANY_ID
+    if company_id != DEFAULT_COMPANY_ID:
+        raise HTTPException(404, "Weekly split salary payments are only available for SuperIQFoam")
+
+
+def superiqfoam_weekly_salary_period(period_start, period_end):
+    payroll_key = salary_payroll_key("weekly", period_start, period_end)
+    monday = date.fromisoformat(period_start)
+    return {
+        "payroll_key": payroll_key,
+        "period_start": period_start,
+        "period_end": period_end,
+        "friday_date": (monday + timedelta(days=4)).isoformat(),
+        "saturday_date": (monday + timedelta(days=5)).isoformat(),
+    }
+
+
+def salary_amount_to_cents(value):
+    return int((D(value or 0) * D(100)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def salary_calculation_snapshot(employee):
+    fields = (
+        "pay_mode", "pay_frequency", "weekly_salary", "monthly_salary",
+        "hourly_rate", "pay_divisor", "half_day_hours", "overtime_rate",
+        "piecework_formula", "worked_hours", "worked_days", "regular_hours",
+        "overtime_hours", "regular_pay", "overtime_pay", "piece_pay",
+        "piece_formula_details", "piece_days", "days", "gross_salary",
+        "standard_salary_detail", "period_opening_balance", "period_remaining_balance",
+        "cut", "net_salary", "balance_before_period", "balance_after_period",
+    )
+    return {
+        "version": 1,
+        "calculated_at": now_iso(),
+        **{field: employee.get(field) for field in fields},
+    }
+
+
+def weekly_salary_payment_summary(
+    employees, friday_employee_ids, payment_accounts, legacy_payments,
+    period_start, period_end,
+):
+    period = superiqfoam_weekly_salary_period(period_start, period_end)
+    friday_ids = set(friday_employee_ids or [])
+    accounts_by_employee = {account.get("employee_id"): account for account in payment_accounts}
+    legacy_by_employee = {payment.get("employee_id"): payment for payment in legacy_payments}
+    rows = []
+    for employee in employees:
+        if employee.get("pay_frequency") == "monthly_fixed":
+            continue
+        employee_id = employee["employee_id"]
+        account = accounts_by_employee.get(employee_id) or {}
+        legacy = legacy_by_employee.get(employee_id)
+        snapshot = account.get("calculation_snapshot") or (
+            legacy.get("calculation_snapshot") if legacy else None
+        ) or {}
+        legacy_group = (
+            "friday" if legacy and legacy.get("payment_date") == period["friday_date"]
+            else "saturday" if legacy and legacy.get("payment_date") == period["saturday_date"]
+            else None
+        )
+        group = account.get("payment_group") or legacy_group or (
+            "friday" if employee_id in friday_ids else "saturday"
+        )
+        calculated_due_cents = max(0, salary_amount_to_cents(
+            employee.get("net_salary", D(employee.get("gross_salary", 0)) - D(employee.get("cut", 0))),
+        ))
+        due_cents = int(account.get("due_amount_cents") or 0) if account else 0
+        if due_cents <= 0:
+            due_cents = salary_amount_to_cents(legacy.get("net_amount", 0)) if legacy else calculated_due_cents
+        due_cents = max(0, due_cents)
+        if legacy:
+            payment_history = [{
+                "id": legacy.get("id"),
+                "amount_cents": salary_amount_to_cents(legacy.get("net_amount", 0)),
+                "payment_date": legacy.get("payment_date", ""),
+                "notes": legacy.get("notes", ""),
+                "legacy": True,
+            }]
+        else:
+            payment_history = list(account.get("payments") or [])
+        paid_cents = sum(max(0, int(payment.get("amount_cents") or 0)) for payment in payment_history)
+        remaining_cents = max(0, due_cents - paid_cents)
+        status = (
+            "Paid" if due_cents > 0 and paid_cents >= due_cents
+            else "Partially Paid" if paid_cents > 0
+            else "Scheduled" if due_cents > 0
+            else "Pending"
+        )
+        rows.append({
+            "employee_id": employee_id,
+            "employee_name": employee.get("name", ""),
+            "department": employee.get("department", ""),
+            "pay_frequency": employee.get("pay_frequency", "weekly_fixed"),
+            "salary_rate_missing": bool(employee.get("salary_rate_missing")),
+            "weekly_salary": snapshot.get("weekly_salary", employee.get("weekly_salary", 0)),
+            "overtime_hours": snapshot.get("overtime_hours", employee.get("overtime_hours", 0)),
+            "overtime_rate": snapshot.get("overtime_rate", employee.get("overtime_rate")),
+            "balance_before_period": employee.get("balance_before_period", 0),
+            "balance_after_period": employee.get("balance_after_period", 0),
+            "balance": employee.get("balance", 0),
+            "balance_history": employee.get("balance_history", []),
+            "gross_salary": snapshot.get("gross_salary", employee.get("gross_salary", 0)),
+            "balance_cut": snapshot.get("cut", employee.get("cut", 0)),
+            "net_salary": snapshot.get("net_salary", employee.get("net_salary", 0)),
+            "due_cents": due_cents,
+            "paid_cents": paid_cents,
+            "remaining_cents": remaining_cents,
+            "payment_group": group,
+            "payment_status": status,
+            "payment_history": payment_history,
+        })
+
+    def summarize_group(group):
+        group_rows = [row for row in rows if row["payment_group"] == group]
+        due_cents = sum(row["due_cents"] for row in group_rows)
+        paid_cents = sum(
+            int(payment.get("amount_cents") or 0)
+            for row in group_rows
+            for payment in row["payment_history"]
+            if payment.get("payment_date") == period[f"{group}_date"]
+        )
+        return {
+            "employee_count": len(group_rows),
+            "due_cents": due_cents,
+            "cash_required_cents": sum(row["remaining_cents"] for row in group_rows),
+            "actually_paid_cents": paid_cents,
+            "employees": group_rows,
+        }
+
+    friday = summarize_group("friday")
+    saturday = summarize_group("saturday")
+    total_salaries_cents = sum(row["due_cents"] for row in rows)
+    total_paid_cents = sum(row["paid_cents"] for row in rows)
+    return {
+        **period,
+        "friday_employee_ids": sorted(friday_ids),
+        "friday": friday,
+        "saturday": saturday,
+        "total_salaries_cents": total_salaries_cents,
+        "total_paid_cents": total_paid_cents,
+        "outstanding_cents": max(0, total_salaries_cents - total_paid_cents),
+    }
+
+
+async def superiqfoam_weekly_salary_data(period_start, period_end):
+    period = superiqfoam_weekly_salary_period(period_start, period_end)
+    report = await salary_report(period_start, period_end, include_monthly_salaries=True)
+    employees = [
+        employee for employee in report["employees"]
+        if employee.get("pay_frequency") != "monthly_fixed"
+    ]
+    plan = await db.salary_weekly_payment_plans.find_one(
+        {"id": period["payroll_key"]}, {"_id": 0},
+    )
+    friday_employee_ids = (plan or {}).get("friday_employee_ids", [])
+    accounts = await listall(
+        "salary_weekly_payment_accounts", {"payroll_key": period["payroll_key"]},
+    )
+    legacy_payments = await listall(
+        "salary_payments", {"payroll_key": period["payroll_key"]},
+    )
+    return weekly_salary_payment_summary(
+        employees,
+        friday_employee_ids,
+        accounts,
+        legacy_payments,
+        period_start,
+        period_end,
+    ), employees, plan
+
+
+@api.get("/salaries/weekly-plan")
+async def get_weekly_salary_plan(
+    period_start: str, period_end: str, user=Depends(get_current_user),
+):
+    require_superiqfoam_weekly_salary_access(user)
+    summary, _employees, plan = await superiqfoam_weekly_salary_data(period_start, period_end)
+    return {**summary, "plan_saved": bool(plan)}
+
+
+@api.put("/salaries/weekly-plan")
+async def save_weekly_salary_plan(
+    body: WeeklySalaryPaymentPlanIn, user=Depends(get_current_user),
+):
+    require_superiqfoam_weekly_salary_access(user)
+    period = superiqfoam_weekly_salary_period(body.period_start, body.period_end)
+    if len(body.friday_employee_ids) != len(set(body.friday_employee_ids)):
+        raise HTTPException(400, "A salary employee can only be assigned to Friday once")
+    summary, employees, current_plan = await superiqfoam_weekly_salary_data(
+        body.period_start, body.period_end,
+    )
+    employee_ids = {employee["employee_id"] for employee in employees}
+    if not set(body.friday_employee_ids).issubset(employee_ids):
+        raise HTTPException(400, "Friday selection contains an employee outside this weekly payroll")
+    previous_friday_ids = set((current_plan or {}).get("friday_employee_ids", []))
+    next_friday_ids = set(body.friday_employee_ids)
+    paid_accounts = await listall(
+        "salary_weekly_payment_accounts", {"payroll_key": period["payroll_key"]},
+    )
+    for account in paid_accounts:
+        if int(account.get("paid_amount_cents") or 0) > 0:
+            employee_id = account.get("employee_id")
+            old_group = account.get("payment_group") or ("friday" if employee_id in previous_friday_ids else "saturday")
+            new_group = "friday" if employee_id in next_friday_ids else "saturday"
+            if old_group != new_group:
+                raise HTTPException(409, "Payment group cannot be changed after a payment has been recorded")
+    legacy_paid_ids = {
+        payment.get("employee_id") for payment in await listall(
+            "salary_payments", {"payroll_key": period["payroll_key"]},
+        )
+    }
+    for employee_id in legacy_paid_ids:
+        old_group = "friday" if employee_id in previous_friday_ids else "saturday"
+        new_group = "friday" if employee_id in next_friday_ids else "saturday"
+        if old_group != new_group:
+            raise HTTPException(409, "A legacy paid employee cannot be moved to another payment group")
+    await db.salary_weekly_payment_plans.update_one(
+        {"id": period["payroll_key"]},
+        {"$set": {
+            "friday_employee_ids": sorted(next_friday_ids),
+            "period_start": body.period_start,
+            "period_end": body.period_end,
+            "updated_at": now_iso(),
+            "updated_by": user.get("id"),
+        }, "$setOnInsert": {
+            "id": period["payroll_key"],
+            "created_at": now_iso(),
+            "created_by": user.get("id"),
+        }},
+        upsert=True,
+    )
+    updated_summary, _employees, _plan = await superiqfoam_weekly_salary_data(
+        body.period_start, body.period_end,
+    )
+    await log_audit(
+        "salary_weekly_plan", period["payroll_key"], "updated", user,
+        before=current_plan,
+        after={
+            "id": period["payroll_key"],
+            "friday_employee_ids": sorted(next_friday_ids),
+            "period_start": body.period_start,
+            "period_end": body.period_end,
+        },
+    )
+    return {**updated_summary, "plan_saved": True}
+
+
+@api.put("/salaries/weekly-overtime")
+async def save_weekly_salary_overtime(
+    body: WeeklyOvertimeIn, user=Depends(get_current_user),
+):
+    require_admin(user)
+    period = superiqfoam_weekly_salary_period(body.period_start, body.period_end)
+    employee = await db.employees.find_one({"id": body.employee_id}, {"_id": 0})
+    if not employee:
+        raise HTTPException(404, "Employee not found")
+    account_id = f"{period['payroll_key']}:{body.employee_id}"
+    account = await db.salary_weekly_payment_accounts.find_one(
+        {"id": account_id}, {"_id": 0},
+    )
+    legacy_payment = await db.salary_payments.find_one(
+        {"employee_id": body.employee_id, "payroll_key": period["payroll_key"]},
+        {"_id": 0},
+    )
+    if int((account or {}).get("paid_amount_cents") or 0) > 0 or legacy_payment:
+        raise HTTPException(409, "Overtime cannot be changed after a salary payment has been recorded")
+
+    overtime_date = period["period_end"]
+    existing = await db.attendance.find_one(
+        {"employee_id": body.employee_id, "date": overtime_date},
+        {"_id": 0},
+    )
+    attendance_data = {
+        "status": (existing or {}).get("status", "Absent"),
+        "start_time": (existing or {}).get("start_time"),
+        "end_time": (existing or {}).get("end_time"),
+        "overtime_hours": (existing or {}).get("overtime_hours", 0),
+        "salary_overtime_override": float(body.overtime_hours),
+        "salary_overtime_rate_override": float(body.overtime_rate),
+        "employee_name": employee.get("name", ""),
+        "department": employee.get("department", ""),
+    }
+    _, saved = await _save_employee_day_record(
+        "attendance", body.employee_id, overtime_date, attendance_data,
+    )
+    await log_audit(
+        "salary_overtime", f"{period['payroll_key']}:{body.employee_id}",
+        "weekly_override_saved", user,
+        before={"salary_overtime_override": (existing or {}).get("salary_overtime_override")},
+        after={
+            "employee_id": body.employee_id,
+            "period_start": body.period_start,
+            "period_end": body.period_end,
+            "salary_overtime_override": saved.get("salary_overtime_override"),
+            "salary_overtime_rate_override": saved.get("salary_overtime_rate_override"),
+        },
+    )
+    return {"ok": True, "overtime_hours": saved["salary_overtime_override"]}
+
+
+@api.post("/salaries/weekly-payments")
+async def record_weekly_salary_payment(
+    body: WeeklySalaryPaymentIn, user=Depends(get_current_user),
+):
+    require_superiqfoam_weekly_salary_access(user)
+    period = superiqfoam_weekly_salary_period(body.period_start, body.period_end)
+    plan = await db.salary_weekly_payment_plans.find_one(
+        {"id": period["payroll_key"]}, {"_id": 0, "friday_employee_ids": 1},
+    ) or {}
+    friday_ids = set(plan.get("friday_employee_ids", []))
+    payment_group = "friday" if body.employee_id in friday_ids else "saturday"
+    expected_date = period[f"{payment_group}_date"]
+    if body.payment_date != expected_date:
+        raise HTTPException(400, f"This employee is scheduled for {payment_group.title()} payment on {expected_date}")
+    report = await salary_report(body.period_start, body.period_end, include_monthly_salaries=True)
+    employee = next(
+        (item for item in report["employees"] if item["employee_id"] == body.employee_id),
+        None,
+    )
+    if not employee or employee.get("pay_frequency") == "monthly_fixed":
+        raise HTTPException(404, "Weekly-paid employee not found in this payroll period")
+    if employee.get("salary_rate_missing"):
+        raise HTTPException(400, "This employee has no configured salary and cannot be paid")
+    due_cents = max(0, salary_amount_to_cents(employee.get("net_salary", 0)))
+    if due_cents <= 0:
+        raise HTTPException(400, "This employee has no positive net salary due")
+    calculation_snapshot = salary_calculation_snapshot(employee)
+    amount_cents = salary_amount_to_cents(body.amount)
+    if amount_cents <= 0:
+        raise HTTPException(400, "Payment must be at least one cent")
+
+    legacy_payment = await db.salary_payments.find_one(
+        {"employee_id": body.employee_id, "payroll_key": period["payroll_key"]},
+        {"_id": 0},
+    )
+    if legacy_payment:
+        raise HTTPException(409, "A full legacy salary payment already exists for this employee and week")
+
+    account_id = f"{period['payroll_key']}:{body.employee_id}"
+    await db.salary_weekly_payment_accounts.update_one(
+        {"id": account_id},
+        {"$setOnInsert": {
+            "id": account_id,
+            "employee_id": body.employee_id,
+            "employee_name": employee.get("name", ""),
+            "department": employee.get("department", ""),
+            "payroll_key": period["payroll_key"],
+            "period_start": body.period_start,
+            "period_end": body.period_end,
+            "due_amount_cents": due_cents,
+            "paid_amount_cents": 0,
+            "payments": [],
+            "calculation_snapshot": calculation_snapshot,
+            "created_at": now_iso(),
+        }},
+        upsert=True,
+    )
+    account = await db.salary_weekly_payment_accounts.find_one(
+        {"id": account_id}, {"_id": 0},
+    )
+    due_cents = int((account or {}).get("due_amount_cents") or due_cents)
+    duplicate = next((
+        payment for payment in (account or {}).get("payments", [])
+        if payment.get("idempotency_key") == body.idempotency_key
+    ), None)
+    if duplicate:
+        if (
+            duplicate.get("employee_id") != body.employee_id
+            or duplicate.get("payroll_key") != period["payroll_key"]
+            or duplicate.get("payment_group") != payment_group
+            or duplicate.get("payment_date") != body.payment_date
+            or int(duplicate.get("amount_cents") or 0) != amount_cents
+        ):
+            raise HTTPException(409, "Idempotency key was already used for a different payment")
+        return duplicate
+
+    existing_paid_cents = int((account or {}).get("paid_amount_cents") or 0)
+    if existing_paid_cents + amount_cents > due_cents:
+        raise HTTPException(400, "Payment cannot exceed the remaining salary balance")
+    payment_id = new_id()
+    payment_record = {
+        "id": payment_id,
+        "idempotency_key": body.idempotency_key,
+        "employee_id": body.employee_id,
+        "employee_name": employee.get("name", ""),
+        "payroll_key": period["payroll_key"],
+        "period_start": body.period_start,
+        "period_end": body.period_end,
+        "payment_group": payment_group,
+        "payment_date": body.payment_date,
+        "amount_cents": amount_cents,
+        "amount": r2(D(amount_cents) / D(100)),
+        "notes": body.notes or "",
+        "calculation_snapshot": calculation_snapshot,
+        "paid_at": now_iso(),
+        "paid_by": user.get("id"),
+    }
+    update_result = await db.salary_weekly_payment_accounts.update_one(
+        {
+            "id": account_id,
+            "payments.idempotency_key": {"$ne": body.idempotency_key},
+            "$expr": {
+                "$lte": [
+                    {"$add": [{"$ifNull": ["$paid_amount_cents", 0]}, amount_cents]},
+                    due_cents,
+                ],
+            },
+        },
+        {
+            "$set": {
+                "payment_group": payment_group,
+                "employee_name": employee.get("name", ""),
+                "department": employee.get("department", ""),
+                "updated_at": now_iso(),
+            },
+            "$inc": {"paid_amount_cents": amount_cents},
+            "$push": {"payments": payment_record},
+        },
+    )
+    if update_result.modified_count != 1:
+        account = await db.salary_weekly_payment_accounts.find_one({"id": account_id}, {"_id": 0})
+        duplicate = next((
+            payment for payment in (account or {}).get("payments", [])
+            if payment.get("idempotency_key") == body.idempotency_key
+        ), None)
+        if duplicate:
+            return duplicate
+        raise HTTPException(409, "Salary payment changed concurrently; refresh and try again")
+
+    await log_audit(
+        "salary_payment", payment_id, "weekly_partial_payment_recorded", user,
+        before=None, after=payment_record,
+    )
+    return payment_record
+
+
 @api.get("/salaries/payments")
 async def get_salary_payments(
     period_type: Literal["weekly", "monthly"],
@@ -10511,6 +11246,11 @@ async def get_salary_payment_history(user=Depends(get_current_user)):
 @api.post("/salaries/payments")
 async def record_salary_payment(body: SalaryPaymentIn, user=Depends(get_current_user)):
     require_admin(user)
+    if (
+        body.period_type == "weekly"
+        and (active_company_id.get() or user.get("_active_company_id") or DEFAULT_COMPANY_ID) == DEFAULT_COMPANY_ID
+    ):
+        raise HTTPException(409, "Use the weekly Friday/Saturday salary payment workflow for SuperIQFoam")
     payroll_key = salary_payroll_key(
         body.period_type, body.period_start, body.period_end
     )
@@ -10533,6 +11273,7 @@ async def record_salary_payment(body: SalaryPaymentIn, user=Depends(get_current_
     gross_amount = r2(D(employee.get("gross_salary", 0)))
     deduction_amount = r2(D(employee.get("cut", 0)))
     net_amount = r2(gross_amount - deduction_amount)
+    calculation_snapshot = salary_calculation_snapshot(employee)
     if gross_amount <= 0 or net_amount <= 0:
         raise HTTPException(400, "This employee has no positive net amount payable in the selected payroll")
     existing = await db.salary_payments.find_one(
@@ -10552,6 +11293,7 @@ async def record_salary_payment(body: SalaryPaymentIn, user=Depends(get_current_
         "gross_amount": gross_amount,
         "deduction_amount": deduction_amount,
         "net_amount": net_amount,
+        "calculation_snapshot": calculation_snapshot,
         "payment_date": body.payment_date,
         "notes": body.notes or "",
         "status": "paid",
@@ -10575,16 +11317,42 @@ async def save_salary_rate(eid: str, body: SalaryRateIn, user=Depends(get_curren
     employee = await db.employees.find_one({"id": eid}, {"_id": 0})
     if not employee:
         raise HTTPException(404, "Employee not found")
+    config_changes = {}
+    if "overtime_rate" in body.model_fields_set:
+        config_changes["overtime_rate"] = (
+            r2(D(body.overtime_rate)) if body.overtime_rate is not None else None
+        )
+    if body.pay_divisor is not None:
+        config_changes["pay_divisor"] = float(body.pay_divisor)
+    if body.half_day_hours is not None:
+        config_changes["half_day_hours"] = float(body.half_day_hours)
+    if "piecework_formula" in body.model_fields_set:
+        if body.piecework_formula is None or not body.piecework_formula.strip():
+            config_changes["piecework_formula"] = None
+        else:
+            formula = body.piecework_formula.strip().upper()
+            if formula not in set("ABCDEFGHIJKLMN"):
+                raise HTTPException(422, "Invalid piecework formula")
+            config_changes["piecework_formula"] = formula
+    if body.pay_mode is not None:
+        config_changes["pay_mode"] = body.pay_mode
     if body.monthly_salary is not None:
-        if not is_monthly_fixed_salary_employee(employee):
+        if not is_monthly_fixed_salary_employee(employee) and body.pay_mode != "monthly":
             raise HTTPException(422, "Monthly fixed pay is only available for the monthly payroll employees")
-        updated = await update_doc("employees", eid, {"monthly_salary": r2(D(body.monthly_salary))})
-        await log_audit("employee", eid, "monthly_salary_updated", user,
-                        before={"monthly_salary": employee.get("monthly_salary")},
-                        after={"monthly_salary": updated["monthly_salary"]})
+        config_changes["monthly_salary"] = r2(D(body.monthly_salary))
+        updated = await update_doc("employees", eid, config_changes)
+        await log_audit("employee", eid, "salary_configuration_updated", user,
+                        before={key: employee.get(key) for key in config_changes},
+                        after={key: updated.get(key) for key in config_changes})
         return updated
     if body.weekly_salary is None and body.hourly_rate is None:
-        raise HTTPException(422, "Provide a weekly salary or an hourly rate")
+        if not config_changes:
+            raise HTTPException(422, "Provide a salary, hourly, or payroll configuration")
+        updated = await update_doc("employees", eid, config_changes)
+        await log_audit("employee", eid, "salary_configuration_updated", user,
+                        before={key: employee.get(key) for key in config_changes},
+                        after={key: updated.get(key) for key in config_changes})
+        return updated
     work_days_per_week = 6
     hours_per_week = STANDARD_WEEKLY_HOURS
     weekly_salary = r2(D(body.weekly_salary)) if body.weekly_salary is not None else None
@@ -10603,6 +11371,7 @@ async def save_salary_rate(eid: str, body: SalaryRateIn, user=Depends(get_curren
         "weekly_salary": weekly_salary,
         "hours_per_week": hours_per_week,
         "work_days_per_week": work_days_per_week,
+        **config_changes,
     })
     await log_audit("employee", eid, "salary_rate_updated", user,
                     before={
@@ -10661,6 +11430,11 @@ async def save_salary_cut(body: SalaryCutIn, user=Depends(get_current_user)):
     employee = next((item for item in report["employees"] if item["employee_id"] == body.employee_id), None)
     if not employee:
         raise HTTPException(404, "Employee not found")
+    payroll_key = salary_payroll_key(
+        "monthly" if employee.get("pay_frequency") == "monthly_fixed" else "weekly",
+        body.start_date,
+        body.end_date,
+    )
     if employee["pay_frequency"] == "monthly_fixed" and not employee["is_full_month_period"]:
         raise HTTPException(400, "Select a complete calendar month before saving a salary cut")
     employee_cuts = await listall("salary_cuts", {
@@ -10931,54 +11705,6 @@ async def process_daily_vehicle_licence_alerts(today=None):
                     {"$set": dynamic_fields, "$setOnInsert": notification},
                     upsert=True,
                 )
-
-async def process_daily_report_whatsapp_schedule():
-    company_db = tenant_database(client, base_db, "superiqfoam")
-    settings = await company_db.settings.find_one({"id": "singleton"}, {"_id": 0}) or {}
-    if settings.get("daily_report_whatsapp_enabled") is not True:
-        return
-
-    time_match = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", str(settings.get("daily_report_whatsapp_send_time", "17:00")))
-    if not time_match:
-        return
-    now = local_now()
-    scheduled_hour = int(time_match.group(1))
-    scheduled_minute = int(time_match.group(2))
-    if now.hour != scheduled_hour or now.minute != scheduled_minute:
-        return
-
-    owner = await base_db.users.find_one({"email": canonical_email(os.environ["ADMIN_EMAIL"])}, {"_id": 0, "id": 1})
-    if not owner:
-        return
-    report_date = today_str()
-    event_key = f"daily-report-whatsapp-ready:{report_date}:{scheduled_hour:02d}:{scheduled_minute:02d}"
-    await base_db.notifications.update_one(
-        {"company_id": "superiqfoam", "event_key": event_key, "recipient_user_id": owner["id"]},
-        {"$set": {
-            "company_id": "superiqfoam",
-            "recipient_user_id": owner["id"],
-            "event_key": event_key,
-            "kind": "daily_report_whatsapp_ready",
-            "title": "Daily Report ready for WhatsApp",
-            "message": f"Prepare and open WhatsApp for the {report_date} Daily Report. No message is sent automatically.",
-            "action_path": "/daily-report",
-            "created_at": now_iso(),
-            "read": False,
-            "archived": False,
-            "permanently_dismissed": False,
-        }, "$setOnInsert": {"id": new_id()}},
-        upsert=True,
-    )
-
-
-async def scheduled_daily_report_whatsapp_loop():
-    while True:
-        try:
-            await process_daily_report_whatsapp_schedule()
-        except Exception:
-            logging.exception("Scheduled Daily Report WhatsApp preparation could not be processed")
-        await asyncio.sleep(30)
-
 
 async def scheduled_fleet_notification_loop():
     while True:
@@ -11632,18 +12358,6 @@ async def accept_intercompany_request(request_id: str, user=Depends(get_current_
     resolved_items, available, relinked = await resolve_intercompany_request_stock(
         supplier_db, company_id, request["items"], available,
     )
-    shortages = [
-        {
-            "product": item["product"],
-            "dimensions": item["dimensions"],
-            "available": available.get(item["stock_id"], 0),
-            "requested": item["quantity"],
-        }
-        for item in resolved_items
-        if D(available.get(item["stock_id"], 0)) < D(item["quantity"])
-    ]
-    if shortages:
-        raise HTTPException(409, {"message": "Insufficient supplier stock; no stock was reserved or deducted", "shortages": shortages})
     now = now_iso()
     updated = await base_db.intercompany_order_requests.find_one_and_update(
         {
@@ -11669,6 +12383,65 @@ async def accept_intercompany_request(request_id: str, user=Depends(get_current_
     )
     if not updated:
         raise HTTPException(409, "Request status changed; reload before accepting")
+    if company_id == DEFAULT_COMPANY_ID:
+        existing_order = await supplier_db.orders.find_one(
+            {"source_intercompany_request_id": request_id},
+            {"_id": 0},
+        )
+        if not existing_order:
+            requesting_profile = next(
+                (profile for profile in COMPANY_PROFILES if profile["id"] == updated["requesting_company_id"]),
+                None,
+            )
+            customer_name = (requesting_profile or {}).get("name") or updated["requesting_company_name"]
+            customer = None
+            mapping = await supplier_db.intercompany_customer_mappings.find_one(
+                {
+                    "requesting_company_id": updated["requesting_company_id"],
+                    "company_id": company_id,
+                },
+                {"_id": 0},
+            )
+            if mapping:
+                customer = await supplier_db.customers.find_one(
+                    {"id": mapping["customer_id"], "company_id": company_id, "active": {"$ne": False}},
+                    {"_id": 0},
+                )
+            order_items = [{
+                "qty": item["quantity"],
+                "category": item.get("product_type") or item["product"],
+                "size": item["dimensions"],
+                "description": item.get("description") or item["product"],
+            } for item in resolved_items]
+            reference = await next_ref("ord", "ORD")
+            order_record = {
+                "id": new_id(),
+                "reference": reference,
+                "customer_id": (customer or {}).get("id", ""),
+                "customer_name": (customer or {}).get("name") or customer_name,
+                "customer_address": (customer or {}).get("address", ""),
+                "customer_phone": (customer or {}).get("phone", ""),
+                "customer_email": (customer or {}).get("email", ""),
+                "invoice_id": "",
+                "invoice_number": "",
+                "destination": (customer or {}).get("address", ""),
+                "products": ", ".join(
+                    f"{item['category']} {item['size']} x {item['qty']:g}"
+                    for item in order_items
+                ),
+                "items": order_items,
+                "priority": "Normal",
+                "status": "To Send",
+                "expected_ship_date": None,
+                "vehicle_id": "",
+                "notes": (
+                    f"Created automatically from intercompany request {request_id}"
+                    + (f"\n{updated.get('notes', '').strip()}" if updated.get("notes", "").strip() else "")
+                ),
+                "source_intercompany_request_id": request_id,
+                "created_at": now,
+            }
+            await supplier_db.orders.insert_one(order_record)
     await notify_intercompany_company(
         updated["requesting_company_id"],
         f"intercompany:{request_id}:accepted",
@@ -12205,14 +12978,16 @@ async def send_intercompany_invoice(
 async def list_received_intercompany_invoices(user=Depends(get_current_user)):
     company_id = active_company_id.get()
     require_intercompany_company_access(user, company_id)
-    request_invoices = await base_db.intercompany_order_requests.find(
-        {"requesting_company_id": company_id, "invoice_sent": True},
-        {"_id": 0},
-    ).sort("sent_at", -1).to_list(100)
-    direct_deliveries = await base_db.intercompany_invoice_deliveries.find(
-        {"recipient_company_id": company_id},
-        {"_id": 0},
-    ).sort("sent_at", -1).to_list(100)
+    request_invoices, direct_deliveries = await asyncio.gather(
+        base_db.intercompany_order_requests.find(
+            {"requesting_company_id": company_id, "invoice_sent": True},
+            {"_id": 0},
+        ).sort("sent_at", -1).to_list(100),
+        base_db.intercompany_invoice_deliveries.find(
+            {"recipient_company_id": company_id},
+            {"_id": 0},
+        ).sort("sent_at", -1).to_list(100),
+    )
     received = [{
         "id": f"request:{request['id']}",
         "source": "request",
@@ -12223,28 +12998,45 @@ async def list_received_intercompany_invoices(user=Depends(get_current_user)):
         "invoice_total": request.get("invoice_total"),
         "sent_at": request.get("sent_at"),
     } for request in request_invoices if request.get("invoice_id")]
+    allowed_senders = {profile["id"] for profile in COMPANY_PROFILES}
+    deliveries_by_sender = {}
     for delivery in direct_deliveries:
         sender_company_id = delivery.get("sender_company_id")
-        if sender_company_id not in {profile["id"] for profile in COMPANY_PROFILES}:
-            continue
+        invoice_id = delivery.get("invoice_id")
+        if sender_company_id in allowed_senders and invoice_id:
+            deliveries_by_sender.setdefault(sender_company_id, []).append(delivery)
+
+    async def load_sender_invoices(sender_company_id, deliveries):
         supplier_db = tenant_database(client, base_db, sender_company_id)
-        invoice = await supplier_db.invoices.find_one(
-            {"id": delivery.get("invoice_id")},
-            {"_id": 0, "number": 1, "total": 1, "customer_name": 1},
-        )
-        if not invoice:
-            continue
-        received.append({
-            "id": f"direct:{delivery['id']}",
-            "source": "direct",
-            "requesting_company_id": company_id,
-            "supplying_company_id": sender_company_id,
-            "invoice_id": delivery["invoice_id"],
-            "invoice_number": invoice.get("number") or delivery.get("invoice_number"),
-            "invoice_total": invoice.get("total"),
-            "customer_name": invoice.get("customer_name", ""),
-            "sent_at": delivery.get("sent_at"),
-        })
+        invoice_ids = list({delivery["invoice_id"] for delivery in deliveries})
+        invoices = await supplier_db.invoices.find(
+            {"id": {"$in": invoice_ids}},
+            {"_id": 0, "id": 1, "number": 1, "total": 1, "customer_name": 1},
+        ).to_list(len(invoice_ids))
+        return sender_company_id, {invoice["id"]: invoice for invoice in invoices}
+
+    sender_invoices = await asyncio.gather(*(
+        load_sender_invoices(sender_company_id, deliveries)
+        for sender_company_id, deliveries in deliveries_by_sender.items()
+    ))
+    invoices_by_sender = dict(sender_invoices)
+    for sender_company_id, deliveries in deliveries_by_sender.items():
+        invoices = invoices_by_sender[sender_company_id]
+        for delivery in deliveries:
+            invoice = invoices.get(delivery["invoice_id"])
+            if not invoice:
+                continue
+            received.append({
+                "id": f"direct:{delivery['id']}",
+                "source": "direct",
+                "requesting_company_id": company_id,
+                "supplying_company_id": sender_company_id,
+                "invoice_id": delivery["invoice_id"],
+                "invoice_number": invoice.get("number") or delivery.get("invoice_number"),
+                "invoice_total": invoice.get("total"),
+                "customer_name": invoice.get("customer_name", ""),
+                "sent_at": delivery.get("sent_at"),
+            })
     received.sort(key=lambda item: item.get("sent_at") or "", reverse=True)
     return received
 
@@ -12774,7 +13566,7 @@ INTERFACE_NAV_GROUPS = {
     "overview": ("dashboard",),
     "sales": ("customers", "orders", "invoices", "client-payments"),
     "express": ("express-invoices", "express-client-payments"),
-    "purchasing": ("intercompany", "grv", "suppliers", "buyings"),
+    "purchasing": ("intercompany", "grv", "suppliers"),
     "operations": ("stock", "fleet"),
     "company-inventory": ("company-inventory",),
     "production": ("production", "superiqfoam-monthly-sheet"),
@@ -12799,7 +13591,6 @@ INTERFACE_CUSTOM_LINKS = {
     "/intercompany": "intercompany",
     "/grv": "grv",
     "/suppliers": "suppliers",
-    "/buyings": "buyings",
     "/stock": "stock",
     "/fleet": "fleet",
     "/company-inventory": "company-inventory",
@@ -12845,6 +13636,8 @@ def normalize_interface_config(config, company_id=None, allow_legacy_fields=Fals
         labels = config.get(key, {})
         if not isinstance(labels, dict):
             raise HTTPException(422, f"{key} must be an object")
+        if key == "section_labels" and "buyings" in labels:
+            labels = {name: value for name, value in labels.items() if name != "buyings"}
         if any(not isinstance(name, str) or name not in allowed for name in labels):
             raise HTTPException(422, f"{key} contains an unknown menu item")
         normalized = {}
@@ -12894,6 +13687,8 @@ def normalize_interface_config(config, company_id=None, allow_legacy_fields=Fals
             custom_order = [
                 section for section in custom_order if section not in removed_chemical_sections
             ]
+        if group == "purchasing" and isinstance(custom_order, list):
+            custom_order = [section for section in custom_order if section != "buyings"]
         if not isinstance(custom_order, list) or any(
             not isinstance(section, str) or section not in sections
             for section in custom_order
@@ -12940,6 +13735,8 @@ def normalize_interface_config(config, company_id=None, allow_legacy_fields=Fals
 
     custom_section_ids = {f"custom:{section['id']}" for section in normalized_custom_sections}
     hidden_sections = config.get("hidden_sections", [])
+    if isinstance(hidden_sections, list):
+        hidden_sections = [section for section in hidden_sections if section != "buyings"]
     if not isinstance(hidden_sections, list) or any(
         not isinstance(section, str)
         or (
@@ -12999,16 +13796,6 @@ async def update_interface_settings(
     return config
 
 
-def _interface_settings_company_id(requested_company_id, user):
-    active_id = active_company_id.get() or user.get("_active_company_id") or DEFAULT_COMPANY_ID
-    company_id = requested_company_id or active_id
-    if company_id not in {profile["id"] for profile in COMPANY_PROFILES}:
-        raise HTTPException(422, "Unknown company profile")
-    if company_id != active_id:
-        require_global_owner(user)
-    return company_id
-
-
 class PrintTemplateUpdate(BaseModel):
     name: str = Field(default="Default invoice", min_length=1, max_length=80)
     logo_data_url: str = Field(default="", max_length=350_000)
@@ -13021,6 +13808,7 @@ class PrintTemplateUpdate(BaseModel):
     footer_text: str = Field(default="", max_length=300)
     signature_text: str = Field(default="", max_length=100)
     show_company_details: bool = True
+    show_company_brand: bool = True
     alignment: Literal["left", "center", "right"] = "left"
     columns: List[Literal["category", "size", "quantity", "unit_price", "total"]] = Field(default_factory=list)
     print_trigger: Literal["manual", "on_issue"] = "manual"
@@ -13064,6 +13852,7 @@ def default_print_template(company_id):
         "footer_text": "",
         "signature_text": "",
         "show_company_details": True,
+        "show_company_brand": True,
         "alignment": "left",
         "columns": [],
         "print_trigger": "manual",
@@ -13078,7 +13867,10 @@ async def get_print_template(
     saved = await base_db.print_templates.find_one({"id": company_id}, {"_id": 0})
     approved_fields = default_print_template(company_id)
     if saved:
-        approved_fields.update({key: value for key, value in saved.items() if key in approved_fields})
+        approved_fields.update({
+            key: value for key, value in saved.items()
+            if key in approved_fields
+        })
         approved_fields["is_configured"] = True
     return approved_fields
 
@@ -13099,12 +13891,24 @@ async def update_print_template(
         "updated_at": now_iso(),
         "updated_by": user.get("email", ""),
     }
-    await base_db.print_templates.update_one({"id": company_id}, {"$set": saved}, upsert=True)
+    await base_db.print_templates.update_one(
+        {"id": company_id}, {"$set": saved}, upsert=True,
+    )
     await log_audit(
         "print_templates", company_id, "updated", user,
         before=before or default_print_template(company_id), after=template,
     )
     return {**template, "company_id": company_id, "is_configured": True}
+
+
+def _interface_settings_company_id(requested_company_id, user):
+    active_id = active_company_id.get() or user.get("_active_company_id") or DEFAULT_COMPANY_ID
+    company_id = requested_company_id or active_id
+    if company_id not in {profile["id"] for profile in COMPANY_PROFILES}:
+        raise HTTPException(422, "Unknown company profile")
+    if company_id != active_id:
+        require_global_owner(user)
+    return company_id
 
 
 @api.get("/settings")
@@ -13358,6 +14162,40 @@ async def update_supervisor_password(body: SupervisorPasswordIn, user=Depends(ge
     await log_audit("settings", "singleton", "supervisor_password_updated", user)
     return {"configured": True}
 
+@api.put("/settings/global-owner-password")
+async def update_global_owner_password(
+    body: GlobalOwnerPasswordIn, user=Depends(get_current_user),
+):
+    require_global_owner(user)
+    if user.get("_active_company_id") != DEFAULT_COMPANY_ID:
+        raise HTTPException(403, "Switch to SuperIQFoam to change the Global Owner password")
+    account = await base_db.users.find_one(
+        {"id": user["id"], "role": "owner"},
+        {"_id": 0, "id": 1, "email": 1, "password_hash": 1},
+    )
+    if not account or not is_global_owner_account(account):
+        raise HTTPException(403, "Global Owner access required")
+    if not verify_pw(body.current_password, account.get("password_hash", "")):
+        raise HTTPException(403, "Current password is incorrect")
+    if body.current_password == body.new_password:
+        raise HTTPException(400, "Choose a new password different from the current password")
+
+    result = await base_db.users.update_one(
+        {"id": account["id"], "password_hash": account["password_hash"]},
+        {"$set": {
+            "password_hash": hash_pw(body.new_password),
+            "password_updated_at": now_iso(),
+        }},
+    )
+    if result.matched_count != 1:
+        raise HTTPException(409, "Global Owner credentials changed; reload and try again")
+    session_query = {"user_id": account["id"]}
+    if user.get("_session_id"):
+        session_query["id"] = {"$ne": user["_session_id"]}
+    await base_db.user_sessions.delete_many(session_query)
+    await log_audit("auth", account["id"], "global_owner_password_updated", user)
+    return {"updated": True, "other_sessions_invalidated": True}
+
 @api.put("/settings")
 async def update_settings(body: dict, user=Depends(get_current_user)):
     require_settings_owner(user)
@@ -13515,8 +14353,16 @@ async def dashboard(
             D(item.get("opening", 0))
             + D(stock_movement_totals.get(item["id"], 0))
         )
+        configured_threshold = stock_warning_threshold(item)
+        item["low_stock_threshold"] = (
+            configured_threshold if configured_threshold is not None
+            else item.get("threshold", 0)
+        )
     finished_stock = r2(sum((D(item["current"]) for item in stock), Decimal("0")))
-    low_stock = [s for s in stock if s.get("current", 0) <= s.get("threshold", 0)]
+    low_stock = [
+        s for s in stock
+        if stock_warning_is_active(s, include_equal_for_existing_threshold=True)
+    ]
 
     hours = await resting_hours()
     for p in prod:
@@ -14166,6 +15012,10 @@ class GRVLineIn(BaseModel):
     category: Optional[str] = ""
     unit: Optional[str] = ""
     container_type: Optional[str] = ""
+    container_count: Optional[float] = None
+    container_capacity: Optional[float] = None
+    total_quantity: Optional[float] = None
+    price_basis: Optional[Literal["per_unit", "per_container"]] = None
 
     @field_validator("sale_price_zone_1", "sale_price_zone_2")
     @classmethod
@@ -14180,6 +15030,7 @@ class GRVIn(BaseModel):
     source_intercompany_invoice_id: Optional[str] = ""
     source_intercompany_category: Optional[str] = ""
     vat_rate: float = Field(default=0, ge=0, le=100)
+    freight_cost: float = Field(default=0, ge=0)
     supplier_id: Optional[str] = ""
     supplier_name: Optional[str] = ""
     purchase_order_id: Optional[str] = ""
@@ -15323,6 +16174,7 @@ async def create_grv(body: GRVIn, user=Depends(get_current_user)):
         "is_chemical": bool(body.is_chemical) if purpose == "raw_material" else False,
         "source_intercompany_invoice_id": source_intercompany_invoice_id,
         "source_intercompany_category": source_intercompany_category,
+        "freight_cost": body.freight_cost,
         "status": "draft",
         "created_by": user["email"],
         "edited_by": user["email"],
@@ -15390,6 +16242,7 @@ async def edit_grv(grv_id: str, body: GRVIn, user=Depends(get_current_user)):
             (body.source_intercompany_category or "").strip()
             or before.get("source_intercompany_category", "")
         ),
+        "freight_cost": body.freight_cost,
         "edited_by": user["email"],
         "audit": audit,
     }
@@ -16030,6 +16883,21 @@ async def receive_purchase_order(order_id: str, user=Depends(get_current_user)):
         "Direct purchase-order receiving is disabled. Create and confirm a GRV instead.",
     )
 
+def correct_expense_description(value):
+    corrections = {"veichle": "vehicle", "deisel": "diesel", "commision": "commission"}
+
+    def correct_word(match):
+        word = match.group(0)
+        corrected = corrections[word.lower()]
+        if word.isupper():
+            return corrected.upper()
+        if word[0].isupper():
+            return corrected.capitalize()
+        return corrected
+
+    return re.sub(r"\b(?:veichle|deisel|commision)\b", correct_word, str(value), flags=re.IGNORECASE)
+
+
 class ExpenseIn(BaseModel):
     description: str
     amount: float
@@ -16042,6 +16910,11 @@ class ExpenseIn(BaseModel):
     notes: Optional[str] = ""
     edit_reason: Optional[str] = ""
     supervisor_authorization: Optional[str] = None
+
+    @field_validator("description")
+    @classmethod
+    def normalize_description(cls, value):
+        return correct_expense_description(value)
 
 class ExpenseAuthorizationIn(BaseModel):
     password: str
@@ -16242,14 +17115,6 @@ async def get_expenses(include_voided: bool = False, include_archived: bool = Fa
         flt["archived"] = {"$ne": True}
     return await listall("expenses", flt, sort=("date", -1))
 
-def daily_report_payment_included(payment):
-    return bool(
-        payment.get("include_on_daily_report")
-        if payment.get("daily_report_inclusion_set")
-        else True
-    )
-
-
 def report_date_filter(selected_date):
     selected = date.fromisoformat(selected_date)
     dates = [(selected + timedelta(days=offset)).isoformat() for offset in (-1, 0, 1)]
@@ -16281,114 +17146,6 @@ async def daily_report_records(collection_name, selected_date, conditions=None, 
     cursor = db[collection_name].find(query, {"_id": 0}).sort(sort_field, 1)
     records = await cursor.to_list(None)
     return [record for record in records if record_local_date(record) == selected_date]
-
-def normalize_whatsapp_phone(value):
-    digits = re.sub(r"\D", "", str(value or ""))
-    if digits.startswith("00"):
-        digits = digits[2:]
-    if digits.startswith("0"):
-        digits = f"27{digits[1:]}"
-    if digits.startswith("270"):
-        digits = f"27{digits[3:]}"
-    return digits if 7 <= len(digits) <= 15 else ""
-
-
-def require_superiqfoam_whatsapp_owner(user):
-    company_id = user.get("_active_company_id") or user.get("company_id")
-    if company_id != "superiqfoam" or not (user.get("is_owner") or user.get("_active_role") == "owner"):
-        raise HTTPException(403, "WhatsApp Daily Report is available only to the SUPER IQ-FOAM owner")
-
-
-@api.post("/daily-report-whatsapp/prepare")
-async def prepare_daily_report_whatsapp(body: DailyReportWhatsAppPrepareIn, request: Request, user=Depends(get_current_user)):
-    require_superiqfoam_whatsapp_owner(user)
-    phone = normalize_whatsapp_phone(body.phone)
-    if not phone:
-        raise HTTPException(422, "WhatsApp number not configured or invalid")
-    try:
-        pdf = base64.b64decode(body.pdf_base64, validate=True)
-    except (ValueError, base64.binascii.Error) as error:
-        raise HTTPException(422, "The generated PDF is not valid") from error
-    if not pdf.startswith(b"%PDF-"):
-        raise HTTPException(422, "The generated file is not a PDF")
-
-    token = secrets.token_urlsafe(32)
-    record_id = new_id()
-    link = {
-        "id": record_id,
-        "report_date": body.report_date,
-        "filename": body.filename,
-        "phone": phone,
-        "message_template": body.message_template,
-        "pdf_base64": body.pdf_base64,
-        "token_hash": worker_access_token_hash(token),
-        "token_encrypted": encrypt_worker_access_token(token),
-        "created_at": now_iso(),
-        "status": "ready",
-    }
-    await db.daily_report_whatsapp_links.replace_one(
-        {"company_id": "superiqfoam", "report_date": body.report_date},
-        {"company_id": "superiqfoam", **link},
-        upsert=True,
-    )
-    await log_audit("daily_report", body.report_date, "whatsapp_link_prepared", user,
-                    after={"phone": phone, "filename": body.filename})
-
-    protocol = "https" if request.url.scheme == "https" else request.url.scheme
-    origin = str(request.base_url).rstrip("/")
-    pdf_url = f"{origin}/api/public/daily-reports/{token}"
-    message = body.message_template.replace("{DATE}", body.report_date).replace("{PDF_URL}", pdf_url)
-    return {
-        "pdf_url": pdf_url,
-        "wa_me_url": f"https://wa.me/{phone}?text={quote(message, safe='')}",
-        "status": "ready",
-    }
-
-
-@api.get("/public/daily-reports/{token}")
-async def get_public_daily_report_pdf(token: str, response: Response):
-    response.headers["Cache-Control"] = "private, no-store"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["X-Robots-Tag"] = "noindex, nofollow"
-    if not re.fullmatch(r"[A-Za-z0-9_-]{40,64}", token or ""):
-        raise HTTPException(404, "Daily report link not found")
-    token_hash = worker_access_token_hash(token)
-    for profile in COMPANY_PROFILES:
-        company_db = tenant_database(client, base_db, profile["id"])
-        link = await company_db.daily_report_whatsapp_links.find_one(
-            {"token_hash": token_hash}, {"_id": 0},
-        )
-        if not link:
-            continue
-        if profile["id"] != "superiqfoam":
-            raise HTTPException(404, "Daily report link not found")
-        try:
-            pdf = base64.b64decode(link["pdf_base64"], validate=True)
-        except (ValueError, base64.binascii.Error):
-            raise HTTPException(404, "Daily report PDF unavailable")
-        return StreamingResponse(
-            iter([pdf]),
-            media_type="application/pdf",
-            headers={"Content-Disposition": f"inline; filename={link['filename']}"},
-        )
-    raise HTTPException(404, "Daily report link not found")
-
-
-@api.get("/daily-report-whatsapp/status")
-async def get_daily_report_whatsapp_status(user=Depends(get_current_user)):
-    require_superiqfoam_whatsapp_owner(user)
-    settings = await db.settings.find_one({"id": "singleton"}, {"_id": 0}) or {}
-    records = await db.daily_report_whatsapp_links.find(
-        {"company_id": "superiqfoam"}, {"_id": 0, "pdf_base64": 0, "token_hash": 0, "token_encrypted": 0},
-    ).sort("report_date", -1).limit(30).to_list(30)
-    return {
-        "phone": settings.get("daily_report_whatsapp_phone", "+27 073 072 3286"),
-        "send_time": settings.get("daily_report_whatsapp_send_time", "17:00"),
-        "enabled": settings.get("daily_report_whatsapp_enabled", False),
-        "message_template": settings.get("daily_report_whatsapp_message_template", "Hello, here is the Daily Report for {DATE}.\n{PDF_URL}"),
-        "records": records,
-    }
-
 
 @api.get("/daily-report")
 async def get_daily_report(report_date: Optional[str] = None, user=Depends(get_current_user)):
@@ -16472,8 +17229,14 @@ async def get_daily_report(report_date: Optional[str] = None, user=Depends(get_c
         if payment.get("advance_allocation"):
             continue
         invoice = invoice_by_id.get(payment.get("invoice_id"), {})
-        if not daily_report_payment_included(payment):
-            continue
+        if payment.get("express"):
+            express_payment = (
+                invoice.get("invoice_type") == "express"
+                or payment.get("other_balance_payment")
+                or payment.get("advance_payment")
+            )
+            if not express_payment:
+                continue
         note_parts = []
         for value in (
             payment.get("notes"),
@@ -16655,7 +17418,8 @@ def grv_accepted_value(grv):
 def build_financial_report(start, end, mode, *, invoices, payments, linked_payments,
                            expenses, vehicle_records, buyings, grvs, invoice_movements,
                            payment_invoices=None, salary_rows=(), vehicles_by_id=None,
-                           all_outstanding_invoices=None, all_outstanding_payments=None):
+                           all_outstanding_invoices=None, all_outstanding_payments=None,
+                           all_outstanding_customer_balances=None):
     invoices = unique_financial_records(invoices)
     payments = unique_financial_records(payments)
     linked_payments = unique_financial_records(linked_payments)
@@ -17012,7 +17776,6 @@ def build_financial_report(start, end, mode, *, invoices, payments, linked_payme
     for invoice in outstanding_invoices:
         if (
             invoice.get("archived")
-            or invoice.get("invoice_type") == "express"
             or invoice.get("status") in ("draft", "void")
             or not invoice.get("number")
         ):
@@ -17032,6 +17795,20 @@ def build_financial_report(start, end, mode, *, invoices, payments, linked_payme
             "customer_name": invoice.get("customer_name", ""),
             "due_date": invoice.get("due_date"),
             "amount": r2(outstanding),
+        })
+    for customer in unique_financial_records(all_outstanding_customer_balances or []):
+        outstanding = r2(customer.get("other_balance", 0))
+        if outstanding <= 0:
+            continue
+        pending_values.append(outstanding)
+        pending_rows.append({
+            "id": customer.get("id"),
+            "date": "",
+            "number": "Other balance",
+            "customer_name": customer.get("name", ""),
+            "due_date": None,
+            "amount": outstanding,
+            "balance_type": "express" if customer.get("other_balance_express") else "standard",
         })
     pending_total = dsum(pending_values)
     expense_total = dsum(row["amount"] for row in expense_rows)
@@ -17150,7 +17927,6 @@ async def get_financial_report(
             all_outstanding_invoices = await db.invoices.find(
                 {
                     "archived": {"$ne": True},
-                    "invoice_type": {"$ne": "express"},
                     "status": {"$nin": ["draft", "void"]},
                     "number": {"$exists": True, "$nin": [None, ""]},
                 },
@@ -17166,6 +17942,12 @@ async def get_financial_report(
                 },
                 {"_id": 0},
             ).to_list(None) if all_invoice_ids else []
+            all_outstanding_customer_balances = await db.customers.find(
+                {"other_balance": {"$gt": 0}},
+                {"_id": 0, "id": 1, "name": 1, "other_balance": 1, "other_balance_express": 1},
+            ).to_list(None)
+        else:
+            all_outstanding_customer_balances = None
         invoice_ids = [invoice["id"] for invoice in invoices if invoice.get("id")]
         payment_invoice_ids = list({
             payment["invoice_id"]
@@ -17195,6 +17977,7 @@ async def get_financial_report(
             vehicles_by_id=vehicles_by_id,
             all_outstanding_invoices=all_outstanding_invoices,
             all_outstanding_payments=all_outstanding_payments,
+            all_outstanding_customer_balances=all_outstanding_customer_balances,
         )
 
     try:
@@ -17354,24 +18137,30 @@ async def cost_ledger(since=None, until=None):
 
 def cost_ledger_from_records(expenses, vehicles, vehicle_records, since=None, until=None):
     rows = []
-    for x in expenses:
+    for x in unique_financial_records(expenses):
         source_key = x.get("source_key", "")
         source = (
             "spare_part" if source_key.startswith("sparepart:")
             else "monthly_purchase" if source_key.startswith("monthly_business_purchase:")
             else "expense"
         )
-        rows.append({"id": x["id"], "date": x.get("date"), "description": x.get("description"), "category": x.get("category", "General"),
+        record_date = financial_record_date(x)
+        rows.append({"id": x["id"], "date": record_date.isoformat() if record_date else x.get("date"), "description": x.get("description"), "category": x.get("category", "General"),
                      "amount": x.get("amount", 0), "vehicle_id": x.get("vehicle_id", ""), "source": source})
     vnames = {v["id"]: v["name"] for v in vehicles}
-    for x in vehicle_records:
+    for x in unique_financial_records(vehicle_records):
         if x.get("status") in VEHICLE_COST_DONE and (x.get("amount") or 0) > 0:
-            rows.append({"id": x["id"], "date": x.get("date"), "description": f"{vnames.get(x.get('vehicle_id'), '')}: {x.get('description', '')}",
+            record_date = financial_record_date(x)
+            rows.append({"id": x["id"], "date": record_date.isoformat() if record_date else x.get("date"), "description": f"{vnames.get(x.get('vehicle_id'), '')}: {x.get('description', '')}",
                          "category": f"Vehicle {x.get('type', 'expense').title()}", "amount": x.get("amount", 0),
                          "vehicle_id": x.get("vehicle_id"), "source": "fleet"})
     for r in rows:
         r["vehicle_name"] = vnames.get(r.get("vehicle_id"), "")
-    return [r for r in rows if (not since or (r["date"] or "") >= since) and (not until or (r["date"] or "") <= until)]
+    return [
+        r for r in rows
+        if (not since or (r["date"] or "")[:10] >= str(since)[:10])
+        and (not until or (r["date"] or "")[:10] <= str(until)[:10])
+    ]
 
 def unique_financial_records(records):
     seen = set()
@@ -17884,7 +18673,8 @@ async def profit_report(user=Depends(get_current_user)):
         "total_expenses": dsum(
             row["amount"] for row in cost_ledger_from_records(expenses, vehicles, vehicle_records)
         ),
-        "week_start": week, "month_start": month, "timezone": "Africa/Johannesburg",
+        "week_start": week, "week_end": t, "month_start": month, "month_end": t,
+        "timezone": "Africa/Johannesburg",
     }
 
 @api.get("/reports/costs")
@@ -18589,23 +19379,7 @@ async def get_orders(
         }
         cursor = db.orders.aggregate([
             {"$match": query},
-            {"$addFields": {
-                "_priority_rank": {"$switch": {
-                    "branches": [
-                        {"case": {"$eq": ["$priority", "Urgent"]}, "then": 0},
-                        {"case": {"$eq": ["$priority", "High"]}, "then": 1},
-                        {"case": {"$eq": ["$priority", "Normal"]}, "then": 2},
-                        {"case": {"$eq": ["$priority", "Low"]}, "then": 3},
-                    ],
-                    "default": 9,
-                }},
-                "_ship_date_sort": {"$cond": [
-                    {"$eq": [{"$ifNull": ["$expected_ship_date", ""]}, ""]},
-                    "9",
-                    "$expected_ship_date",
-                ]},
-            }},
-            {"$sort": {"_priority_rank": 1, "_ship_date_sort": 1, "id": 1}},
+            {"$sort": {"created_at": -1, "id": -1}},
             {"$skip": (page - 1) * page_size},
             {"$limit": page_size},
             {"$project": {
@@ -19039,6 +19813,106 @@ def daily_production_blocks(record):
         if int(record.get(field, 0) or 0) > 0
     ]
 
+MONTHLY_PRODUCTION_BLOCK_LABELS = {
+    "big_block": "BIG BLOCK 2750",
+    "big_blue_block": "BIG BLUE BLOCK",
+    "medium_block": "MEDIUM BLOCK",
+    "small_block": "SMALL BLOCK",
+    "small_blue_block": "SMALL BLUE BLOCK",
+}
+
+
+def merge_monthly_sheet_production(daily_records, monthly_sheets):
+    rows_by_date = {}
+    for record in daily_records:
+        rows_by_date[record.get("date", "")] = record
+
+    for sheet in monthly_sheets:
+        year, month_number = map(int, sheet.get("month", "0000-00").split("-"))
+        days_in_month = calendar.monthrange(year, month_number)[1]
+        monday_offset = (
+            date(year, month_number, 1).weekday()
+        )
+        daily_entries_by_week = set()
+        for day in sheet.get("production_days", []):
+            day_date = day.get("date", "")
+            if not day_date:
+                continue
+            week_index = day.get("week_index")
+            if week_index is None:
+                week_index = (monday_offset + int(day_date[-2:]) - 1) // 7
+            if any(
+                (day.get(key) or {}).get("quantity") is not None
+                or (day.get(key) or {}).get("weight_kg") is not None
+                for key in MONTHLY_PRODUCTION_BLOCK_LABELS
+            ):
+                daily_entries_by_week.add(week_index)
+
+        for week_index, week in enumerate(sheet.get("weeks", [])):
+            if week_index in daily_entries_by_week:
+                continue
+            has_weekly_entry = any(
+                (week.get(key) or {}).get("quantity") is not None
+                or (week.get(key) or {}).get("weight_kg") is not None
+                for key in MONTHLY_PRODUCTION_BLOCK_LABELS
+            )
+            if not has_weekly_entry:
+                continue
+            first_day = max(1, week_index * 7 - monday_offset + 1)
+            last_day = min(days_in_month, (week_index + 1) * 7 - monday_offset)
+            period_start = f"{year:04d}-{month_number:02d}-{first_day:02d}"
+            period_end = f"{year:04d}-{month_number:02d}-{last_day:02d}"
+            for existing_date in list(rows_by_date):
+                if period_start <= existing_date <= period_end:
+                    rows_by_date.pop(existing_date)
+            blocks = [
+                {"block": label, "quantity": int((week.get(key) or {}).get("quantity") or 0)}
+                for key, label in MONTHLY_PRODUCTION_BLOCK_LABELS.items()
+                if int((week.get(key) or {}).get("quantity") or 0) > 0
+            ]
+            rows_by_date[f"monthly-sheet-production:{sheet.get('month')}:week:{week_index}"] = {
+                "id": f"monthly-sheet-production:{sheet.get('month')}:week:{week_index}",
+                "date": period_end,
+                "period_start": period_start,
+                "period_end": period_end,
+                "week_number": week_index + 1,
+                "blocks": blocks,
+                "total_blocks": sum(block["quantity"] for block in blocks),
+                "notes": "",
+                "source": "monthly_chemical_sheet_weekly",
+            }
+
+        for day in sheet.get("production_days", []):
+            day_date = day.get("date", "")
+            quantities = {
+                key: (day.get(key) or {}).get("quantity")
+                for key in MONTHLY_PRODUCTION_BLOCK_LABELS
+            }
+            if not day_date or all(quantity is None for quantity in quantities.values()):
+                continue
+            blocks = [
+                {"block": MONTHLY_PRODUCTION_BLOCK_LABELS[key], "quantity": int(quantity or 0)}
+                for key, quantity in quantities.items()
+                if quantity is not None and int(quantity or 0) > 0
+            ]
+            rows_by_date[day_date] = {
+                "id": f"monthly-sheet-production:{sheet.get('month')}:{day_date}",
+                "date": day_date,
+                "blocks": blocks,
+                "total_blocks": sum(block["quantity"] for block in blocks),
+                "notes": "",
+                "source": "monthly_chemical_sheet",
+            }
+
+    rows = []
+    for record in rows_by_date.values():
+        row = dict(record)
+        row["blocks"] = daily_production_blocks(row)
+        row["total_blocks"] = sum(item["quantity"] for item in row["blocks"])
+        rows.append(row)
+    return sorted(rows, key=lambda row: (row.get("date") or "", row.get("id") or ""), reverse=True)
+
+
 @api.get("/production/daily")
 async def get_daily_prod(
     include_archived: bool = False,
@@ -19047,34 +19921,44 @@ async def get_daily_prod(
     user=Depends(get_current_user),
 ):
     flt = {} if include_archived else {"archived": {"$ne": True}}
-    if page is None:
-        rows = await listall("production_daily", flt, sort=("date", -1))
-        total = len(rows)
-    else:
-        cursor = (
-            db.production_daily.find(flt, {"_id": 0})
-            .sort([("date", -1), ("id", 1)])
-            .skip((page - 1) * page_size)
-            .limit(page_size)
+    daily_records = await listall("production_daily", flt, sort=("date", -1))
+    monthly_sheets = []
+    company_id = user.get("_active_company_id")
+    if company_id in CHEMICAL_COMPANY_IDS and (
+        not worker_restrictions_apply(user)
+        or (
+            {"warehouse-a", "warehouses", "superiqfoam-monthly-sheet", "chemicals-quantity", "chemical-usage-log"}
+            .intersection(user.get("worker_allowed_sections", []))
         )
-        rows, total = await asyncio.gather(
-            cursor.to_list(length=page_size),
-            db.production_daily.count_documents(flt),
+    ):
+        id_pattern = (
+            r"^monthly-chemical-sheet:\d{4}-\d{2}$"
+            if company_id == DEFAULT_COMPANY_ID
+            else f"^{re.escape(f'monthly-chemical-sheet:{company_id}:')}"
         )
+        monthly_sheets = await listall(
+            "monthly_chemical_sheets", {"id": {"$regex": id_pattern}},
+        )
+    merged_rows = merge_monthly_sheet_production(daily_records, monthly_sheets)
+    total = len(merged_rows)
+    rows = merged_rows if page is None else merged_rows[(page - 1) * page_size:page * page_size]
     week, month = period_starts()
     summary_start = min(week, month)
-    active_rows = await listall(
-        "production_daily",
-        {"archived": {"$ne": True}, "date": {"$gte": summary_start}},
-        sort=("date", -1),
+    active_rows = merge_monthly_sheet_production(
+        await listall(
+            "production_daily",
+            {"archived": {"$ne": True}, "date": {"$gte": summary_start}},
+            sort=("date", -1),
+        ),
+        monthly_sheets,
     )
-    for row in rows:
-        row["blocks"] = daily_production_blocks(row)
-        row["total_blocks"] = sum(item["quantity"] for item in row["blocks"])
-    def tot(since):
+    def tot(since, *, daily_only=False):
         totals = {}
         for record in active_rows:
-            if record["date"] < since:
+            if record.get("period_start"):
+                if daily_only or record.get("period_end", record["date"]) < since:
+                    continue
+            elif record["date"] < since:
                 continue
             for item in daily_production_blocks(record):
                 block = item["block"]
@@ -19086,7 +19970,7 @@ async def get_daily_prod(
             "blue_blocks": totals.get("Blue", 0),
         }
     return {
-        "rows": rows, "today": tot(today_str()), "week": tot(week), "month": tot(month),
+        "rows": rows, "today": tot(today_str(), daily_only=True), "week": tot(week), "month": tot(month),
         "total": total, "page": page, "page_size": page_size if page is not None else None,
     }
 
@@ -19933,6 +20817,23 @@ async def initialize_empty_company(company_id):
         [("payment_date", -1)],
         name="salary_payment_date",
     )
+    if company_id == DEFAULT_COMPANY_ID:
+        await create_company_unique_index(
+            company_db.salary_weekly_payment_plans,
+            "id",
+            unique=True,
+            name="salary_weekly_plan_once",
+        )
+        await create_company_unique_index(
+            company_db.salary_weekly_payment_accounts,
+            "id",
+            unique=True,
+            name="salary_weekly_account_once",
+        )
+        await company_db.salary_weekly_payment_accounts.create_index(
+            [("payroll_key", 1), ("employee_id", 1)],
+            name="salary_weekly_account_employee",
+        )
     try:
         await ensure_performance_indexes(company_db)
     except OperationFailure as error:
@@ -19940,7 +20841,7 @@ async def initialize_empty_company(company_id):
 
 @app.on_event("startup")
 async def on_startup():
-    global backup_scheduler_task, fleet_notification_scheduler_task, daily_report_whatsapp_scheduler_task, legacy_migration_task
+    global backup_scheduler_task, fleet_notification_scheduler_task, legacy_migration_task
     startup_company = active_company_id.set(DEFAULT_COMPANY_ID)
     try:
         await seed()
@@ -19961,9 +20862,6 @@ async def on_startup():
         logging.warning("Notification/intercompany indexes not fully created: %s", error)
     fleet_notification_scheduler_task = asyncio.create_task(
         scheduled_fleet_notification_loop()
-    )
-    daily_report_whatsapp_scheduler_task = asyncio.create_task(
-        scheduled_daily_report_whatsapp_loop()
     )
     status = backup_runtime_status()
     if status["configured"] and status["tools_available"]:
@@ -20131,12 +21029,6 @@ logging.basicConfig(level=logging.INFO)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    if daily_report_whatsapp_scheduler_task:
-        daily_report_whatsapp_scheduler_task.cancel()
-        try:
-            await daily_report_whatsapp_scheduler_task
-        except asyncio.CancelledError:
-            pass
     if fleet_notification_scheduler_task:
         fleet_notification_scheduler_task.cancel()
         try:

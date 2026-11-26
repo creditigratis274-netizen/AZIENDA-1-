@@ -200,7 +200,7 @@ def test_short_custom_shift_earns_pay_proportional_to_regular_hours():
     assert result[0]["attendance_fraction"] == 0.5
 
 
-def test_saved_times_are_used_instead_of_default_hours_or_manual_overtime():
+def test_manual_overtime_is_used_instead_of_saved_times_only_when_entered():
     result = calculate_salary_hours([{
         "date": "2026-10-26",
         "status": "Present",
@@ -209,8 +209,8 @@ def test_saved_times_are_used_instead_of_default_hours_or_manual_overtime():
         "overtime_hours": 2,
     }])
 
-    assert result[0]["regular_hours"] == 5
-    assert result[0]["overtime_hours"] == 0
+    assert result[0]["regular_hours"] == 3
+    assert result[0]["overtime_hours"] == 2
 
 
 def test_half_day_without_times_defaults_to_four_hours():

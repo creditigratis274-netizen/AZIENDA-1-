@@ -26,7 +26,17 @@ def validate_grv_line_quantities(line, *, remaining=None):
         raise ValueError("Damaged quantity cannot exceed rejected quantity")
     if remaining is not None and actual_decimal > Decimal(str(remaining)):
         raise ValueError(f"Actual received quantity cannot exceed the remaining quantity ({remaining:g})")
-    total_value = (accepted_decimal * unit_cost_decimal).quantize(
+    container_count = float(line.get("container_count") or accepted)
+    container_capacity = float(line.get("container_capacity") or line.get("size") or 0)
+    price_basis = line.get("price_basis")
+    if price_basis == "per_unit":
+        total_quantity = container_count * container_capacity
+    elif price_basis == "per_container":
+        total_quantity = container_count
+    else:
+        total_quantity = accepted
+    total_quantity_decimal = Decimal(str(total_quantity if math.isfinite(total_quantity) else 0))
+    total_value = (total_quantity_decimal * unit_cost_decimal).quantize(
         Decimal("0.01"), rounding=ROUND_HALF_UP,
     )
     return {
@@ -35,6 +45,10 @@ def validate_grv_line_quantities(line, *, remaining=None):
         "rejected_quantity": rejected,
         "damaged_quantity": damaged,
         "unit_cost": unit_cost,
+        "container_count": container_count,
+        "container_capacity": container_capacity,
+        "total_quantity": float(total_quantity_decimal),
+        "price_basis": price_basis,
         "total_value": float(total_value),
     }
 

@@ -12,6 +12,7 @@ import { InvoiceDocument } from "@/components/InvoiceDocument";
 import { elementToPdf, printElements } from "@/lib/pdf";
 
 const receivedInvoicesSeenKey = (companyId) => `received-invoices-seen:${companyId || "default"}`;
+const receivedInvoicesNotifiedKey = (companyId) => `received-invoices-notified:${companyId || "default"}`;
 const receivedInvoiceItems = (invoice) => (invoice?.items || [])
   .filter((item) => (item.category || item.size || item.description)
     && !(!item.category && !item.size && item.description?.trim().toLowerCase() === "opening balance"))
@@ -44,6 +45,7 @@ export default function InvoiceList({ express = false }) {
   const [receivedInvoiceDetails, setReceivedInvoiceDetails] = useState(null);
   const [receivedInvoiceLoading, setReceivedInvoiceLoading] = useState(false);
   const [seenReceivedInvoiceIds, setSeenReceivedInvoiceIds] = useState([]);
+  const [newReceivedInvoiceIds, setNewReceivedInvoiceIds] = useState([]);
   const [receivedGRVAssignments, setReceivedGRVAssignments] = useState({});
   const [receivedGRVExpanded, setReceivedGRVExpanded] = useState(false);
   const [receivedGRVBusy, setReceivedGRVBusy] = useState(false);
@@ -61,6 +63,12 @@ export default function InvoiceList({ express = false }) {
   const [reload, setReload] = useState(0);
   const nav = useNavigate();
   const [sel, setSel] = useState([]);
+  const [printSel, setPrintSel] = useState([]);
+  const [printPreview, setPrintPreview] = useState([]);
+  const [printPreviewFailures, setPrintPreviewFailures] = useState([]);
+  const [printPreviewLoading, setPrintPreviewLoading] = useState(false);
+  const [printPreviewOpen, setPrintPreviewOpen] = useState(false);
+  const [batchPrintResult, setBatchPrintResult] = useState(null);
   const [viewOpen, setViewOpen] = useState(false);
   const [viewLoading, setViewLoading] = useState(false);
   const [viewInvoice, setViewInvoice] = useState(null);
@@ -69,17 +77,13 @@ export default function InvoiceList({ express = false }) {
   const [whatsappDraft, setWhatsappDraft] = useState(null);
   const [pdfDownload, setPdfDownload] = useState(null);
   const [pdfBusyId, setPdfBusyId] = useState("");
-  const [printSel, setPrintSel] = useState([]);
-  const [printPreviewOpen, setPrintPreviewOpen] = useState(false);
-  const [printPreviewLoading, setPrintPreviewLoading] = useState(false);
-  const [printPreview, setPrintPreview] = useState([]);
-  const [printPreviewFailures, setPrintPreviewFailures] = useState([]);
-  const [batchPrintResult, setBatchPrintResult] = useState(null);
   const detailRequest = useRef(0);
   const pdfDocumentRef = useRef(null);
   const receivedInvoiceDocumentRef = useRef(null);
-  const receivedInvoicesLoadedRef = useRef(false);
+  const receivedInvoiceRequestsRef = useRef(new Map());
   const receivedInvoicesCompanyRef = useRef(user?.company_id);
+  const activeSectionRef = useRef(section);
+  activeSectionRef.current = section;
   const pdfBusyRef = useRef(false);
   const pdfDownloadStartedRef = useRef("");
   const batchPrintRefs = useRef(new Map());
@@ -89,32 +93,71 @@ export default function InvoiceList({ express = false }) {
     if (express) return undefined;
     if (receivedInvoicesCompanyRef.current !== user?.company_id) {
       receivedInvoicesCompanyRef.current = user?.company_id;
-      receivedInvoicesLoadedRef.current = false;
       setReceivedInvoices([]);
+      setNewReceivedInvoiceIds([]);
     }
-    if (section !== "receiving" && receivedInvoicesLoadedRef.current) return undefined;
+    const requestKey = `${user?.company_id || "default"}:${receivedReload}`;
     let active = true;
-    const loadReceivedInvoices = async () => {
-      if (!receivedInvoicesLoadedRef.current) setReceivedLoading(true);
-      try {
-        const result = await api.getUncached("/intercompany/invoices/received");
+    let request = receivedInvoiceRequestsRef.current.get(requestKey);
+    if (!request) {
+      setReceivedLoading(true);
+      request = api.getUncached("/intercompany/invoices/received");
+      receivedInvoiceRequestsRef.current.set(requestKey, request);
+      request.then(
+        () => {
+          if (receivedInvoiceRequestsRef.current.get(requestKey) === request) {
+            receivedInvoiceRequestsRef.current.delete(requestKey);
+          }
+        },
+        () => {
+          if (receivedInvoiceRequestsRef.current.get(requestKey) === request) {
+            receivedInvoiceRequestsRef.current.delete(requestKey);
+          }
+        },
+      );
+    }
+    request.then((result) => {
         if (!Array.isArray(result)) throw new Error("The received invoice list response is not valid.");
         if (active) {
           setReceivedInvoices(result);
-          receivedInvoicesLoadedRef.current = true;
+          try {
+            const notified = JSON.parse(localStorage.getItem(receivedInvoicesNotifiedKey(user?.company_id)) || "[]");
+            const seen = JSON.parse(localStorage.getItem(receivedInvoicesSeenKey(user?.company_id)) || "[]");
+            if (
+              !Array.isArray(notified) || notified.some((id) => typeof id !== "string")
+              || !Array.isArray(seen) || seen.some((id) => typeof id !== "string")
+            ) {
+              throw new Error("Saved received invoice notification state is invalid.");
+            }
+            if (activeSectionRef.current === "receiving") {
+              setNewReceivedInvoiceIds([]);
+              markReceivedInvoicesSeen(result.map((receipt) => receipt.id));
+            } else {
+              const unseen = result.filter((receipt) => !seen.includes(receipt.id));
+              setNewReceivedInvoiceIds(unseen.map((receipt) => receipt.id));
+              const newInvoices = unseen.filter((receipt) => !notified.includes(receipt.id));
+              if (newInvoices.length) {
+                toast.info(`NEW INVOICE RECEIVED! (${newInvoices.length})`);
+                localStorage.setItem(
+                  receivedInvoicesNotifiedKey(user?.company_id),
+                  JSON.stringify([...new Set([...notified, ...newInvoices.map((receipt) => receipt.id)])]),
+                );
+              }
+            }
+          } catch (error) {
+            toast.error(`Could not update received invoice notification state: ${error.message}`);
+          }
         }
-      } catch (error) {
+      }).catch((error) => {
         if (!active) return;
         toast.error(`Could not load received invoices: ${apiError(error)}`);
-      } finally {
+      }).finally(() => {
         if (active) setReceivedLoading(false);
-      }
-    };
-    loadReceivedInvoices();
+      });
     return () => {
       active = false;
     };
-  }, [express, section, receivedReload, user?.company_id]);
+  }, [express, receivedReload, user?.company_id]);
 
   useEffect(() => {
     if (express) return;
@@ -130,15 +173,20 @@ export default function InvoiceList({ express = false }) {
     }
   }, [express, user?.company_id]);
 
-  const markReceivedInvoiceSeen = (receiptId) => {
-    const next = [...new Set([...seenReceivedInvoiceIds, receiptId])];
+  const markReceivedInvoicesSeen = (receiptIds) => {
     try {
+      const saved = JSON.parse(localStorage.getItem(receivedInvoicesSeenKey(user?.company_id)) || "[]");
+      if (!Array.isArray(saved) || saved.some((id) => typeof id !== "string")) {
+        throw new Error("Saved received invoice notification state is invalid.");
+      }
+      const next = [...new Set([...saved, ...seenReceivedInvoiceIds, ...receiptIds])];
       localStorage.setItem(receivedInvoicesSeenKey(user?.company_id), JSON.stringify(next));
       setSeenReceivedInvoiceIds(next);
     } catch (error) {
       toast.error(`Could not update received invoice notification state: ${error.message}`);
     }
   };
+  const markReceivedInvoiceSeen = (receiptId) => markReceivedInvoicesSeen([receiptId]);
 
   const openReceivedInvoice = async (receipt, openGRV = false) => {
     setReceivedInvoiceReceipt(receipt);
@@ -150,10 +198,17 @@ export default function InvoiceList({ express = false }) {
       const details = await api.getUncached(
         `/intercompany/invoices/received/${encodeURIComponent(receipt.id)}`,
       );
+      let printTemplate = null;
+      try {
+        printTemplate = await api.getUncached("/print-templates");
+      } catch (error) {
+        toast.error(`Invoice opened, but its approved print template could not be loaded: ${apiError(error)}`);
+      }
       const invoiceId = details.invoice_details?.invoice?.id;
       setReceivedInvoiceDetails({
         ...details,
         receipt,
+        printTemplate,
         items: receivedInvoiceItems(details.invoice_details?.invoice),
         existingGrvs: [],
       });
@@ -312,6 +367,10 @@ export default function InvoiceList({ express = false }) {
     let active = true;
     setLoading(true);
     setSel([]);
+    setPrintSel([]);
+    setPrintPreview([]);
+    setPrintPreviewFailures([]);
+    setBatchPrintResult(null);
     api.get("/invoices", {
       express,
       include_archived: showArchived && canAccessInvoiceArchive,
@@ -344,17 +403,7 @@ export default function InvoiceList({ express = false }) {
     setViewInvoice(null);
     setViewCustomer(null);
     detailRequest.current += 1;
-    setPrintSel([]);
-    setPrintPreviewOpen(false);
-    setPrintPreview([]);
-    setPrintPreviewFailures([]);
-    setBatchPrintResult(null);
-    batchPrintRefs.current.clear();
   }, [user?.company_id]);
-
-  useEffect(() => {
-    setPrintSel([]);
-  }, [page, debouncedQ, status, zone, invoiceDate, showArchived, express, user?.company_id]);
 
   const load = () => setReload((current) => current + 1);
 
@@ -391,9 +440,10 @@ export default function InvoiceList({ express = false }) {
     pdfDownloadStartedRef.current = "";
     setPdfBusyId(invoiceRow.id);
     try {
-      const [invoice, settings] = await Promise.all([
-        api.getUncached(`/invoices/${invoiceRow.id}`),
+      const [invoice, settings, printTemplate] = await Promise.all([
+        api.get(`/invoices/${invoiceRow.id}`),
         api.get("/settings"),
+        api.getUncached("/print-templates"),
       ]);
       let customer = {
         phone: invoice.customer_phone || "",
@@ -403,7 +453,7 @@ export default function InvoiceList({ express = false }) {
       if (invoice.customer_id && !invoice.customer_deleted) {
         customer = { ...customer, ...await api.getUncached(`/customers/${invoice.customer_id}`) };
       }
-      setPdfDownload({ invoice, settings, customer });
+      setPdfDownload({ invoice, settings, customer, printTemplate });
     } catch (error) {
       pdfBusyRef.current = false;
       setPdfBusyId("");
@@ -435,11 +485,9 @@ export default function InvoiceList({ express = false }) {
   }, [pdfDownload]);
 
   const toggle = (id) => setSel((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
-
   const togglePrintSelection = (id) => setPrintSel((selected) => (
     selected.includes(id) ? selected.filter((item) => item !== id) : [...selected, id]
   ));
-
   const prepareBatchPrint = async () => {
     if (!printSel.length || printPreviewLoading) return;
     setPrintPreviewLoading(true);
@@ -447,13 +495,11 @@ export default function InvoiceList({ express = false }) {
     setPrintPreviewFailures([]);
     setBatchPrintResult(null);
     batchPrintRefs.current.clear();
-
     try {
       const [settings, printTemplate] = await Promise.all([
         api.get("/settings"),
         api.getUncached("/print-templates"),
       ]);
-
       const results = await Promise.all(printSel.map(async (invoiceId) => {
         try {
           const invoice = await api.get(`/invoices/${invoiceId}`);
@@ -462,25 +508,16 @@ export default function InvoiceList({ express = false }) {
             city: invoice.customer_city || "",
             address: invoice.customer_address || "",
           };
-
           if (invoice.customer_id && !invoice.customer_deleted) {
-            customer = {
-              ...customer,
-              ...await api.getUncached(`/customers/${invoice.customer_id}`),
-            };
+            customer = { ...customer, ...await api.getUncached(`/customers/${invoice.customer_id}`) };
           }
-
           return { invoice, customer, settings, printTemplate };
         } catch (error) {
           return { failure: { id: invoiceId, error: apiError(error) } };
         }
       }));
-
       const documents = results.filter((result) => !result.failure);
-      const failures = results
-        .filter((result) => result.failure)
-        .map((result) => result.failure);
-
+      const failures = results.filter((result) => result.failure).map((result) => result.failure);
       setPrintPreview(documents);
       setPrintPreviewFailures(failures);
       setBatchPrintResult({ printed: 0, failed: failures.length });
@@ -491,52 +528,31 @@ export default function InvoiceList({ express = false }) {
       setPrintPreviewLoading(false);
     }
   };
-
   const printSelectedInvoices = () => {
     if (!printPreview.length) return;
-
-    if (!window.confirm(
-      `Print ${printPreview.length} invoice(s)? Check the preview to avoid accidental duplicate printing.`
-    )) return;
-
+    if (!window.confirm(`Print ${printPreview.length} invoice(s)? Check the preview to avoid accidental duplicate printing.`)) return;
     const elements = printPreview.map((_, index) => batchPrintRefs.current.get(index));
     const renderFailures = printPreview.flatMap((document, index) => elements[index] ? [] : [{
       id: document.invoice.id,
       error: "The invoice preview could not be rendered.",
     }]);
-
     const printableElements = elements.filter(Boolean);
     const previousPreparationFailures = printPreviewFailures.filter(
       (failure) => !failure.error.includes("browser blocked the print window"),
     );
-
-    if (
-      !printableElements.length
-      || !printElements(printableElements, `Invoice batch (${printableElements.length})`)
-    ) {
+    if (!printableElements.length || !printElements(printableElements, `Invoice batch (${printableElements.length})`)) {
       const errors = printPreview.map((document) => ({
         id: document.invoice.id,
         error: "The browser blocked the print window. Allow pop-ups and try again.",
       }));
-
       setPrintPreviewFailures([...previousPreparationFailures, ...errors]);
-      setBatchPrintResult({
-        printed: 0,
-        failed: previousPreparationFailures.length + errors.length,
-      });
+      setBatchPrintResult({ printed: 0, failed: previousPreparationFailures.length + errors.length });
       return;
     }
-
     const printed = printableElements.length;
     setPrintPreviewFailures([...previousPreparationFailures, ...renderFailures]);
-    setBatchPrintResult({
-      printed,
-      failed: previousPreparationFailures.length + renderFailures.length,
-    });
-
-    toast.success(
-      `${printed} invoice(s) sent to the print dialog; ${previousPreparationFailures.length + renderFailures.length} failed to prepare.`
-    );
+    setBatchPrintResult({ printed, failed: previousPreparationFailures.length + renderFailures.length });
+    toast.success(`${printed} invoice(s) sent to the print dialog; ${previousPreparationFailures.length + renderFailures.length} failed to prepare.`);
   };
   const removeMany = async (ids) => {
     if (!window.confirm(`Delete ${ids.length} invoice(s)?`)) return;
@@ -669,10 +685,6 @@ export default function InvoiceList({ express = false }) {
   const pageCount = Math.max(1, Math.ceil(total / 50));
   const rangeStart = total === 0 ? 0 : (page - 1) * 50 + 1;
   const rangeEnd = Math.min(page * 50, total);
-  const unseenReceivedInvoiceCount = receivedInvoices.filter(
-    (receipt) => !seenReceivedInvoiceIds.includes(receipt.id),
-  ).length;
-
   return (
     <div>
       <PageHeader title={express ? "Express Website Invoices" : "Invoices"} subtitle={loading ? "Loading invoices..." : `Showing ${rangeStart}–${rangeEnd} of ${total} invoices`}>
@@ -684,7 +696,10 @@ export default function InvoiceList({ express = false }) {
           type="button"
           role="tab"
           aria-selected={section === "invoices"}
-          onClick={() => setSection("invoices")}
+          onClick={() => {
+            setSection("invoices");
+            setReceivedReload((current) => current + 1);
+          }}
           className={`border-b-2 px-3 py-2 text-sm font-semibold ${section === "invoices" ? "border-primary text-primary" : "border-transparent text-slate-500"}`}
           data-testid="invoices-section-tab"
         >Invoices</button>
@@ -692,7 +707,12 @@ export default function InvoiceList({ express = false }) {
           type="button"
           role="tab"
           aria-selected={section === "receiving"}
-          onClick={() => setSection("receiving")}
+          onClick={() => {
+            setSection("receiving");
+            setReceivedReload((current) => current + 1);
+            setNewReceivedInvoiceIds([]);
+            markReceivedInvoicesSeen(receivedInvoices.map((receipt) => receipt.id));
+          }}
           className={`border-b-2 px-3 py-2 text-sm font-semibold ${section === "receiving" ? "border-primary text-primary" : "border-transparent text-slate-500"}`}
           data-testid="receiving-invoices-section-tab"
         >
@@ -700,8 +720,8 @@ export default function InvoiceList({ express = false }) {
           <span className="ml-1 rounded-full bg-slate-100 px-2 py-0.5 text-xs" data-testid="received-invoice-count">
             {receivedInvoices.length}
           </span>
-          {unseenReceivedInvoiceCount > 0 && <span
-            className="ml-2 inline-flex items-center rounded-full border border-rose-300 bg-rose-100 px-2 py-0.5 text-[10px] font-extrabold tracking-wide text-rose-700 shadow-[0_0_8px_rgba(251,113,133,0.75)] animate-pulse"
+          {newReceivedInvoiceIds.length > 0 && <span
+            className="ml-2 inline-flex items-center rounded-full border-2 border-red-300 bg-red-600 px-2.5 py-1 text-[10px] font-black tracking-wide text-white shadow-[0_0_6px_2px_rgba(239,68,68,0.85)] animate-pulse"
             role="status"
             data-testid="new-invoice-received-alert"
           >NEW INVOICE RECEIVED!</span>}
@@ -774,6 +794,9 @@ export default function InvoiceList({ express = false }) {
             Show archived invoices
         </label>}
       </Card>
+      <p className="mb-3 text-sm text-slate-600" data-testid="batch-print-instructions">
+        To print multiple invoices together, select the checkboxes in the first column, then click <strong>Print Selected</strong>.
+      </p>
 
       {canManageInvoices && (!showArchived || canAccessInvoiceArchive) && sel.length > 0 && <div className="flex items-center justify-between rounded-xl border border-amber-200 bg-amber-50 px-4 py-2" data-testid="bulk-bar">
         <span className="text-sm font-semibold text-amber-800">{sel.length} selected</span>
@@ -781,12 +804,7 @@ export default function InvoiceList({ express = false }) {
           <Trash2 size={15} /> {showArchived ? "Permanently delete selected" : "Delete selected"}
         </Btn>
       </div>}
-
-      <p className="mb-3 text-sm text-slate-600" data-testid="batch-print-instructions">
-        To print multiple invoices together, select the checkboxes in the first column, then click <strong>Print Selected</strong>.
-      </p>
-
-      {printSel.length > 0 && <div className="mb-3 flex items-center justify-between rounded-xl border border-blue-200 bg-blue-50 px-4 py-2" data-testid="batch-print-bar">
+      {printSel.length > 0 && <div className="flex items-center justify-between rounded-xl border border-blue-200 bg-blue-50 px-4 py-2" data-testid="batch-print-bar">
         <span className="text-sm font-semibold text-blue-900">{printSel.length} invoice(s) selected for printing</span>
         <Btn onClick={prepareBatchPrint} disabled={printPreviewLoading} data-testid="print-selected-invoices">
           <Printer size={15} /> {printPreviewLoading ? "Preparing preview..." : "Print Selected"}
@@ -798,30 +816,12 @@ export default function InvoiceList({ express = false }) {
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead><tr className="text-left text-xs text-slate-400 bg-slate-50 border-b border-border">
-                <th className="px-3 py-3 w-8" title="Select for printing">
-                  <input
-                    type="checkbox"
-                    checked={list.length > 0 && list.every((item) => printSel.includes(item.id))}
-                    onChange={(event) => setPrintSel((current) => event.target.checked
-                      ? [...new Set([...current, ...list.map((item) => item.id)])]
-                      : current.filter((id) => !list.some((item) => item.id === id)))}
-                    aria-label="Select all invoices on this page for printing"
-                    data-testid="select-all-invoices-for-print"
-                  />
-                </th>
+                <th className="px-3 py-3 w-8" title="Select for printing"><input type="checkbox" className="h-5 w-5 accent-primary" checked={list.length > 0 && list.every((invoice) => printSel.includes(invoice.id))} onChange={(event) => setPrintSel((current) => event.target.checked ? [...new Set([...current, ...list.map((invoice) => invoice.id)])] : current.filter((id) => !list.some((invoice) => invoice.id === id)))} aria-label="Select all invoices on this page for printing" data-testid="select-all-invoices-for-print" /></th>
                 {canManageInvoices && <th className="px-3 py-3 w-8"><input type="checkbox" checked={sel.length > 0 && sel.length === list.filter((i) => showArchived ? i.archived : !i.archived && i.status === "draft").length} onChange={(e) => setSel(e.target.checked ? list.filter((i) => showArchived ? i.archived : !i.archived && i.status === "draft").map((i) => i.id) : [])} data-testid="select-all-invoices" /></th>}<th className="px-4 py-3 font-semibold">Invoice</th><th className="px-4 font-semibold">Customer</th><th className="px-4 font-semibold">Date</th><th className="px-4 font-semibold">Due</th>{priceZonesEnabled && <th className="px-4 font-semibold">Zone</th>}<th className="px-4 font-semibold text-right">Total</th><th className="px-4 font-semibold text-right">Paid</th><th className="px-4 font-semibold text-right">Balance</th><th className="px-4 font-semibold text-center">Status</th><th className="px-4 font-semibold text-right">Actions</th>
               </tr></thead>
               <tbody>{list.map((i) => (
                 <tr key={i.id} className="border-b border-border/60 hover:bg-slate-50 cursor-pointer" onClick={() => i.archived ? view(i.id) : nav(`${listPath}/${i.id}`)} data-testid={`invoice-row-${i.id}`}>
-                  <td className="px-3" onClick={(event) => event.stopPropagation()}>
-                    <input
-                      type="checkbox"
-                      checked={printSel.includes(i.id)}
-                      onChange={() => togglePrintSelection(i.id)}
-                      aria-label={`Select invoice ${i.number || "draft"} for printing`}
-                      data-testid={`select-invoice-for-print-${i.id}`}
-                    />
-                  </td>
+                  <td className="px-3" onClick={(event) => event.stopPropagation()}><input type="checkbox" className="h-5 w-5 accent-primary" checked={printSel.includes(i.id)} onChange={() => togglePrintSelection(i.id)} aria-label={`Select invoice ${i.number || "draft"} for printing`} data-testid={`select-invoice-for-print-${i.id}`} /></td>
                   {canManageInvoices && <td className="px-3" onClick={(e) => e.stopPropagation()}>{(showArchived ? i.archived : !i.archived && i.status === "draft") && <input type="checkbox" checked={sel.includes(i.id)} onChange={() => toggle(i.id)} data-testid={`select-invoice-${i.id}`} />}</td>}
                   <td className="px-4 py-3 font-mono font-semibold text-slate-700">{i.number || "DRAFT"}{i.archived && <span className="ml-2 inline-block rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-800 font-sans">Archived</span>}{i.opening_balance && <span className="ml-2 inline-block rounded-full border border-violet-200 bg-violet-50 px-2 py-0.5 text-[10px] font-semibold text-violet-700 font-sans" data-testid={`opening-badge-${i.id}`}>Opening Balance</span>}</td>
                   <td className="px-4 text-slate-600">{i.customer_name}{i.customer_deleted && <Badge cls="ml-2 border-red-200 bg-red-50 text-red-700">Deleted customer</Badge>}</td>
@@ -1097,6 +1097,7 @@ export default function InvoiceList({ express = false }) {
                     totals={totals}
                     customer={customer}
                     settings={settings}
+                    printTemplate={receivedInvoiceDetails.printTemplate}
                   />
                 </div>
                 {existingGrvs.length > 0 && <div className="rounded-lg border border-blue-200 bg-blue-50 p-3">
@@ -1182,60 +1183,44 @@ export default function InvoiceList({ express = false }) {
         wide
       >
         <div className="space-y-4">
-          <p className="text-sm text-slate-600">
-            Review all documents before opening the browser print dialog. Cancel here to leave every invoice unchanged.
-          </p>
-
+          <p className="text-sm text-slate-600">Review all documents before opening the browser print dialog. Cancel here to leave every invoice unchanged.</p>
           {batchPrintResult && <p className="rounded-md border border-blue-200 bg-blue-50 p-3 text-sm font-semibold text-blue-900" role="status" data-testid="batch-print-result">
             Sent to print dialog: {batchPrintResult.printed} · Failed: {batchPrintResult.failed}
           </p>}
-
           {printPreviewFailures.length > 0 && <div className="rounded-md border border-amber-200 bg-amber-50 p-3" data-testid="batch-print-failures">
-            <p className="text-sm font-semibold text-amber-900">
-              {printPreviewFailures.length} invoice(s) could not be prepared:
-            </p>
+            <p className="text-sm font-semibold text-amber-900">{printPreviewFailures.length} invoice(s) could not be prepared:</p>
             <ul className="mt-1 list-inside list-disc text-sm text-amber-900">
-              {printPreviewFailures.map((failure, index) => (
-                <li key={`${failure.id}-${index}`}>{failure.id}: {failure.error}</li>
-              ))}
+              {printPreviewFailures.map((failure, index) => <li key={`${failure.id}-${index}`}>{failure.id}: {failure.error}</li>)}
             </ul>
           </div>}
-
           <div className="max-h-[65vh] space-y-5 overflow-auto rounded-lg bg-slate-100 p-3">
-            {printPreview.map((document, index) => (
-              <section
-                key={document.invoice.id}
-                className="overflow-x-auto border border-slate-200 bg-white shadow-sm"
-                data-testid={`batch-print-preview-${document.invoice.id}`}
-              >
-                <p className="sticky left-0 z-10 bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-700">
-                  {document.invoice.number || "DRAFT"} · {document.invoice.customer_name || "Customer"}
-                </p>
-                <InvoiceDocument
-                  ref={(element) => {
-                    if (element) batchPrintRefs.current.set(index, element);
-                    else batchPrintRefs.current.delete(index);
-                  }}
-                  inv={document.invoice}
-                  totals={{
-                    subtotal: Number(document.invoice.subtotal) || 0,
-                    tax: Number(document.invoice.tax_amount) || 0,
-                    total: Number(document.invoice.total) || 0,
-                    outstanding: Number(document.invoice.outstanding) || 0,
-                  }}
-                  customer={document.customer}
-                  settings={document.settings}
-                  previousInvoices={document.invoice.previous_invoices_pending || []}
-                  customerBalanceBeforeInvoice={Number(document.invoice.customer_balance_before_invoice) || 0}
-                  showCustomerBalance={document.invoice.include_previous_balance !== false
-                    && document.invoice.customer_balance_before_invoice != null}
-                  printTemplate={document.printTemplate}
-                />
-              </section>
-            ))}
+            {printPreview.map((document, index) => <section key={document.invoice.id} className="overflow-x-auto border border-slate-200 bg-white shadow-sm" data-testid={`batch-print-preview-${document.invoice.id}`}>
+              <p className="sticky left-0 z-10 bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-700">
+                {document.invoice.number || "DRAFT"} · {document.invoice.customer_name || "Customer"}
+              </p>
+              <InvoiceDocument
+                ref={(element) => {
+                  if (element) batchPrintRefs.current.set(index, element);
+                  else batchPrintRefs.current.delete(index);
+                }}
+                inv={document.invoice}
+                totals={{
+                  subtotal: Number(document.invoice.subtotal) || 0,
+                  tax: Number(document.invoice.tax_amount) || 0,
+                  total: Number(document.invoice.total) || 0,
+                  outstanding: Number(document.invoice.outstanding) || 0,
+                }}
+                customer={document.customer}
+                settings={document.settings}
+                previousInvoices={document.invoice.previous_invoices_pending || []}
+                customerBalanceBeforeInvoice={Number(document.invoice.customer_balance_before_invoice) || 0}
+                showCustomerBalance={document.invoice.include_previous_balance !== false
+                  && document.invoice.customer_balance_before_invoice != null}
+                printTemplate={document.printTemplate}
+              />
+            </section>)}
             {!printPreview.length && <p className="p-5 text-sm text-slate-500">No invoice previews are available.</p>}
           </div>
-
           <div className="flex flex-wrap justify-end gap-2">
             <Btn variant="outline" onClick={() => setPrintPreviewOpen(false)}>Close</Btn>
             <Btn onClick={printSelectedInvoices} disabled={!printPreview.length} data-testid="confirm-print-selected">
@@ -1256,6 +1241,7 @@ export default function InvoiceList({ express = false }) {
           }}
           customer={pdfDownload.customer}
           settings={pdfDownload.settings}
+          printTemplate={pdfDownload.printTemplate}
           previousInvoices={pdfDownload.invoice.previous_invoices_pending || []}
           customerBalanceBeforeInvoice={Number(pdfDownload.invoice.customer_balance_before_invoice) || 0}
           showCustomerBalance={pdfDownload.invoice.include_previous_balance !== false

@@ -10,6 +10,15 @@ test("weekday 08:00-18:00 is nine worked hours including one overtime hour", () 
   }), { workedHours: 9, overtimeHours: 1 });
 });
 
+test("manual overtime replaces the automatic overtime value", () => {
+  assert.deepEqual(calculateAttendanceHours({
+    date: "2026-10-26",
+    start_time: "08:00",
+    end_time: "13:00",
+    overtime_hours: 2,
+  }), { workedHours: 5, overtimeHours: 2 });
+});
+
 test("Saturday has no lunch deduction and overtime remains after 17:00", () => {
   assert.deepEqual(calculateAttendanceHours({
     date: "2026-11-14",

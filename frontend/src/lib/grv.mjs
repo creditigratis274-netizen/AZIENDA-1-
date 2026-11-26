@@ -20,17 +20,38 @@ export function parseGrvDecimal(value) {
   return Number(normalized);
 }
 
-export function grvTotals(items = [], vatRate = 0) {
-  const subtotal = items.reduce((sum, line) => {
-    const quantity = Number(line.accepted_quantity) || 0;
-    const unitCost = parseGrvDecimal(line.unit_cost);
-    return sum + quantity * (Number.isFinite(unitCost) ? unitCost : 0);
-  }, 0);
+export function grvLineCalculations(line = {}) {
+  const containerCount = Number(line.container_count ?? line.accepted_quantity ?? 0) || 0;
+  const containerCapacity = Number(line.container_capacity ?? line.size ?? 0) || 0;
+  const unitPrice = parseGrvDecimal(line.unit_cost);
+  const priceBasis = line.price_basis
+    || (containerCapacity > 0 && /^(kg|kgs|kilograms?|l|liters?|litres?)$/i.test(String(line.unit || "").trim())
+      ? "per_unit" : "per_container");
+  const totalQuantity = priceBasis === "per_unit"
+    ? containerCount * containerCapacity
+    : containerCount;
+  const subtotal = totalQuantity * (Number.isFinite(unitPrice) ? unitPrice : 0);
+  return {
+    containerCount,
+    containerCapacity,
+    totalQuantity,
+    priceBasis,
+    subtotal,
+  };
+}
+
+export function grvTotals(items = [], vatRate = 0, freightCost = 0) {
+  const subtotal = items.reduce((sum, line) => sum + grvLineCalculations(line).subtotal, 0);
   const rate = parseGrvDecimal(vatRate);
-  const vatAmount = subtotal * (Number.isFinite(rate) ? rate : 0) / 100;
+  const freight = parseGrvDecimal(freightCost);
+  const freightAmount = Number.isFinite(freight) ? Math.max(0, freight) : 0;
+  const taxableSubtotal = subtotal + freightAmount;
+  const vatAmount = taxableSubtotal * (Number.isFinite(rate) ? rate : 0) / 100;
   return {
     subtotal,
+    taxableSubtotal,
     vatAmount,
-    total: subtotal + vatAmount,
+    freightAmount,
+    total: taxableSubtotal + vatAmount,
   };
 }

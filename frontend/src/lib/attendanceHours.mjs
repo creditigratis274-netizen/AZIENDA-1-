@@ -10,9 +10,13 @@ export const calculateAttendanceHours = (record) => {
   const isWeekday = weekday >= 1 && weekday <= 5;
   const lunchBreak = isWeekday && duration > 8 ? 1 : 0;
   const endMinutes = endHour * 60 + endMinute;
+  const automaticOvertime = Math.max(0, (endMinutes - 17 * 60) / 60);
+  const manualOvertime = Number(record.overtime_hours);
 
   return {
     workedHours: Math.max(0, duration - lunchBreak),
-    overtimeHours: Math.max(0, (endMinutes - 17 * 60) / 60),
+    overtimeHours: Number.isFinite(manualOvertime) && manualOvertime > 0
+      ? manualOvertime
+      : automaticOvertime,
   };
 };

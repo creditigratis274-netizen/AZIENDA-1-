@@ -9,7 +9,7 @@ import { useAuth } from "@/context/AuthContext";
 import { api, apiError } from "@/lib/api";
 import { fmtDate, fmtMoney, today } from "@/lib/format";
 import { companyProfileName } from "@/lib/company";
-import { grvTotals, parseGrvDecimal, updateGrvReceivedQuantity } from "@/lib/grv.mjs";
+import { grvLineCalculations, grvTotals, parseGrvDecimal, updateGrvReceivedQuantity } from "@/lib/grv.mjs";
 import { Badge, Btn, Card, Empty, Input, Modal, PageHeader, Select, Textarea } from "@/components/common";
 import BarcodeScanner from "@/components/BarcodeScanner";
 
@@ -53,12 +53,11 @@ const blankLine = () => ({
 const blankGRV = () => ({
   supplier_id: "", supplier_name: "", purchase_order_id: "",
   delivery_note_number: "", received_date: today(), received_by: "",
-  warehouse: "", notes: "", items: [blankLine()], vat_rate: 0,
+  warehouse: "", notes: "", items: [blankLine()], vat_rate: 0, freight_cost: 0,
   purpose: "selling", is_chemical: false,
 });
-const lineValue = (line) => (Number(line.accepted_quantity) || 0)
-  * (Number.isFinite(parseGrvDecimal(line.unit_cost)) ? parseGrvDecimal(line.unit_cost) : 0);
-const savedGrvTotals = (grv) => grvTotals(grv.items || [], grv.vat_rate || 0);
+const lineValue = (line) => grvLineCalculations(line).subtotal;
+const savedGrvTotals = (grv) => grvTotals(grv.items || [], grv.vat_rate || 0, grv.freight_cost || 0);
 const stockItemLabel = (item) => [item.size, item.product].filter(Boolean).join(" ");
 const intercompanyInvoiceItems = (invoice) => (invoice?.items || [])
   .filter((item) => (item.category || item.size || item.description)
@@ -205,6 +204,10 @@ async function downloadGRVPdf(grv, companyName, settings = {}) {
   pdf.setFontSize(10);
   const totals = savedGrvTotals(grv);
   addText(`Accepted goods subtotal: ${fmtMoney(totals.subtotal)}`, right, y, { align: "right" });
+  y += 6;
+  addText(`Freight Cost: ${fmtMoney(totals.freightAmount)}`, right, y, { align: "right" });
+  y += 6;
+  addText(`Taxable subtotal: ${fmtMoney(totals.taxableSubtotal)}`, right, y, { align: "right" });
   y += 6;
   addText(`VAT (${Number(grv.vat_rate || 0)}%): ${fmtMoney(totals.vatAmount)}`, right, y, { align: "right" });
   y += 6;
@@ -584,6 +587,10 @@ export default function GRV() {
     if (!Number.isFinite(vatRate) || vatRate < 0 || vatRate > 100) {
       return toast.error("VAT percentage must be between 0 and 100");
     }
+    const freightCost = parseGrvDecimal(draft.freight_cost);
+    if (!Number.isFinite(freightCost) || freightCost < 0) {
+      return toast.error("Freight cost must be a valid non-negative amount");
+    }
     const decimalFields = draft.items.flatMap((line) => [
       line.unit_cost,
       line.sale_price_zone_1,
@@ -606,6 +613,7 @@ export default function GRV() {
       const payload = {
         ...draft,
         vat_rate: vatRate,
+        freight_cost: freightCost,
         items: draft.items.map((line) => ({
           ...line,
           actual_received_quantity: Number(line.actual_received_quantity || 0),
@@ -613,6 +621,22 @@ export default function GRV() {
           rejected_quantity: Number(line.rejected_quantity || 0),
           damaged_quantity: Number(line.damaged_quantity || 0),
           unit_cost: parseGrvDecimal(line.unit_cost || 0),
+          container_count: draft.is_chemical
+            ? Number(line.accepted_quantity || line.container_count || 0)
+            : (line.container_count == null ? Number(line.accepted_quantity || 0) : Number(line.container_count)),
+          container_capacity: draft.is_chemical
+            ? parseGrvDecimal(line.container_capacity ?? line.size)
+            : parseGrvDecimal(line.container_capacity ?? line.size),
+          total_quantity: draft.is_chemical
+            ? grvLineCalculations({
+              ...line,
+              container_count: Number(line.accepted_quantity || line.container_count || 0),
+              container_capacity: parseGrvDecimal(line.container_capacity ?? line.size),
+            }).totalQuantity
+            : Number(line.accepted_quantity || 0),
+          price_basis: draft.is_chemical
+            ? (line.price_basis || "per_unit")
+            : (line.price_basis || "per_container"),
           sale_price_zone_1: line.sale_price_zone_1 === "" || line.sale_price_zone_1 == null
             ? null : parseGrvDecimal(line.sale_price_zone_1),
           sale_price_zone_2: line.sale_price_zone_2 === "" || line.sale_price_zone_2 == null
@@ -976,6 +1000,9 @@ export default function GRV() {
             <Input label="VAT (%)" type="text" inputMode="decimal" value={draft.vat_rate ?? 0}
               onChange={(event) => setDraft({ ...draft, vat_rate: event.target.value })}
               data-testid="grv-vat-rate" />
+            <Input label="Freight Cost (R)" type="text" inputMode="decimal" value={draft.freight_cost ?? 0}
+              onChange={(event) => setDraft({ ...draft, freight_cost: event.target.value })}
+              data-testid="grv-freight-cost" />
           </div>
 
           {scanReceivingMode && <div className="max-w-xl">
@@ -1015,8 +1042,48 @@ export default function GRV() {
                         {draft.is_chemical
                           ? <input placeholder="Container (Barrel...)" value={line.container_type || ""} onChange={(event) => updateLine(index, "container_type", event.target.value)} className="rounded border border-input px-2 py-1.5" data-testid={`grv-raw-container-${index}`} />
                           : <input list="grv-raw-material-categories" placeholder="Category (Glue, Fabric...)" value={line.category || ""} onChange={(event) => updateLine(index, "category", event.target.value)} className="rounded border border-input px-2 py-1.5" data-testid={`grv-raw-category-${index}`} />}
-                        <input placeholder={draft.is_chemical ? "Capacity (number)" : "Size"} value={line.size} onChange={(event) => updateLine(index, "size", event.target.value)} className="rounded border border-input px-2 py-1.5" data-testid={`grv-raw-size-${index}`} />
+                        <input placeholder={draft.is_chemical ? "Capacity per container (number)" : "Size"} value={line.size} onChange={(event) => {
+                          const capacity = event.target.value;
+                          setDraft((current) => ({
+                            ...current,
+                            items: current.items.map((item, itemIndex) => itemIndex === index
+                              ? { ...item, size: capacity, container_capacity: parseGrvDecimal(capacity) }
+                              : item),
+                          }));
+                        }} className="rounded border border-input px-2 py-1.5" data-testid={`grv-raw-size-${index}`} />
                         <input placeholder="Unit * (kg, L, pcs)" value={line.unit || ""} onChange={(event) => updateLine(index, "unit", event.target.value)} className="rounded border border-input px-2 py-1.5" data-testid={`grv-raw-unit-${index}`} />
+                        {draft.is_chemical && <>
+                          <input
+                            type="number" min="0" step="0.01"
+                            placeholder="Container count"
+                            value={line.container_count ?? line.accepted_quantity ?? 0}
+                            onChange={(event) => {
+                              const containerCount = Number(event.target.value || 0);
+                              setDraft((current) => ({
+                                ...current,
+                                items: current.items.map((item, itemIndex) => itemIndex === index
+                                  ? {
+                                    ...item,
+                                    container_count: containerCount,
+                                    accepted_quantity: containerCount,
+                                    actual_received_quantity: containerCount,
+                                  }
+                                  : item),
+                              }));
+                            }}
+                            className="rounded border border-input px-2 py-1.5"
+                            data-testid={`grv-chemical-container-count-${index}`}
+                          />
+                          <select
+                            value={line.price_basis || "per_unit"}
+                            onChange={(event) => updateLine(index, "price_basis", event.target.value)}
+                            className="rounded border border-input px-2 py-1.5"
+                            data-testid={`grv-chemical-price-basis-${index}`}
+                          >
+                            <option value="per_unit">Per Unit (KG / L / etc.)</option>
+                            <option value="per_container">Per Container (Barrel / Drum / Box)</option>
+                          </select>
+                        </>}
                       </div>
                       : !draft.purchase_order_id
                       ? line.new_product
@@ -1129,7 +1196,12 @@ export default function GRV() {
                           data-testid={`grv-${key}-${index}`} />
                       </td>
                     ))}
-                    <td className="p-2 text-right font-mono font-semibold">{fmtMoney(lineValue(line))}</td>
+                    <td className="p-2 text-right font-mono font-semibold">
+                      {draft.is_chemical && <span className="block text-[10px] text-slate-500">
+                        {grvLineCalculations(line).containerCount} × {grvLineCalculations(line).containerCapacity} = {grvLineCalculations(line).totalQuantity} {line.unit || "units"}
+                      </span>}
+                      {fmtMoney(lineValue(line))}
+                    </td>
                     {!draft.purchase_order_id && <td className="p-2"><button type="button" onClick={() => removeLine(index)} className="text-xs text-red-700 hover:underline">Remove</button></td>}
                   </>}
                 </tr>
@@ -1138,9 +1210,11 @@ export default function GRV() {
           </div>
           {!draft.purchase_order_id && <Btn type="button" variant="outline" onClick={() => setDraft({ ...draft, items: [...draft.items, blankLine()] })}><Plus size={14} /> Add product line</Btn>}
           {(() => {
-            const totals = grvTotals(draft.items, draft.vat_rate);
+            const totals = grvTotals(draft.items, draft.vat_rate, draft.freight_cost);
             return <div className="ml-auto max-w-sm space-y-1 rounded-md border border-border bg-slate-50 p-3 text-sm" data-testid="grv-total-preview">
               <p className="flex justify-between gap-6"><span>Subtotal (accepted value)</span><span className="font-mono">{fmtMoney(totals.subtotal)}</span></p>
+              <p className="flex justify-between gap-6"><span>Freight Cost</span><span className="font-mono">{fmtMoney(totals.freightAmount)}</span></p>
+              <p className="flex justify-between gap-6"><span>Taxable subtotal</span><span className="font-mono">{fmtMoney(totals.taxableSubtotal)}</span></p>
               <p className="flex justify-between gap-6"><span>VAT ({draft.vat_rate || 0}%)</span><span className="font-mono">{fmtMoney(totals.vatAmount)}</span></p>
               <p className="flex justify-between gap-6 border-t border-border pt-1 font-bold"><span>Total including VAT</span><span className="font-mono">{fmtMoney(totals.total)}</span></p>
             </div>;
@@ -1182,12 +1256,19 @@ export default function GRV() {
                   <td className="px-3 py-2 text-right font-mono">{line.actual_received_quantity ?? 0}</td>
                   <td className="px-3 py-2 text-right font-mono">{line.accepted_quantity ?? 0}</td>
                   <td className="px-3 py-2 text-right font-mono">{fmtMoney(line.unit_cost ?? 0)}</td>
-                  <td className="px-3 py-2 text-right font-mono">{fmtMoney(line.total_value ?? lineValue(line))}</td>
+                  <td className="px-3 py-2 text-right font-mono">
+                    {viewTarget.is_chemical && <span className="block text-[10px] text-slate-500">
+                      {line.container_count ?? line.accepted_quantity ?? 0} containers × {line.container_capacity ?? line.size ?? 0} = {line.total_quantity ?? grvLineCalculations(line).totalQuantity} {line.unit || "units"}
+                    </span>}
+                    {fmtMoney(line.total_value ?? lineValue(line))}
+                  </td>
                 </tr>
               ))}</tbody>
               <tfoot>
                 <tr><td colSpan={4} className="px-3 py-2 text-right">Subtotal accepted value</td><td className="px-3 py-2 text-right font-mono">{fmtMoney(savedGrvTotals(viewTarget).subtotal)}</td></tr>
+                <tr><td colSpan={4} className="px-3 py-2 text-right">Taxable subtotal</td><td className="px-3 py-2 text-right font-mono">{fmtMoney(savedGrvTotals(viewTarget).taxableSubtotal)}</td></tr>
                 <tr><td colSpan={4} className="px-3 py-2 text-right">VAT ({Number(viewTarget.vat_rate || 0)}%)</td><td className="px-3 py-2 text-right font-mono">{fmtMoney(savedGrvTotals(viewTarget).vatAmount)}</td></tr>
+                <tr><td colSpan={4} className="px-3 py-2 text-right">Freight Cost</td><td className="px-3 py-2 text-right font-mono">{fmtMoney(savedGrvTotals(viewTarget).freightAmount)}</td></tr>
                 <tr className="font-semibold"><td colSpan={4} className="px-3 py-2 text-right">Total including VAT</td><td className="px-3 py-2 text-right font-mono">{fmtMoney(savedGrvTotals(viewTarget).total)}</td></tr>
               </tfoot>
             </table>

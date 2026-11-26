@@ -24,24 +24,19 @@ def daily_tier_result(*daily_counts):
 
 
 def test_daily_rate_tiers_pay_weekdays_at_two_fifty_until_70_then_three_fifty():
-    result = daily_tier_result(54, 55, 69, 70, 75, 40)
+    result = daily_tier_result(54, 55, 69, 70, 80, 40)
 
     week = result["weeks"][0]
     assert [day["target"] for day in week["days"][:5]] == [55] * 5
     assert [day["high_rate_target"] for day in week["days"][:5]] == [70] * 5
-    assert [day["pay"] for day in week["days"][:5]] == [135, 137.5, 172.5, 245, 262.5]
+    assert [day["pay"] for day in week["days"][:5]] == [135, 137.5, 172.5, 245, 280]
     assert [day["piece_rate"] for day in week["days"][:5]] == [2.5, 2.5, 2.5, 3.5, 3.5]
 
 
-def test_daily_rate_tiers_pay_saturday_at_two_fifty_with_a_40_piece_target():
-    result = daily_tier_result(70, 70, 70, 70, 70, 40)
-
-    saturday = result["weeks"][0]["days"][-1]
-    assert saturday["target"] == 40
-    assert saturday["piece_rate"] == 2.5
-    assert saturday["high_rate_pieces"] == 0
-    assert saturday["low_rate_pieces"] == 40
-    assert saturday["pay"] == 100
+def test_daily_rate_tiers_pay_saturday_at_target_or_above_at_three_fifty():
+    assert daily_tier_result(70, 70, 70, 70, 70, 39)["weeks"][0]["days"][-1]["pay"] == 97.5
+    assert daily_tier_result(70, 70, 70, 70, 70, 40)["weeks"][0]["days"][-1]["pay"] == 140
+    assert daily_tier_result(70, 70, 70, 70, 70, 50)["weeks"][0]["days"][-1]["pay"] == 175
 
 
 def test_daily_rate_tiers_do_not_transfer_piece_targets_between_days():
@@ -165,6 +160,14 @@ def test_saturday_at_and_above_40_pays_each_piece_at_high_rate():
 
     assert (at_target["saturday_rate"], at_target["saturday_pay"]) == (3.5, 140)
     assert (above_target["saturday_rate"], above_target["saturday_pay"]) == (3.5, 143.5)
+
+
+def test_editing_monday_from_65_to_70_recalculates_daily_pay():
+    initial = daily_tier_result(65, 70)
+    edited = daily_tier_result(70, 70)
+
+    assert initial["weeks"][0]["days"][0]["pay"] == 162.5
+    assert edited["weeks"][0]["days"][0]["pay"] == 245
 
 
 def test_editing_monday_recalculates_all_recovery_and_pay_results():

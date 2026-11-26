@@ -7,6 +7,7 @@ import {
 import { api, apiError } from "@/lib/api";
 import { fmtMoney, today } from "@/lib/format";
 import { isPieceworkTailor, moneyToCents, sumPayrollRows } from "@/lib/salaryReportMath.mjs";
+import { monthSalaryWeeks } from "@/lib/salaryPeriodMath.mjs";
 import { Badge, Btn, Card, Empty, Input, Modal, Select } from "@/components/common";
 import { useAuth } from "@/context/AuthContext";
 
@@ -31,27 +32,6 @@ const monthRange = (month) => {
   if (!Number.isFinite(start.getTime())) return null;
   const end = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 0));
   return { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) };
-};
-
-const monthSalaryWeeks = (month) => {
-  if (!/^\d{4}-\d{2}$/.test(String(month || ""))) return [];
-  const monthStart = new Date(month + "-01T00:00:00Z");
-  if (!Number.isFinite(monthStart.getTime())) return [];
-  const monthEnd = new Date(Date.UTC(monthStart.getUTCFullYear(), monthStart.getUTCMonth() + 1, 0));
-  const firstMonday = new Date(monthStart);
-  const offsetToMonday = (firstMonday.getUTCDay() + 6) % 7;
-  firstMonday.setUTCDate(firstMonday.getUTCDate() + ((7 - offsetToMonday) % 7));
-  const weeks = [];
-  for (let monday = new Date(firstMonday); monday <= monthEnd; monday.setUTCDate(monday.getUTCDate() + 7)) {
-    const saturday = new Date(monday);
-    saturday.setUTCDate(saturday.getUTCDate() + 5);
-    if (saturday > monthEnd) break;
-    weeks.push({
-      start: monday.toISOString().slice(0, 10),
-      end: saturday.toISOString().slice(0, 10),
-    });
-  }
-  return weeks;
 };
 
 const addDays = (value, days) => {
@@ -429,12 +409,19 @@ export default function SalariesManagement() {
   const [calendarOpen, setCalendarOpen] = useState(false);
   const [calendarMonth, setCalendarMonth] = useState(() => today().slice(0, 7));
   const [filtersOpen, setFiltersOpen] = useState(false);
+  const [ribbonReportMode, setRibbonReportMode] = useState("week");
+  const [ribbonDate, setRibbonDate] = useState(today());
+  const [ribbonCustomStart, setRibbonCustomStart] = useState(() => mondayOf(today()));
+  const [ribbonCustomEnd, setRibbonCustomEnd] = useState(() => addDays(mondayOf(today()), 5));
+  const [ribbonReport, setRibbonReport] = useState(null);
+  const [ribbonDrafts, setRibbonDrafts] = useState({});
+  const [ribbonSaving, setRibbonSaving] = useState({});
 
   const monthWeeks = useMemo(() => monthSalaryWeeks(monthValue), [monthValue]);
   const period = useMemo(() => {
     if (periodType === "monthly") return monthRange(monthValue);
     const selectedMonthWeek = monthWeeks[monthWeekIndex];
-    return selectedMonthWeek ? weekRange(selectedMonthWeek.start) : weekRange(weekStart);
+    return selectedMonthWeek ? selectedMonthWeek : weekRange(weekStart);
   }, [periodType, monthValue, monthWeekIndex, monthWeeks, weekStart]);
   const payrollKey = period ? periodKey(periodType, period.start) : "";
   useEffect(() => {
@@ -611,6 +598,35 @@ export default function SalariesManagement() {
     });
     return () => { active = false; };
   }, [period?.start, period?.end, periodType, user?.company_id, isSuperIqFoam]);
+
+  const ribbonPeriod = useMemo(() => {
+    if (ribbonReportMode === "day") return { start: ribbonDate, end: ribbonDate };
+    if (ribbonReportMode === "month") return monthRange(ribbonDate.slice(0, 7));
+    if (ribbonReportMode === "custom") {
+      if (ribbonCustomEnd >= ribbonCustomStart) return { start: ribbonCustomStart, end: ribbonCustomEnd };
+      return null;
+    }
+    const weekStart = mondayOf(ribbonDate);
+    return { start: weekStart, end: addDays(weekStart, 5) };
+  }, [ribbonReportMode, ribbonDate, ribbonCustomStart, ribbonCustomEnd]);
+
+  useEffect(() => {
+    if (view !== "ribbon" || !ribbonPeriod) return;
+    let active = true;
+    api.getUncached("/salaries", {
+      start_date: ribbonPeriod.start,
+      end_date: ribbonPeriod.end,
+      include_monthly_salaries: false,
+    }).then((nextReport) => {
+      if (active) setRibbonReport(nextReport);
+      if (active) setRibbonDrafts(Object.fromEntries((nextReport?.employees || [])
+        .filter(isPieceworkTailor)
+        .map((employee) => [employee.employee_id, String((employee.piece_days || []).find((day) => day.date === ribbonDate)?.pieces ?? "")])));
+    }).catch((error) => {
+      if (active) toast.error(apiError(error));
+    });
+    return () => { active = false; };
+  }, [view, ribbonPeriod, ribbonDate, user?.company_id]);
 
   useEffect(() => {
     if (view !== "history" || (historyLoaded && historyCompanyId === user?.company_id)) return;
@@ -800,14 +816,25 @@ export default function SalariesManagement() {
     }
   };
 
-  const saveTableOvertime = async (employee, _hoursValue, rateValue) => {
+  const saveTableOvertime = async (employee, hoursValue, rateValue) => {
+    const overtimeHours = Number(hoursValue);
     const overtimeRate = Number(rateValue);
+    if (!Number.isFinite(overtimeHours) || overtimeHours < 0 || overtimeHours > 168) {
+      return toast.error("Overtime hours must be between 0 and 168.");
+    }
     if (!Number.isFinite(overtimeRate) || overtimeRate < 0) return toast.error("Overtime rate must be zero or greater.");
+    if (!period) return toast.error("Choose a valid pay period first.");
     setSavingIds((current) => ({ ...current, [employee.employee_id]: true }));
     try {
-      await api.put("/salaries/rates/" + employee.employee_id, { overtime_rate: overtimeRate });
+      await api.put("/salaries/weekly-overtime", {
+        employee_id: employee.employee_id,
+        period_start: period.start,
+        period_end: period.end,
+        overtime_hours: overtimeHours,
+        overtime_rate: overtimeRate,
+      });
       await reload({ showLoading: false, resetExpanded: false });
-      toast.success("Overtime rate saved.");
+      toast.success("Overtime hours and rate saved.");
     } catch (error) {
       toast.error(apiError(error));
     } finally {
@@ -835,6 +862,28 @@ export default function SalariesManagement() {
       toast.error(apiError(error));
     } finally {
       setSavingIds((current) => ({ ...current, [employee.employee_id]: false }));
+    }
+  };
+
+  const saveRibbonProduction = async (employee, date, value) => {
+    const pieces = Number(value);
+    if (!Number.isInteger(pieces) || pieces < 0) return toast.error("Pieces must be a whole number of zero or more.");
+    setRibbonSaving((current) => ({ ...current, [employee.employee_id]: true }));
+    try {
+      await api.post("/piece-production", { employee_id: employee.employee_id, date, pieces });
+      toast.success(`Production saved for ${employee.name}`);
+      setRibbonDrafts((current) => ({ ...current, [employee.employee_id]: String(pieces) }));
+      const nextReport = await api.getUncached("/salaries", {
+        start_date: ribbonPeriod.start,
+        end_date: ribbonPeriod.end,
+        include_monthly_salaries: false,
+      });
+      setRibbonReport(nextReport);
+      await reload({ showLoading: false, resetExpanded: false });
+    } catch (error) {
+      toast.error(apiError(error));
+    } finally {
+      setRibbonSaving((current) => ({ ...current, [employee.employee_id]: false }));
     }
   };
 
@@ -869,6 +918,18 @@ export default function SalariesManagement() {
       toast.error(apiError(error));
     } finally {
       setSavingIds((current) => ({ ...current, [employee.employee_id]: false }));
+    }
+  };
+
+  const updateBalanceHistoryModal = (nextReport, employeeId) => {
+    if (!balanceHistoryModal) return;
+    const updatedEmployee = (nextReport?.employees || []).find((item) => item.employee_id === employeeId);
+    if (updatedEmployee) {
+      setBalanceHistoryModal({
+        ...updatedEmployee,
+        name: updatedEmployee.name || employeeId,
+        employee_name: updatedEmployee.name || employeeId,
+      });
     }
   };
 
@@ -907,7 +968,8 @@ export default function SalariesManagement() {
       toast.success("Manual balance deduction saved.");
       setCutDrafts((current) => ({ ...current, [employee.employee_id]: String(amount) }));
       setCutModal(null);
-      await reload({ showLoading: false, resetExpanded: false });
+      const reloaded = await reload({ showLoading: false, resetExpanded: false });
+      updateBalanceHistoryModal(reloaded?.report, employee.employee_id);
       return true;
     } catch (error) {
       toast.error(apiError(error));
@@ -926,7 +988,8 @@ export default function SalariesManagement() {
       });
       toast.success("Borrowed balance added. Previous paid payrolls were not changed.");
       setAdvanceModal(null);
-      await reload({ showLoading: false, resetExpanded: false });
+      const reloaded = await reload({ showLoading: false, resetExpanded: false });
+      updateBalanceHistoryModal(reloaded?.report, advanceModal.employee_id);
     } catch (error) {
       toast.error(apiError(error));
     }
@@ -1185,6 +1248,7 @@ export default function SalariesManagement() {
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Btn variant={view === "payroll" ? "primary" : "outline"} className="rounded-xl" onClick={() => setView("payroll")} data-testid="salary-view-payroll"><Wallet size={15} /> Payroll</Btn>
+          <Btn variant={view === "ribbon" ? "primary" : "outline"} className="rounded-xl" onClick={() => setView("ribbon")} data-testid="salary-view-ribbon"><Wallet size={15} /> Ribbon piecework</Btn>
           <Btn variant={view === "history" ? "primary" : "outline"} className="rounded-xl" onClick={() => setView("history")} data-testid="salary-view-history"><History size={15} /> Payment history</Btn>
           {view === "payroll" && <Btn variant="outline" className="rounded-xl" disabled={loading || !report} onClick={reload} data-testid="salary-refresh"><History size={15} /> Recalculate</Btn>}
           {view === "payroll" && <Btn className="rounded-xl bg-slate-950 text-white hover:bg-slate-800" disabled={loading || !report || !reportRows.length} onClick={downloadReport} data-testid="salary-download-report"><Download size={15} /> Download report</Btn>}
@@ -1223,7 +1287,7 @@ export default function SalariesManagement() {
                   : displayMonth(monthValue)}
               </p>
               <p className="mt-1 text-xs font-medium text-slate-500">
-                {periodType === "weekly" ? `Settimana ${selectedMonthWeekNumber} di ${displayMonth(monthValue)} · Payroll runs Monday–Saturday` : "Full calendar month"}
+                {periodType === "weekly" ? `Settimana ${selectedMonthWeekNumber} di ${displayMonth(monthValue)} · ${monthWeeks.length} settimane nel mese` : "Full calendar month"}
               </p>
             </div>
             <button
@@ -1291,8 +1355,9 @@ export default function SalariesManagement() {
           </div>}
 
           {periodType === "weekly" && <div className="mt-3 grid grid-cols-7 gap-1.5 sm:mt-4 sm:gap-2" aria-label="Selected week days">
-            {Array.from({ length: 7 }, (_, index) => {
-              const date = addDays(weekStart, index);
+            {period && Array.from({ length: 7 }, (_, index) => {
+              const date = addDays(period.start, index);
+              if (date > period.end) return null;
               return <button type="button" key={date} onClick={() => { setCalendarMonth(date.slice(0, 7)); setCalendarOpen(true); }} className="min-w-0 rounded-xl bg-[#eff8f3] px-1 py-2 text-center transition-colors hover:bg-[#dff2e9] sm:px-2 sm:py-2.5" data-testid={"salary-week-day-" + date}>
                 <span className="block text-[9px] font-semibold uppercase tracking-wide text-[#6b8f80] sm:text-[10px]">{displayDate(date, { weekday: "short" })}</span>
                 <span className="mt-0.5 block text-xs font-semibold tabular-nums text-[#315d4c] sm:text-sm">{Number(date.slice(-2))}</span>
@@ -1353,11 +1418,17 @@ export default function SalariesManagement() {
                         aria-label={`Salary for ${employee.name}`}
                       />
                     </td>
-                    <td className="border border-slate-300 px-1 py-1 bg-[#f4f8f5] font-mono text-slate-700" title="Calculated automatically from Attendance">
-                      <span className="block px-1 py-1 text-center" aria-label={`Automatic overtime hours for ${employee.name}: ${automaticOvertimeHours}`}>
-                        {automaticOvertimeHours}
-                      </span>
-                      <span className="block text-[8px] font-bold uppercase text-[#34725c]">AUTO</span>
+                    <td className="border border-slate-300 px-1 py-1 font-mono">
+                      <input
+                        type="number" min="0" max="168" step="0.25"
+                        value={tableDrafts[employee.employee_id + ":overtime_hours"] ?? (employee.days || []).reduce((sum, day) => sum + Number(day.salary_overtime_override ?? day.overtime_hours ?? 0), 0)}
+                        onChange={(event) => setTableDrafts((current) => ({ ...current, [employee.employee_id + ":overtime_hours"]: event.target.value }))}
+                        onBlur={(event) => saveTableOvertime(employee, event.target.value, tableDrafts[employee.employee_id + ":overtime_rate"] ?? (employee.overtime_rate ?? 21))}
+                        disabled={!!row.payment || !!savingIds[employee.employee_id]}
+                        className="w-16 bg-transparent px-1 text-center outline-none"
+                        aria-label={`Overtime hours for ${employee.name}`}
+                        title="Edit weekly overtime hours"
+                      />
                     </td>
                     <td className="border border-slate-300 px-1 py-1 font-mono">
                       <input
@@ -1376,7 +1447,7 @@ export default function SalariesManagement() {
                         onClick={() => setAdvanceModal({ employee_id: employee.employee_id, employee_name: employee.name, amount: "", date: today(), notes: "" })}
                         className="w-full px-1 py-1 text-center text-[#2633a0] hover:underline"
                         title="Add balance"
-                      >{employee.balance_before_period || 0}</button>
+                      >{employee.balance || 0}</button>
                     </td>
                     <td className="border border-slate-300 px-2 py-1 font-mono">{employee.worked_hours || 0}</td>
                     <td className="border border-slate-300 px-2 py-1 font-mono">{Number(employee.present_days || 0) + Number(employee.half_days || 0) * 0.5}</td>
@@ -1460,7 +1531,7 @@ export default function SalariesManagement() {
                   <td className="border border-slate-300 px-2 py-2 font-mono">{fmtMoney(rows.reduce((sum, row) => sum + cents(row.employee.weekly_salary || row.employee.monthly_salary || 0), 0) / 100)}</td>
                   <td className="border border-slate-300 px-2 py-2">{rows.reduce((sum, row) => sum + Number(row.employee.overtime_hours || 0), 0)}</td>
                   <td className="border border-slate-300 px-2 py-2 font-mono">{fmtMoney(rows.reduce((sum, row) => sum + cents(row.employee.overtime_pay), 0) / 100)}</td>
-                  <td className="border border-slate-300 px-2 py-2 font-mono">{fmtMoney(rows.reduce((sum, row) => sum + cents(row.employee.balance_before_period), 0) / 100)}</td>
+                  <td className="border border-slate-300 px-2 py-2 font-mono">{fmtMoney(rows.reduce((sum, row) => sum + cents(row.employee.balance), 0) / 100)}</td>
                   <td className="border border-slate-300 px-2 py-2">{rows.reduce((sum, row) => sum + Number(row.employee.worked_hours || 0), 0)}</td>
                   <td className="border border-slate-300 px-2 py-2">{rows.reduce((sum, row) => sum + Number(row.employee.present_days || 0) + Number(row.employee.half_days || 0) * 0.5, 0)}</td>
                   <td className="border border-slate-300 px-2 py-2 font-mono">{fmtMoney(totals.grossCents / 100)}</td>
@@ -1803,7 +1874,117 @@ export default function SalariesManagement() {
           </div>
         </section>}
 
-      </> : <Card className="overflow-hidden">
+      </> : view === "ribbon" ? <section className="space-y-4" data-testid="ribbon-piecework-section">
+        <Card className="p-5">
+          <div className="flex flex-wrap items-end justify-between gap-4">
+            <div>
+              <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-[#39806b]">Ayanda &amp; Asive</p>
+              <h3 className="mt-1 text-xl font-semibold text-slate-950">RIBBON MATTRESS – PIECEWORK</h3>
+              <p className="mt-1 text-xs text-slate-500">Monday–Friday target 70 · Saturday target 40 · Sunday excluded</p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {[["day", "Day"], ["week", "Week"], ["month", "Month"], ["custom", "Custom"]].map(([mode, label]) => <Btn
+                key={mode}
+                variant={ribbonReportMode === mode ? "primary" : "outline"}
+                className="h-9 px-3 text-xs"
+                onClick={() => setRibbonReportMode(mode)}
+              >{label}</Btn>)}
+            </div>
+          </div>
+          <div className="mt-4 flex flex-wrap items-end gap-3">
+            {ribbonReportMode === "day" || ribbonReportMode === "week" || ribbonReportMode === "month"
+              ? <Input label={ribbonReportMode === "month" ? "Report month" : "Report date"}
+                  type={ribbonReportMode === "month" ? "month" : "date"}
+                  value={ribbonReportMode === "month" ? ribbonDate.slice(0, 7) : ribbonDate}
+                  onChange={(event) => setRibbonDate(ribbonReportMode === "month" ? event.target.value + "-01" : event.target.value)} />
+              : <>
+                  <Input label="Start date" type="date" value={ribbonCustomStart} onChange={(event) => setRibbonCustomStart(event.target.value)} />
+                  <Input label="End date" type="date" value={ribbonCustomEnd} onChange={(event) => setRibbonCustomEnd(event.target.value)} />
+                </>}
+          </div>
+          {ribbonPeriod && <p className="mt-3 text-xs font-medium text-slate-500">Report period: {ribbonPeriod.start} – {ribbonPeriod.end}</p>}
+        </Card>
+
+        <Card className="p-5">
+          <div className="flex flex-wrap items-end justify-between gap-3">
+            <div>
+              <h4 className="font-semibold text-slate-950">Daily production</h4>
+              <p className="mt-1 text-xs text-slate-500">Enter whole pieces for Monday–Saturday.</p>
+            </div>
+            <Input label="Production date" type="date" value={ribbonDate}
+              onChange={(event) => setRibbonDate(event.target.value)} className="w-44" />
+          </div>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            {(ribbonReport?.employees || []).filter(isPieceworkTailor).map((employee) => {
+              const existing = (employee.piece_days || []).find((day) => day.date === ribbonDate)?.pieces
+                ?? (ribbonReport?.piece_days || []).find((day) => day.employee_id === employee.employee_id && day.date === ribbonDate)?.pieces;
+              const sunday = ribbonDate && new Date(ribbonDate + "T00:00:00Z").getUTCDay() === 0;
+              return <div key={employee.employee_id} className="flex items-end gap-3 rounded-xl border border-slate-200 p-3">
+                <div className="flex-1">
+                  <p className="text-sm font-semibold text-slate-950">{employee.name}</p>
+                  <p className="mt-1 text-xs text-slate-500">Saved: {existing ?? 0} pieces</p>
+                </div>
+                <div className="w-28">
+                  <Input label="Pieces" type="number" min="0" step="1"
+                    value={ribbonDrafts[employee.employee_id] ?? String(existing ?? "")}
+                    onChange={(event) => setRibbonDrafts((current) => ({ ...current, [employee.employee_id]: event.target.value }))}
+                    disabled={!!ribbonSaving[employee.employee_id] || sunday} />
+                </div>
+                <Btn onClick={() => saveRibbonProduction(employee, ribbonDate, ribbonDrafts[employee.employee_id] ?? existing ?? 0)}
+                  disabled={!!ribbonSaving[employee.employee_id] || sunday} data-testid={`ribbon-save-${employee.employee_id}`}>
+                  {ribbonSaving[employee.employee_id] ? "Saving…" : "Save"}
+                </Btn>
+              </div>;
+            })}
+          </div>
+        </Card>
+
+        <Card className="overflow-hidden">
+          <div className="border-b border-border p-4">
+            <h4 className="font-semibold text-slate-950">Piecework report</h4>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[760px] border-collapse text-sm">
+              <thead className="bg-slate-50 text-left text-[10px] uppercase text-slate-500">
+                <tr><th className="px-4 py-3">Employee</th><th className="px-4 py-3">Pieces</th><th className="px-4 py-3">Earnings</th><th className="px-4 py-3">Targets achieved</th><th className="px-4 py-3">Targets missed</th><th className="px-4 py-3">Average / day</th></tr>
+              </thead>
+              <tbody>
+                {(ribbonReport?.employees || []).filter(isPieceworkTailor).map((employee) => {
+                  const days = (employee.piece_days || []).filter((day) => day.recorded !== false);
+                  const achieved = days.filter((day) => day.recorded && day.pieces >= day.target).length;
+                  const missed = days.filter((day) => day.recorded && day.pieces < day.target).length;
+                  const average = days.length ? Number(employee.total_pieces || 0) / days.length : 0;
+                  return <tr key={employee.employee_id} className="border-t border-slate-100">
+                    <td className="px-4 py-3 font-semibold">{employee.name}</td>
+                    <td className="px-4 py-3 font-mono">{employee.total_pieces || 0}</td>
+                    <td className="px-4 py-3 font-mono">{fmtMoney(employee.piece_pay || 0)}</td>
+                    <td className="px-4 py-3">{achieved}</td>
+                    <td className="px-4 py-3">{missed}</td>
+                    <td className="px-4 py-3 font-mono">{average.toFixed(2)}</td>
+                  </tr>;
+                })}
+                {(ribbonReport?.employees || []).filter(isPieceworkTailor).length > 0 && (() => {
+                  const ribbonEmployees = (ribbonReport?.employees || []).filter(isPieceworkTailor);
+                  const allDays = ribbonEmployees.flatMap((employee) => (employee.piece_days || []).filter((day) => day.recorded));
+                  const combinedPieces = ribbonEmployees.reduce((sum, employee) => sum + Number(employee.total_pieces || 0), 0);
+                  const combinedPay = ribbonEmployees.reduce((sum, employee) => sum + cents(employee.piece_pay || 0), 0);
+                  const combinedAchieved = allDays.filter((day) => day.pieces >= day.target).length;
+                  const combinedMissed = allDays.filter((day) => day.pieces < day.target).length;
+                  const combinedAverage = allDays.length ? combinedPieces / allDays.length : 0;
+                  return <tr className="border-t-2 border-slate-300 bg-slate-50 font-semibold">
+                    <td className="px-4 py-3">Combined total</td>
+                    <td className="px-4 py-3 font-mono">{combinedPieces}</td>
+                    <td className="px-4 py-3 font-mono">{fmtMoney(combinedPay / 100)}</td>
+                    <td className="px-4 py-3">{combinedAchieved}</td>
+                    <td className="px-4 py-3">{combinedMissed}</td>
+                    <td className="px-4 py-3 font-mono">{combinedAverage.toFixed(2)}</td>
+                  </tr>;
+                })()}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      </section> : <Card className="overflow-hidden">
         <div className="border-b border-border p-4">
           <h3 className="font-display text-lg font-semibold text-foreground">Payment history</h3>
           <p className="mt-1 text-xs text-muted-foreground">Recorded payments are read-only and remain separate from new borrowed balances.</p>
