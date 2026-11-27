@@ -11203,6 +11203,8 @@ async def record_weekly_salary_payment(
         return duplicate
 
     existing_paid_cents = int((account or {}).get("paid_amount_cents") or 0)
+    if existing_paid_cents > 0:
+        raise HTTPException(409, "A salary payment has already been recorded for this employee and week")
     if existing_paid_cents + amount_cents > due_cents:
         raise HTTPException(400, "Payment cannot exceed the remaining salary balance")
     payment_id = new_id()
