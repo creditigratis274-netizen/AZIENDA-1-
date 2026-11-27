@@ -261,36 +261,50 @@ test("a GRV-created category, size, and prices are selectable on invoices in bot
   });
 });
 
-test("Imraan invoice categories and sizes come only from its existing stock records", () => {
+test("Imraan invoice categories, products and sizes come only from categorized stock", () => {
   const stock = [
-    { product: "32 INCH 35MIC", size: "32 INCH" },
-    { product: "34 INCH 35MIC", size: "34 INCH" },
-    { product: "32 INCH 35MIC", size: "32 INCH" },
+    { catalog_category: "BIN BAGS", product: "32 INCH 35MIC", size: "32 INCH" },
+    { catalog_category: "BIN BAGS", product: "34 INCH 35MIC", size: "34 INCH" },
+    { catalog_category: "BIN BAGS", product: "32 INCH 35MIC", size: "32 INCH" },
+    { catalog_category: "MATERIALS", product: "COLOUR MATERIAL", size: "CLR" },
+    { catalog_category: "MATERIALS", product: "COLOUR MATERIAL", size: "STD" },
+    { catalog_category: "PLASTICS", product: "MINI WHITE PLASTICS", size: "MINI" },
   ];
   const prices = [
     { zone: 1, category: "32 INCH 35MIC", size: "32 INCH", price: 35, active: true, confirmed: true },
+    { zone: 1, category: "COLOUR MATERIAL", size: "CLR", price: 12, active: true, confirmed: true },
     { zone: 1, category: "Simple", size: "760x50", price: 105, active: true, confirmed: true },
     { zone: 1, category: "Orphan product", size: "XL", price: 999, active: true, confirmed: true },
   ];
 
   assert.deepEqual(invoiceCategoriesFor(1, false, prices, stock, "imraan-plastics"), [
-    "32 INCH 35MIC",
-    "34 INCH 35MIC",
+    "BIN BAGS", "MATERIALS", "PLASTICS",
   ]);
-  assert.deepEqual(
-    invoiceSizesFor(1, "32 INCH 35MIC", false, prices, stock, "imraan-plastics"),
-    ["32 INCH"],
-  );
-  assert.deepEqual(
-    invoiceSizesFor(1, "Simple", false, prices, stock, "imraan-plastics"),
-    [],
-  );
+  assert.deepEqual(invoiceProductsFor(stock, "BIN BAGS", "imraan-plastics"), [
+    "32 INCH 35MIC", "34 INCH 35MIC",
+  ]);
+  assert.deepEqual(invoiceProductsFor(stock, "MATERIALS", "imraan-plastics"), [
+    "COLOUR MATERIAL",
+  ]);
+  assert.deepEqual(invoiceProductsFor(stock, "PLASTICS", "imraan-plastics"), [
+    "MINI WHITE PLASTICS",
+  ]);
+  assert.deepEqual(invoiceSizesFor(1, "COLOUR MATERIAL", false, prices, stock, "imraan-plastics"), [
+    "CLR", "STD",
+  ]);
+  assert.deepEqual(invoiceSizesFor(1, "32 INCH 35MIC", false, prices, stock, "imraan-plastics"), [
+    "32 INCH",
+  ]);
   assert.deepEqual(
     lookupInvoicePrice(1, "32 INCH 35MIC", "32 INCH", false, prices, "imraan-plastics"),
     { price: 35, needsConfig: false },
   );
   assert.deepEqual(
+    lookupInvoicePrice(1, "COLOUR MATERIAL", "CLR", false, prices, "imraan-plastics"),
+    { price: 12, needsConfig: false },
+  );
+  assert.deepEqual(
     lookupInvoicePrice(1, "Simple", "760x50", false, prices, "imraan-plastics"),
-    { price: 105, needsConfig: false },
+    { price: 105, needsConfig: false, missing: true },
   );
 });
