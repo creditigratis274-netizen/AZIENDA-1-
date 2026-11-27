@@ -5,6 +5,7 @@ import {
   canonicalInvoiceSize,
   canonicalInvoiceCategory,
   invoiceCategoriesFor,
+  invoiceProductsFor,
   invoicePriceCategory,
   invoiceStockLinesChanged,
   invoiceSizesFor,
