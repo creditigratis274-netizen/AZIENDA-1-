@@ -99,16 +99,19 @@ const displayInvoiceCategory = (category) => {
   return ["Standard", "Simple"].includes(canonical) ? "Simple/Mix color" : canonical;
 };
 
-export const invoiceCategoriesFor = (zone, unifiedPriceList, prices, stockItems) => {
-  const defaults = unifiedPriceList ? UNIFIED_INVOICE_CATEGORIES : INVOICE_CATEGORIES[zone] || [];
-  const configured = prices
-    .filter((price) => price.zone === zone && price.active && price.category)
-    .map((price) => displayInvoiceCategory(price.category));
-  const stocked = stockItems
-    .map((item) => displayInvoiceCategory(item.product))
-    .filter(Boolean);
+export const invoiceCategoriesFor = (zone, unifiedPriceList, prices, stockItems, companyId) => {
+  // Imraan invoice choices must come only from products already present in its stock.
+  const source = companyId === "imraan-plastics"
+    ? stockItems.map((item) => String(item.product || "").trim()).filter(Boolean)
+    : [
+      ...(unifiedPriceList ? UNIFIED_INVOICE_CATEGORIES : INVOICE_CATEGORIES[zone] || []),
+      ...prices
+        .filter((price) => Number(price.zone) === Number(zone) && price.active && price.category)
+        .map((price) => displayInvoiceCategory(price.category)),
+      ...stockItems.map((item) => displayInvoiceCategory(item.product)).filter(Boolean),
+    ];
   const seen = new Set();
-  return [...defaults, ...configured, ...stocked].filter((category) => {
+  return source.filter((category) => {
     const key = String(category || "").trim().toLowerCase();
     if (!key || seen.has(key)) return false;
     seen.add(key);
@@ -123,12 +126,20 @@ const SUPER_IQ_FOAM_DEFAULT_SIZES = {
 };
 
 export const invoiceSizesFor = (zone, category, unifiedPriceList, prices, stockItems, companyId) => {
+  if (companyId === "imraan-plastics") {
+    const productKey = String(category || "").trim().toLowerCase();
+    if (!productKey) return [];
+    return [...new Set(stockItems
+      .filter((item) => String(item.product || "").trim().toLowerCase() === productKey)
+      .map((item) => String(item.size || "").trim())
+      .filter(Boolean))];
+  }
   const priceCategory = invoicePriceCategory(category, unifiedPriceList);
   const defaultSizes = companyId === "superiqfoam"
     ? SUPER_IQ_FOAM_DEFAULT_SIZES[priceCategory] || []
     : [];
   const pricedSizes = prices
-    .filter((price) => price.zone === zone
+    .filter((price) => Number(price.zone) === Number(zone)
       && sameInvoicePriceCategory(price.category, category, unifiedPriceList)
       && price.active)
     .map((price) => price.size);
@@ -138,17 +149,21 @@ export const invoiceSizesFor = (zone, category, unifiedPriceList, prices, stockI
   return [...new Set([...defaultSizes, ...pricedSizes, ...stockedSizes])];
 };
 
-export const lookupInvoicePrice = (zone, category, size, unifiedPriceList, prices) => {
-  if (isManualInvoicePrice(category, size, unifiedPriceList)) {
+export const lookupInvoicePrice = (zone, category, size, unifiedPriceList, prices, companyId) => {
+  if (companyId !== "imraan-plastics" && isManualInvoicePrice(category, size, unifiedPriceList)) {
     return { price: null, needsConfig: true };
   }
-  const priceCategory = invoicePriceCategory(category, unifiedPriceList);
-  const matches = prices.filter((price) => price.zone === zone
-    && sameInvoicePriceCategory(price.category, category, unifiedPriceList)
+  const priceCategory = companyId === "imraan-plastics"
+    ? String(category || "").trim()
+    : invoicePriceCategory(category, unifiedPriceList);
+  const matches = prices.filter((price) => Number(price.zone) === Number(zone)
+    && (companyId === "imraan-plastics"
+      ? String(price.category || "").trim().toLowerCase() === priceCategory.toLowerCase()
+      : sameInvoicePriceCategory(price.category, category, unifiedPriceList))
     && canonicalInvoiceSize(price.size) === canonicalInvoiceSize(size)
     && price.active);
   const price = matches.find((item) =>
-    String(item.category || "").trim().toLowerCase() === String(priceCategory || "").trim().toLowerCase()
+    String(item.category || "").trim().toLowerCase() === priceCategory.toLowerCase()
   ) || matches[0];
   if (!price) return { price: null, needsConfig: false, missing: true };
   if (price.price == null || !price.confirmed) return { price: null, needsConfig: true };
