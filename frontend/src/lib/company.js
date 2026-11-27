@@ -10,7 +10,9 @@ export const usesUnifiedPriceList = (companyId) => UNIFIED_PRICE_COMPANIES.has(c
 export const usesPriceZones = (companyId) =>
   !UNIFIED_PRICE_COMPANIES.has(companyId) && companyId !== "imraan-plastics";
 
-export const usesFreeformInvoiceItems = (companyId) => companyId === "imraan-plastics";
+// IMRAAN PLASTICS now uses the same stock-backed category/size invoice flow as the other companies.
+// Keep legacy freeform invoice handling server-side for previously issued invoices.
+export const usesFreeformInvoiceItems = () => false;
 
 export const includePreviousInvoiceBalanceByDefault = (companyId) => companyId !== "superiqfoam";
 
