@@ -41,6 +41,7 @@ from salary_math import (
 from grv_math import (
     aggregate_accepted_stock_lines,
     grv_confirmation_status,
+    grv_line_total_value,
     validate_grv_line_quantities,
 )
 from smart_production_planner import build_smart_production_plan
@@ -15612,6 +15613,7 @@ def _raw_grv_items(
                 "unit_cost": data.get("unit_cost", 0),
                 "container_count": data.get("container_count", data.get("accepted_quantity", 0)),
                 "container_capacity": data.get("container_capacity") or (size if to_chemicals else 0),
+                "unit": unit,
                 "price_basis": data.get("price_basis") or ("per_unit" if to_chemicals else "per_container"),
             })
         except (TypeError, ValueError) as error:
@@ -17470,21 +17472,8 @@ GRV_CONFIRMED_STATUSES = ("completed", "partially_received", "discrepancy")
 
 
 def grv_accepted_value(grv):
-    def accepted_line_value(line):
-        container_count = D(line.get("container_count", line.get("accepted_quantity", 0)))
-        container_capacity = D(line.get("container_capacity", 0))
-        unit_cost = D(line.get("unit_cost", 0))
-        if line.get("price_basis") == "per_unit" and container_capacity > 0:
-            return container_count * container_capacity * unit_cost
-        if line.get("price_basis") == "per_container":
-            return container_count * unit_cost
-        return D(line.get(
-            "total_value",
-            D(line.get("accepted_quantity", 0)) * unit_cost,
-        ))
-
     accepted_subtotal = D(dsum(
-        accepted_line_value(line) for line in grv.get("items", [])
+        grv_line_total_value(line) for line in grv.get("items", [])
     ))
     freight = D(grv.get("freight_cost", 0))
     vat_rate = D(grv.get("vat_rate", 0))
