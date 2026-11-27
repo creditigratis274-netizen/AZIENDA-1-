@@ -75,7 +75,7 @@ def test_fixed_price_company_saves_prices_in_zone_one_and_preserves_other_produc
     assert result[1] == original[1]
     assert result[2] == {
         "zone": 1, "category": "Simple", "size": "910x100",
-        "description": "", "price": 44.0, "zone_independent": True,
+        "price": 44.0, "zone_independent": True,
     }
     assert result[3]["zone"] == 1 and result[3]["size"] == "1070x100"
     assert result[3]["zone_independent"] is True
@@ -148,7 +148,6 @@ def test_customer_invoice_price_can_be_replaced_with_original_list_price(monkeyp
         "zone": 2,
         "category": "Standard",
         "size": "910x100",
-        "description": "",
         "price": 35.0,
         "zone_independent": True,
     }
