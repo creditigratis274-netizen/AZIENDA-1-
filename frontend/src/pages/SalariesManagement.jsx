@@ -1296,7 +1296,7 @@ export default function SalariesManagement() {
           <Btn variant={view === "ribbon" ? "primary" : "outline"} className="rounded-xl" onClick={() => setView("ribbon")} data-testid="salary-view-ribbon"><Wallet size={15} /> Ribbon piecework</Btn>
           <Btn variant={view === "history" ? "primary" : "outline"} className="rounded-xl" onClick={() => setView("history")} data-testid="salary-view-history"><History size={15} /> Payment history</Btn>
           {view === "payroll" && <Btn variant="outline" className="rounded-xl" disabled={currentBalancesLoading} onClick={refreshAllCurrentBalances} data-testid="salary-refresh-all-current-balances"><History size={15} /> {currentBalancesLoading ? "Refreshing balances..." : "Refresh all current balances"}</Btn>}
-          {view === "payroll" && <Btn variant="outline" className="rounded-xl" disabled={loading || !report} onClick={reload} data-testid="salary-refresh"><History size={15} /> Recalculate</Btn>
+          {view === "payroll" && <Btn variant="outline" className="rounded-xl" disabled={loading || !report} onClick={reload} data-testid="salary-refresh"><History size={15} /> Recalculate</Btn>}
           {view === "payroll" && <Btn className="rounded-xl bg-slate-950 text-white hover:bg-slate-800" disabled={loading || !report || !reportRows.length} onClick={downloadReport} data-testid="salary-download-report"><Download size={15} /> Download report</Btn>}
         </div>
       </div>
