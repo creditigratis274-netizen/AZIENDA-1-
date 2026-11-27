@@ -790,7 +790,7 @@ export default function InvoiceEditor({ express = false }) {
     items: inv.items.filter((it) => (it.category && it.size) || it.description).map((it) => {
       const { unitPrice } = resolveInvoiceLineForIssue(it, inv.zone, unifiedPriceList, prices);
       return {
-        qty: Number(it.qty) || 0, category: it.category, size: it.size, description: it.description,
+        qty: Number(it.qty) || 0, category: it.category, stock_category: it.stock_category || "", size: it.size, description: it.description,
         unit_price: unitPrice, price_override: it.price_override, tax: it.tax,
       };
     }),
