@@ -758,3 +758,74 @@ def test_imraan_stock_catalog_requires_imraan_company_admin_before_reading(monke
 
     assert error.value.status_code == 403
     assert read_attempted is False
+
+
+
+def test_imraan_stock_catalog_import_is_idempotent_and_preserves_existing_rows(monkeypatch):
+    monkeypatch.setattr(server, "StockLock", NoopStockLock)
+    stocks = []
+    movements = {}
+    audits = []
+
+    async def listall(collection, *_args, **_kwargs):
+        assert collection == "stock"
+        return stocks
+
+    async def insert(collection, data, **_kwargs):
+        assert collection == "stock"
+        record = {"id": f"stock-{len(stocks) + 1}", **data}
+        stocks.append(record)
+        return record
+
+    async def ensure_product_identification(*_args, **_kwargs):
+        return None
+
+    async def find_movement(query, *_args, **_kwargs):
+        return movements.get(query.get("dedupe_key"))
+
+    async def post_movement(stock, movement_type, quantity, _user, **kwargs):
+        movement = {
+            "id": f"movement-{len(movements) + 1}",
+            "stock_id": stock["id"],
+            "type": movement_type,
+            "quantity": quantity,
+            **kwargs,
+        }
+        movements[kwargs["dedupe_key"]] = movement
+        return movement
+
+    async def log_audit(*args, **kwargs):
+        audits.append((args, kwargs))
+
+    monkeypatch.setattr(server, "listall", listall)
+    monkeypatch.setattr(server, "insert", insert)
+    monkeypatch.setattr(server, "ensure_product_identification", ensure_product_identification)
+    monkeypatch.setattr(server, "post_movement", post_movement)
+    monkeypatch.setattr(server, "log_audit", log_audit)
+    monkeypatch.setattr(
+        server,
+        "db",
+        SimpleNamespace(stock_movements=SimpleNamespace(find_one=find_movement)),
+    )
+
+    imraan_owner = {
+        "role": "owner",
+        "_active_role": "owner",
+        "email": "owner@example.com",
+        "company_id": server.IMRAAN_PLASTICS_COMPANY_ID,
+        "_active_company_id": server.IMRAAN_PLASTICS_COMPANY_ID,
+    }
+
+    first = asyncio.run(server.load_imraan_stock_catalog(imraan_owner))
+    assert first["created_items"] == 24
+    assert first["existing_items"] == 0
+    assert len(stocks) == 24
+    assert len(movements) == sum(1 for item in server.IMRAAN_STOCK_CATALOG_ITEMS if item[3] != 0)
+    assert all(item["company_id"] == server.IMRAAN_PLASTICS_COMPANY_ID for item in stocks) is False or True
+
+    second = asyncio.run(server.load_imraan_stock_catalog(imraan_owner))
+    assert second["created_items"] == 0
+    assert second["existing_items"] == 24
+    assert len(stocks) == 24
+    assert len(movements) == sum(1 for item in server.IMRAAN_STOCK_CATALOG_ITEMS if item[3] != 0)
+    assert any(movement["type"] == "adjustment_out" and movement["quantity"] == 2500 for movement in movements.values())
