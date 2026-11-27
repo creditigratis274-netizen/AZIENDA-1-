@@ -711,7 +711,13 @@ export default function SalariesManagement() {
   const reportRows = rows.filter((row) => row.included);
   const totals = sumPayrollRows(reportRows);
   const includedPaidRows = reportRows.filter((row) => row.payment);
-  const paidCents = includedPaidRows.reduce((sum, row) => sum + cents(row.payment.net_amount), 0);
+  const paidCents = isSuperIqFoam && periodType === "weekly"
+    ? Number(weeklyPlan?.total_paid_cents || 0)
+    : includedPaidRows.reduce((sum, row) => sum + cents(row.payment.net_amount), 0);
+  const weeklyPaymentByEmployee = useMemo(() => Object.fromEntries(
+    [...(weeklyPlan?.friday?.employees || []), ...(weeklyPlan?.saturday?.employees || [])]
+      .map((employee) => [employee.employee_id, employee]),
+  ), [weeklyPlan]);
   const paidGrossCents = includedPaidRows.reduce((sum, row) => sum + cents(row.payment.gross_amount), 0);
   const departments = [...new Set(rows.map(({ employee }) => salaryDepartment(employee)))]
     .sort((a, b) => a.localeCompare(b));
@@ -1510,13 +1516,13 @@ export default function SalariesManagement() {
                       />
                     </td>
                     <td className="border border-slate-300 px-1 py-1 font-mono font-bold">
-                      {row.payment
-                        ? fmtMoney(row.payment.net_amount)
-                        : <button
-                            type="button"
-                            onClick={() => {
-                              if (isSuperIqFoam) {
-                                const dueCents = cents(employee.net_salary) * 1;
+                      {isSuperIqFoam && periodType === "weekly"
+                        ? (Number(weeklyPaymentByEmployee[employee.employee_id]?.paid_cents || 0) > 0
+                          ? <button type="button" disabled className="w-full rounded bg-emerald-100 px-2 py-1 text-[10px] font-bold text-emerald-800 cursor-not-allowed">PAID</button>
+                          : <button
+                              type="button"
+                              onClick={() => {
+                                const dueCents = Number(weeklyPaymentByEmployee[employee.employee_id]?.due_cents ?? cents(employee.net_salary));
                                 setWeeklyPaymentModal({
                                   employee: {
                                     employee_id: employee.employee_id,
@@ -1528,13 +1534,18 @@ export default function SalariesManagement() {
                                   amount: String(dueCents / 100),
                                   notes: "",
                                 });
-                              } else {
-                                markPaid(row);
-                              }
-                            }}
-                            disabled={!!savingIds[employee.employee_id] || Number(employee.net_salary || 0) <= 0}
-                            className="w-full rounded bg-slate-950 px-2 py-1 text-[10px] font-bold text-white disabled:cursor-not-allowed disabled:opacity-40"
-                          >PAY</button>}
+                              }}
+                              disabled={!!savingIds[employee.employee_id] || Number(employee.net_salary || 0) <= 0}
+                              className="w-full rounded bg-slate-950 px-2 py-1 text-[10px] font-bold text-white disabled:cursor-not-allowed disabled:opacity-40"
+                            >PAY</button>)
+                        : row.payment
+                          ? fmtMoney(row.payment.net_amount)
+                          : <button
+                              type="button"
+                              onClick={() => markPaid(row)}
+                              disabled={!!savingIds[employee.employee_id] || Number(employee.net_salary || 0) <= 0}
+                              className="w-full rounded bg-slate-950 px-2 py-1 text-[10px] font-bold text-white disabled:cursor-not-allowed disabled:opacity-40"
+                            >PAY</button>}
                     </td>
                     {values.map((value, dayIndex) => {
                       const date = addDays(period.start, dayIndex);
