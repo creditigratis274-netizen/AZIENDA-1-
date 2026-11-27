@@ -101,7 +101,7 @@ def test_zone_company_keeps_zone_and_freeform_company_saves_description(monkeypa
     finally:
         server.active_company_id.reset(token)
     assert any(
-        item["description"] == "Foam packaging" and item["zone"] == 1
+        item.get("description") == "Foam packaging" and item["zone"] == 1
         for item in freeform_result
     )
 
