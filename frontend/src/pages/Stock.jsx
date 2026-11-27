@@ -33,7 +33,7 @@ export default function Stock() {
   const canViewStockCosts = user?.is_owner || user?.is_company_owner || user?.role === "owner";
   const isSuperIqFoam = user?.company_id === "superiqfoam";
   const isImraanPlastics = user?.company_id === "imraan-plastics";
-  const canLoadImraanCatalog = isImraanPlastics && ["owner", "admin"].includes(user?._active_role);
+  const canLoadImraanCatalog = isImraanPlastics && (user?.is_admin || user?.is_owner || user?.is_company_owner);
   const reduceMotion = useReducedMotion();
   const unifiedPriceList = usesUnifiedPriceList(user?.company_id);
   const priceZonesEnabled = usesPriceZones(user?.company_id);
