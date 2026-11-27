@@ -138,7 +138,7 @@ function SidebarContent({ onNav, companyName, companyId, user, interfaceConfig }
                   </motion.div>
                 )}
               </AnimatePresence>
-            ) : <div>{items}</div>
+            ) : <div>{items}</div>}
           </div>
         );})}
       </nav>
