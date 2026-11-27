@@ -1517,27 +1517,30 @@ export default function SalariesManagement() {
                     </td>
                     <td className="border border-slate-300 px-1 py-1 font-mono font-bold">
                       {isSuperIqFoam && periodType === "weekly"
-                        ? (Number(weeklyPaymentByEmployee[employee.employee_id]?.paid_cents || 0) > 0
-                          ? <button type="button" disabled className="w-full rounded bg-emerald-100 px-2 py-1 text-[10px] font-bold text-emerald-800 cursor-not-allowed">PAID</button>
-                          : <button
-                              type="button"
-                              onClick={() => {
-                                const dueCents = Number(weeklyPaymentByEmployee[employee.employee_id]?.due_cents ?? cents(employee.net_salary));
-                                setWeeklyPaymentModal({
-                                  employee: {
-                                    employee_id: employee.employee_id,
-                                    employee_name: employee.name,
-                                    due_cents: dueCents,
-                                    remaining_cents: dueCents,
-                                  },
-                                  paymentDate: period.start ? addDays(period.start, 5) : today(),
-                                  amount: String(dueCents / 100),
-                                  notes: "",
-                                });
-                              }}
-                              disabled={!!savingIds[employee.employee_id] || Number(employee.net_salary || 0) <= 0}
-                              className="w-full rounded bg-slate-950 px-2 py-1 text-[10px] font-bold text-white disabled:cursor-not-allowed disabled:opacity-40"
-                            >PAY</button>)
+                        ? <div className="space-y-1">
+                            <div>{fmtMoney(Number(weeklyPaymentByEmployee[employee.employee_id]?.paid_cents || 0) / 100)}</div>
+                            {Number(weeklyPaymentByEmployee[employee.employee_id]?.paid_cents || 0) > 0
+                              ? <button type="button" disabled className="w-full rounded bg-emerald-100 px-2 py-1 text-[10px] font-bold text-emerald-800 cursor-not-allowed">PAID</button>
+                              : <button
+                                  type="button"
+                                  onClick={() => {
+                                    const dueCents = Number(weeklyPaymentByEmployee[employee.employee_id]?.due_cents ?? cents(employee.net_salary));
+                                    setWeeklyPaymentModal({
+                                      employee: {
+                                        employee_id: employee.employee_id,
+                                        employee_name: employee.name,
+                                        due_cents: dueCents,
+                                        remaining_cents: dueCents,
+                                      },
+                                      paymentDate: period.start ? addDays(period.start, 5) : today(),
+                                      amount: String(dueCents / 100),
+                                      notes: "",
+                                    });
+                                  }}
+                                  disabled={!!savingIds[employee.employee_id] || Number(employee.net_salary || 0) <= 0}
+                                  className="w-full rounded bg-slate-950 px-2 py-1 text-[10px] font-bold text-white disabled:cursor-not-allowed disabled:opacity-40"
+                                >PAY</button>}
+                          </div>
                         : row.payment
                           ? fmtMoney(row.payment.net_amount)
                           : <button
