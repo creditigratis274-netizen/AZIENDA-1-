@@ -106,6 +106,36 @@ def test_zone_company_keeps_zone_and_freeform_company_saves_description(monkeypa
     )
 
 
+def test_customer_invoice_price_can_be_replaced_with_original_list_price(monkeypatch):
+    customers = install_customer_db(monkeypatch, {
+        "id": "customer-1",
+        "invoice_prices": [{
+            "zone": 2,
+            "category": "Standard",
+            "size": "910x100",
+            "price": 42,
+        }],
+    })
+    body = server.CustomerInvoicePricesIn(items=[
+        {"zone": 2, "category": "Standard", "size": "910x100", "price": 35},
+    ])
+    token = server.active_company_id.set("superiqfoam")
+    try:
+        result = asyncio.run(server.save_customer_invoice_prices(
+            "customer-1", body, user={"role": "owner"},
+        ))
+    finally:
+        server.active_company_id.reset(token)
+
+    assert result == [{
+        "zone": 2,
+        "category": "Standard",
+        "size": "910x100",
+        "price": 35.0,
+    }]
+    assert customers.document["invoice_prices"] == result
+
+
 def test_worker_without_invoice_price_permission_cannot_save_customer_price(monkeypatch):
     install_customer_db(monkeypatch, {"id": "customer-1", "invoice_prices": []})
     token = server.active_company_id.set("superiqfoam")
