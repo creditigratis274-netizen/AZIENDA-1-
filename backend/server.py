@@ -3341,6 +3341,7 @@ class MonthlySheetChemicalValues(BaseModel):
     silicone: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     amine52: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     mcl: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+    h2o: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class MonthlySheetProductionBlockIn(BaseModel):
@@ -3385,7 +3386,7 @@ class MonthlySheetArrivalLineIn(BaseModel):
     model_config = {"extra": "forbid"}
 
     line_index: int = Field(ge=0)
-    chemical_key: str = Field(pattern=r"^(ppg|tdi|t9|silicone|amine52|mcl)$")
+    chemical_key: str = Field(pattern=r"^(ppg|tdi|t9|silicone|amine52|mcl|h2o)$")
 
 
 class MonthlySheetArrivalSourceIn(BaseModel):
