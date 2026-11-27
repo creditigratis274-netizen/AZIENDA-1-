@@ -5708,6 +5708,7 @@ def derive_status(inv):
 class InvoiceItem(BaseModel):
     qty: float = 1
     category: str = ""
+    stock_category: str = ""
     size: str = ""
     description: str = ""
     unit_price: Optional[float] = 0
