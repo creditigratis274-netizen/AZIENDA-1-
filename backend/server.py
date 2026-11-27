@@ -7550,6 +7550,37 @@ class StockIn(BaseModel):
         return value
 
 
+
+IMRAAN_STOCK_CATALOG_VERSION = "2026-11-27-v1"
+# Current quantities supplied by the owner. These are imported as audited stock
+# adjustments; historical invoices and existing stock balances are never rewritten.
+IMRAAN_STOCK_CATALOG_ITEMS = [
+    ("BIN BAGS", "30 MIC", "30 MICRON BINBAGS", 0),
+    ("BIN BAGS", "32 INCH", "32 INCH 35MIC", 169),
+    ("BIN BAGS", "34 INCH", "34 INCH 35MIC", 123),
+    ("BIN BAGS", "36 INCH", "36 INCH 35MICRON", 0),
+    ("BIN BAGS", "38 INCH", "38 INCH 35MIC", 30),
+    ("BIN BAGS", "40 INCH", "40 INCH 35MIC", 48),
+    ("BIN BAGS", "40 MIC", "40 MICRON BINBAGS", 0),
+    ("BIN BAGS", "42 INCH", "42 INCH 35MIC", 141),
+    ("BIN BAGS", "43 INCH", "43 INCH 35MIC", 20),
+    ("BIN BAGS", "45INCH", "45 INCH 35MIC", 104),
+    ("BIN BAGS", "46 INCH", "46 INCH 35MIC", 1),
+    ("BIN BAGS", "47 INCH", "47 INCH 35MIC", 122),
+    ("BIN BAGS", "60 INCH", "60 INCH 35MIC", 1),
+    ("BIN BAGS", "62 INCH", "62 INCH 35MIC", -65),
+    ("BIN BAGS", "74 INCH", "74 INCH 35MIC", 0),
+    ("MATERIALS", "BLK", "BLACK MATERIAL", 0),
+    ("MATERIALS", "CLR", "COLOUR MATERIAL", 0),
+    ("MATERIALS", "STD", "COLOUR MATERIAL", -2500),
+    ("MATERIALS", "SMK", "SMOKEY MATERIAL", 0),
+    ("PLASTICS", "JUMBO", "JUMBO BLACK PLASTICS", 0),
+    ("PLASTICS", "MIDI", "MIDI BLACK PLASTICS", 0),
+    ("PLASTICS", "MINI", "MINI BLACK PLASTICS", 0),
+    ("PLASTICS", "MINI", "MINI WHITE PLASTICS", 0),
+    ("PLASTICS", "S/JUM", "SUPER JUMBO PLASTICS", 0),
+]
+
 RIGHT_STOCK_UPDATE_ITEMS = [
     ("Simple", "760x50", 150),
     ("Simple", "760x75", 305),
@@ -8745,6 +8776,163 @@ async def find_stock_by_identity(product, size, company_id, *, exclude_id=None):
         and same_stock_identity(item, product, size, company_id)
     ]
     return max(matches, key=lambda item: str(item.get("created_at") or ""), default=None)
+
+
+@api.post("/stock/load-imraan-catalog")
+async def load_imraan_stock_catalog(user=Depends(get_current_user)):
+    company_id = user.get("_active_company_id") or user.get("company_id")
+    if company_id != IMRAAN_PLASTICS_COMPANY_ID:
+        raise HTTPException(403, "This stock catalogue is only available in IMRAAN PLASTICS")
+    require_admin(user)
+
+    company_context = active_company_id.set(IMRAAN_PLASTICS_COMPANY_ID)
+    try:
+        stock_items = await listall("stock")
+        created_items = 0
+        existing_items = 0
+        categorized_existing = 0
+        resumed_items = 0
+        stock_movements_created = 0
+        category_conflicts = 0
+
+        for category, size, product, target_quantity in IMRAAN_STOCK_CATALOG_ITEMS:
+            matches = [
+                item for item in stock_items
+                if same_stock_identity(item, product, size, IMRAAN_PLASTICS_COMPANY_ID)
+            ]
+            existing = max(
+                matches,
+                key=lambda item: str(item.get("created_at") or ""),
+                default=None,
+            )
+
+            if existing:
+                existing_items += 1
+                if not existing.get("catalog_category"):
+                    existing = await update_doc(
+                        "stock",
+                        existing["id"],
+                        {"catalog_category": category},
+                    )
+                    categorized_existing += 1
+                    await log_audit(
+                        "stock",
+                        existing["id"],
+                        "catalog_category_assigned",
+                        user,
+                        before={"catalog_category": None},
+                        after={"catalog_category": category},
+                        reason="IMRAAN PLASTICS stock catalogue grouping",
+                    )
+                elif existing.get("catalog_category") != category:
+                    category_conflicts += 1
+
+                # Resume only rows created by this import if an earlier request
+                # stopped between creating the row and posting its opening movement.
+                if existing.get("catalog_import_version") == IMRAAN_STOCK_CATALOG_VERSION:
+                    movement_key = (
+                        f"imraan-stock-catalog:{IMRAAN_STOCK_CATALOG_VERSION}:"
+                        f"{right_stock_product_key(product)}:{right_stock_size_key(size)}"
+                    )
+                    if target_quantity:
+                        async with StockLock([existing["id"]]):
+                            prior_movement = await db.stock_movements.find_one(
+                                {"dedupe_key": movement_key}, {"_id": 0}
+                            )
+                            if not prior_movement:
+                                movement_type = "adjustment_in" if target_quantity > 0 else "adjustment_out"
+                                movement = await post_movement(
+                                    existing,
+                                    movement_type,
+                                    abs(target_quantity),
+                                    user,
+                                    reason="IMRAAN PLASTICS initial stock catalogue",
+                                    reference="Owner-supplied IMRAAN PLASTICS stock list",
+                                    notes=f"Initial supplied current quantity: {target_quantity}",
+                                    dedupe_key=movement_key,
+                                    allow_negative=True,
+                                )
+                                await log_audit(
+                                    "stock_movement",
+                                    movement["id"],
+                                    "posted",
+                                    user,
+                                    after=movement,
+                                    reason="IMRAAN PLASTICS stock catalogue import",
+                                )
+                                stock_movements_created += 1
+                    resumed_items += 1
+                continue
+
+            stock = await insert("stock", {
+                "product": product,
+                "size": size,
+                "opening": 0,
+                "threshold": 0,
+                "catalog_category": category,
+                "catalog_import_version": IMRAAN_STOCK_CATALOG_VERSION,
+            })
+            stock_items.append(stock)
+            created_items += 1
+            await ensure_product_identification(stock, IMRAAN_PLASTICS_COMPANY_ID)
+
+            if target_quantity:
+                movement_key = (
+                    f"imraan-stock-catalog:{IMRAAN_STOCK_CATALOG_VERSION}:"
+                    f"{right_stock_product_key(product)}:{right_stock_size_key(size)}"
+                )
+                async with StockLock([stock["id"]]):
+                    prior_movement = await db.stock_movements.find_one(
+                        {"dedupe_key": movement_key}, {"_id": 0}
+                    )
+                    if not prior_movement:
+                        movement_type = "adjustment_in" if target_quantity > 0 else "adjustment_out"
+                        movement = await post_movement(
+                            stock,
+                            movement_type,
+                            abs(target_quantity),
+                            user,
+                            reason="IMRAAN PLASTICS initial stock catalogue",
+                            reference="Owner-supplied IMRAAN PLASTICS stock list",
+                            notes=f"Initial supplied current quantity: {target_quantity}",
+                            dedupe_key=movement_key,
+                            allow_negative=True,
+                        )
+                        await log_audit(
+                            "stock_movement",
+                            movement["id"],
+                            "posted",
+                            user,
+                            after=movement,
+                            reason="IMRAAN PLASTICS stock catalogue import",
+                        )
+                        stock_movements_created += 1
+
+            await log_audit(
+                "stock",
+                stock["id"],
+                "catalog_imported",
+                user,
+                after={
+                    "catalog_category": category,
+                    "product": product,
+                    "size": size,
+                    "initial_current_quantity": target_quantity,
+                },
+                reason="IMRAAN PLASTICS owner-supplied stock catalogue",
+            )
+
+        return {
+            "total_items": len(IMRAAN_STOCK_CATALOG_ITEMS),
+            "created_items": created_items,
+            "existing_items": existing_items,
+            "categorized_existing": categorized_existing,
+            "resumed_items": resumed_items,
+            "stock_movements_created": stock_movements_created,
+            "category_conflicts": category_conflicts,
+        }
+    finally:
+        active_company_id.reset(company_context)
 
 
 def right_stock_canonical_product(product):
