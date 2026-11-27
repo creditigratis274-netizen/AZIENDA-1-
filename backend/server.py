@@ -17480,9 +17480,9 @@ def grv_accepted_value(grv):
             D(line.get("accepted_quantity", 0)) * unit_cost,
         ))
 
-    accepted_subtotal = dsum(
+    accepted_subtotal = D(dsum(
         accepted_line_value(line) for line in grv.get("items", [])
-    )
+    ))
     freight = D(grv.get("freight_cost", 0))
     vat_rate = D(grv.get("vat_rate", 0))
     taxable_subtotal = accepted_subtotal + freight
