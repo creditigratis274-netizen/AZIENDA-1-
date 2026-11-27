@@ -435,7 +435,7 @@ export default function InvoiceEditor({ express = false }) {
     // until replaced, preserving previously stored customer pricing.
     const sharedPrice = matches.find((price) => price.zone_independent === true);
     if (sharedPrice) return sharedPrice;
-    const zonePrice = matches.find((price) => Number(price.zone) === customerPriceZone(zone));
+    const zonePrice = matches.find((price) => (Number(price.zone) || 1) === customerPriceZone(zone));
     if (zonePrice) return zonePrice;
     const legacyPrices = new Set(matches.map((price) => Number(price.price)));
     return legacyPrices.size === 1 ? matches[0] : null;
