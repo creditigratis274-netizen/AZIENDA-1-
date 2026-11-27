@@ -681,3 +681,31 @@ def test_monthly_report_includes_manual_cuts_from_each_weekly_payroll(monkeypatc
     assert result["gross_salary"] == 1200
     assert result["cut"] == 300
     assert result["net_salary"] == 900
+
+
+def test_salary_report_live_balance_includes_new_advance_in_current_week(monkeypatch):
+    employee = {"id": "employee-live-balance", "name": "Worker", "weekly_salary": 600}
+    records = {
+        "employees": [employee],
+        "attendance": [],
+        "piece_production": [],
+        "salary_advances": [
+            {"employee_id": employee["id"], "date": "2026-11-23", "amount": 500},
+            {"employee_id": employee["id"], "date": "2026-11-25", "amount": 300},
+        ],
+        "salary_cuts": [],
+    }
+
+    async def fake_listall(collection, *_args, **_kwargs):
+        return records[collection]
+
+    monkeypatch.setattr(server, "listall", fake_listall)
+
+    result = asyncio.run(server.salary_report("2026-11-23", "2026-11-28"))["employees"][0]
+
+    # The current total balance must include additions dated inside this week,
+    # while the opening balance remains a historical period-start snapshot.
+    assert result["balance"] == 800
+    assert result["available_balance"] == 800
+    assert result["balance_before_period"] == 0
+    assert result["balance_after_period"] == 800

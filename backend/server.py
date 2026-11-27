@@ -11396,7 +11396,23 @@ async def add_salary_advance(body: SalaryAdvanceIn, user=Depends(get_current_use
         raise HTTPException(422, "Borrowed amount must be at least one cent")
     record = await insert("salary_advances", {**body.model_dump(), "amount": amount})
     await log_audit("salary_advance", record["id"], "created", user, after=record)
-    return record
+
+    # Return the employee's live outstanding balance so the Salary table can
+    # display the newly added amount immediately, regardless of payroll week.
+    advances, cuts = await asyncio.gather(
+        listall("salary_advances", {"employee_id": body.employee_id, "voided": {"$ne": True}}),
+        listall("salary_cuts", {"employee_id": body.employee_id, "voided": {"$ne": True}}),
+    )
+    outstanding_balance = sum(
+        (D(item.get("amount", 0)) for item in advances), Decimal("0")
+    ) - sum(
+        (D(item.get("amount", 0)) for item in cuts), Decimal("0")
+    )
+    return {
+        **record,
+        "balance": r2(outstanding_balance),
+        "available_balance": r2(outstanding_balance),
+    }
 
 @api.delete("/salaries/history/{eid}")
 async def clear_salary_history(eid: str, user=Depends(get_current_user)):
