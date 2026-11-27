@@ -100,9 +100,9 @@ const displayInvoiceCategory = (category) => {
 };
 
 export const invoiceCategoriesFor = (zone, unifiedPriceList, prices, stockItems, companyId) => {
-  // Imraan invoice choices must come only from products already present in its stock.
+  // IMRAAN categories are the explicit groupings assigned to its stock products.
   const source = companyId === "imraan-plastics"
-    ? stockItems.map((item) => String(item.product || "").trim()).filter(Boolean)
+    ? stockItems.map((item) => String(item.catalog_category || "").trim()).filter(Boolean)
     : [
       ...(unifiedPriceList ? UNIFIED_INVOICE_CATEGORIES : INVOICE_CATEGORIES[zone] || []),
       ...prices
@@ -117,6 +117,21 @@ export const invoiceCategoriesFor = (zone, unifiedPriceList, prices, stockItems,
     seen.add(key);
     return true;
   });
+};
+
+export const invoiceProductsFor = (stockItems, stockCategory, companyId) => {
+  if (companyId !== "imraan-plastics" || !stockCategory) return [];
+  const seen = new Set();
+  return stockItems
+    .filter((item) => String(item.catalog_category || "").trim() === stockCategory)
+    .map((item) => String(item.product || "").trim())
+    .filter((product) => {
+      const key = product.toLowerCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((left, right) => left.localeCompare(right));
 };
 
 const SUPER_IQ_FOAM_DEFAULT_SIZES = {
