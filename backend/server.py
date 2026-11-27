@@ -15607,6 +15607,9 @@ def _raw_grv_items(
                 "rejected_quantity": data.get("rejected_quantity", 0),
                 "damaged_quantity": data.get("damaged_quantity", 0),
                 "unit_cost": data.get("unit_cost", 0),
+                "container_count": data.get("container_count", data.get("accepted_quantity", 0)),
+                "container_capacity": data.get("container_capacity") or size,
+                "price_basis": data.get("price_basis") or ("per_unit" if to_chemicals else "per_container"),
             })
         except (TypeError, ValueError) as error:
             raise HTTPException(400, str(error))
@@ -15988,6 +15991,9 @@ async def _grv_items_from_request(
             "rejected_quantity": data.get("rejected_quantity", 0),
             "damaged_quantity": data.get("damaged_quantity", 0),
             "unit_cost": unit_cost,
+            "container_count": data.get("container_count", data.get("accepted_quantity", 0)),
+            "container_capacity": data.get("container_capacity") or size,
+            "price_basis": data.get("price_basis") or "per_container",
         }
         try:
             calculated = validate_grv_line_quantities(
@@ -17461,13 +17467,23 @@ GRV_CONFIRMED_STATUSES = ("completed", "partially_received", "discrepancy")
 
 
 def grv_accepted_value(grv):
-    return dsum(
-        line.get(
-            "total_value",
-            D(line.get("accepted_quantity", 0)) * D(line.get("unit_cost", 0)),
+    accepted_subtotal = dsum(
+        (
+            D(line.get("container_count", line.get("accepted_quantity", 0)))
+            * D(line.get("container_capacity", line.get("size", 0)))
+            * D(line.get("unit_cost", 0))
+            if line.get("price_basis") == "per_unit"
+            else D(line.get("container_count", line.get("accepted_quantity", 0)))
+            * D(line.get("unit_cost", 0))
+            if line.get("price_basis") == "per_container"
+            else D(line.get("total_value", D(line.get("accepted_quantity", 0)) * D(line.get("unit_cost", 0))))
         )
         for line in grv.get("items", [])
     )
+    freight = D(grv.get("freight_cost", 0))
+    vat_rate = D(grv.get("vat_rate", 0))
+    taxable_subtotal = accepted_subtotal + freight
+    return r2(taxable_subtotal + (taxable_subtotal * vat_rate / D(100)))
 
 
 def build_financial_report(start, end, mode, *, invoices, payments, linked_payments,
