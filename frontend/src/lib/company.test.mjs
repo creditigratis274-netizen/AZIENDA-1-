@@ -25,15 +25,17 @@ test("invoice customer balance labels match the company", () => {
     invoice: "REMAINING BLN ON INVOICE",
   });
 
-  test("IMRAAN invoices use stock-backed items and keep the existing single price list", () => {
-    assert.equal(usesFreeformInvoiceItems("imraan-plastics"), false);
-    assert.equal(usesPriceZones("imraan-plastics"), false);
-    assert.equal(usesPriceZones("superiqfoam"), true);
-    assert.equal(usesPriceZones("iqfoam-manufactoring"), false);
-    assert.equal(usesFreeformInvoiceItems("iqfoam-manufactoring"), false);
-  });
   assert.deepEqual(invoiceCustomerBalanceLabels("SUPER IQ-FOAM"), {
     option: "SHOW REMAINING BLN FROM PREVIOUS INVOICES ON INVOICE",
     invoice: "REMAINING BLN FROM PREVIOUS INVOICES",
   });
+});
+
+test("IMRAAN invoices use stock-backed items and keep the existing single price list", () => {
+  assert.equal(usesFreeformInvoiceItems("imraan-plastics"), false);
+  assert.equal(usesPriceZones("imraan-plastics"), false);
+  assert.equal(usesPriceZones("superiqfoam"), true);
+  assert.equal(usesPriceZones("iqfoam-manufactoring"), false);
+  assert.equal(usesFreeformInvoiceItems("iqfoam-manufactoring"), false);
+});
 });
