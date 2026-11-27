@@ -9,7 +9,7 @@ import { useAuth } from "@/context/AuthContext";
 import { companyProfileName, usesFreeformInvoiceItems, usesPriceZones } from "@/lib/company";
 import { resolveWhatsAppPhone } from "@/lib/whatsappPhone.mjs";
 import { InvoiceDocument } from "@/components/InvoiceDocument";
-import { elementToPdf, printElements } from "@/lib/pdf";
+import { elementToPdf, elementsToPdf, printElements } from "@/lib/pdf";
 
 const receivedInvoicesSeenKey = (companyId) => `received-invoices-seen:${companyId || "default"}`;
 const receivedInvoicesNotifiedKey = (companyId) => `received-invoices-notified:${companyId || "default"}`;
@@ -532,28 +532,30 @@ export default function InvoiceList({ express = false }) {
   const downloadSelectedInvoices = async () => {
     if (!printPreview.length || batchDownloadBusy) return;
     setBatchDownloadBusy(true);
-    let downloaded = 0;
-    let failed = 0;
+    const readyDocuments = printPreview
+      .map((document, index) => ({
+        document,
+        element: batchPrintRefs.current.get(index),
+      }))
+      .filter((item) => item.element);
+
     try {
-      for (let index = 0; index < printPreview.length; index += 1) {
-        const document = printPreview[index];
-        const element = batchPrintRefs.current.get(index);
-        if (!element) {
-          failed += 1;
-          continue;
-        }
-        try {
-          await elementToPdf(
-            element,
-            `${documentFilename("Invoice", document.invoice.customer_name || "Customer", document.invoice.number || "Draft")}.pdf`,
-          );
-          downloaded += 1;
-        } catch (error) {
-          failed += 1;
-        }
+      if (!readyDocuments.length) {
+        toast.error("No selected invoices are ready to download.");
+        return;
       }
-      if (downloaded) toast.success(`${downloaded} invoice PDF(s) downloaded${failed ? `; ${failed} failed` : ""}`);
-      else toast.error("Could not download the selected invoices.");
+
+      await elementsToPdf(
+        readyDocuments.map((item) => item.element),
+        "Selected-Invoices.pdf",
+      );
+
+      const failed = printPreview.length - readyDocuments.length;
+      toast.success(
+        `Downloaded ${readyDocuments.length} invoice(s) in one PDF${failed ? `; ${failed} could not be included` : ""}.`,
+      );
+    } catch (error) {
+      toast.error(`Could not download the selected invoices: ${apiError(error)}`);
     } finally {
       setBatchDownloadBusy(false);
     }
