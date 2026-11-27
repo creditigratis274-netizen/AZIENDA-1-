@@ -33,7 +33,6 @@ export default function Stock() {
   const canViewStockCosts = user?.is_owner || user?.is_company_owner || user?.role === "owner";
   const isSuperIqFoam = user?.company_id === "superiqfoam";
   const isImraanPlastics = user?.company_id === "imraan-plastics";
-  const canLoadImraanCatalog = isImraanPlastics && (user?.is_admin || user?.is_owner || user?.is_company_owner);
   const reduceMotion = useReducedMotion();
   const unifiedPriceList = usesUnifiedPriceList(user?.company_id);
   const priceZonesEnabled = usesPriceZones(user?.company_id);
@@ -51,7 +50,6 @@ export default function Stock() {
   const [showProductIds, setShowProductIds] = useState(false);
   const [busy, setBusy] = useState(false);
   const [updatingRightStock, setUpdatingRightStock] = useState(false);
-  const [loadingImraanCatalog, setLoadingImraanCatalog] = useState(false);
   const [dailyCountSheet, setDailyCountSheet] = useState(null);
   const [dailyCountCategory, setDailyCountCategory] = useState("");
   const [loadingDailyCount, setLoadingDailyCount] = useState(false);
@@ -401,33 +399,6 @@ export default function Stock() {
     }
   };
 
-  const loadImraanCatalog = async () => {
-    if (loadingImraanCatalog || list === null) return;
-    const confirmed = window.confirm(
-      "Load the 24 supplied IMRAAN PLASTICS products into this company's stock? "
-      + "Only missing products will be created. Existing quantities, invoices, costs and selling prices will not be overwritten. "
-      + "The supplied current quantities for new products will be recorded as audited stock adjustments. "
-      + "Historical invoice movements will not be recreated.",
-    );
-    if (!confirmed) return;
-    setLoadingImraanCatalog(true);
-    try {
-      const result = await api.post("/stock/load-imraan-catalog", {});
-      toast.success(
-        `IMRAAN catalogue loaded: ${result.created_items} new product(s), `
-        + `${result.existing_items} already existed, ${result.categorized_existing} category label(s) added.`,
-      );
-      if (result.category_conflicts > 0) {
-        toast.warning(`${result.category_conflicts} existing product(s) already had a different category; those labels were preserved.`);
-      }
-      load();
-    } catch (error) {
-      toast.error(`Could not load IMRAAN stock catalogue: ${apiError(error)}`);
-    } finally {
-      setLoadingImraanCatalog(false);
-    }
-  };
-
   const getTotalsByCategory = () => {
     const totals = {};
     getCanonicalStock().forEach((s) => {
@@ -635,17 +606,6 @@ export default function Stock() {
       <div className="no-print relative z-40 mb-5 flex flex-wrap items-center justify-between gap-4 border-b border-slate-200 pb-4" data-testid="stock-update-actions">
         <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap">
           {addProductAction}
-          {canLoadImraanCatalog && (
-            <Btn
-              type="button"
-              variant="outline"
-              onClick={loadImraanCatalog}
-              disabled={loadingImraanCatalog || list === null || busy}
-              data-testid="load-imraan-stock-catalog"
-            >
-              <Boxes size={16} /> {loadingImraanCatalog ? "Loading catalogue..." : "Load IMRAAN Categories & Products"}
-            </Btn>
-          )}
           {searchAction}
           {productIdsAction}
           {ledgerAction}
