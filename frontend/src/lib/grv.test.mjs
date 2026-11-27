@@ -102,3 +102,32 @@ test("GRV totals include freight cost separately", () => {
     total: 402.5,
   });
 });
+
+
+
+test("legacy KGR lines always calculate by kilogram even when saved per_container", () => {
+  const line = {
+    accepted_quantity: 80,
+    container_count: 80,
+    container_capacity: 210,
+    price_basis: "per_container",
+    unit: "KGR",
+    unit_cost: 37.15,
+    total_value: 2972,
+  };
+
+  assert.deepEqual(grvLineCalculations(line), {
+    containerCount: 80,
+    containerCapacity: 210,
+    totalQuantity: 16800,
+    priceBasis: "per_unit",
+    subtotal: 624120,
+  });
+  assert.deepEqual(grvTotals([line], 15, 0), {
+    subtotal: 624120,
+    taxableSubtotal: 624120,
+    vatAmount: 93618,
+    freightAmount: 0,
+    total: 717738,
+  });
+});
