@@ -210,6 +210,35 @@ def report_data(mode, salary_rows=()):
     )
 
 
+def test_grv_report_value_includes_container_basis_freight_and_vat():
+    grv = {
+        "items": [
+            {
+                "accepted_quantity": 2,
+                "container_count": 2,
+                "container_capacity": 100,
+                "price_basis": "per_unit",
+                "unit_cost": 2566.7025,
+                "total_value": 513340.50,
+            },
+        ],
+        "freight_cost": 14630,
+        "vat_rate": 15,
+    }
+
+    assert server.grv_accepted_value(grv) == 607166.08
+
+
+def test_grv_report_value_keeps_legacy_line_fallback_and_zero_vat():
+    grv = {
+        "items": [{"accepted_quantity": 4, "unit_cost": 48}],
+        "freight_cost": 0,
+        "vat_rate": 0,
+    }
+
+    assert server.grv_accepted_value(grv) == 192
+
+
 def test_company_profit_uses_received_payments_and_deducts_all_expense_groups():
     report = report_data("expenses_only", salary_rows=[{
         "employee_id": "employee-1", "name": "Worker", "gross_salary": 20,
