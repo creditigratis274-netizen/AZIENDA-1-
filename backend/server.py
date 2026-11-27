@@ -5417,8 +5417,9 @@ class CustomerInvoicePricesIn(BaseModel):
 
 
 def customer_invoice_price_key(item):
+    # Customer-specific prices are shared across zones. Legacy records without
+    # zone_independent remain available as zone-specific fallbacks in the UI.
     return (
-        int(item.get("zone") or 1),
         str(item.get("category") or "").strip().casefold(),
         canonical_price_size(item.get("size") or "").casefold(),
         " ".join(str(item.get("description") or "").split()).casefold(),
@@ -5453,16 +5454,23 @@ async def save_customer_invoice_prices(
             data.pop("description", None)
         if not uses_price_zones(company_id):
             data["zone"] = 1
+        data["zone_independent"] = True
         prices.append(data)
 
     keys = [customer_invoice_price_key(item) for item in prices]
     if len(keys) != len(set(keys)):
-        raise HTTPException(422, "Each customer price must identify a unique product and zone")
+        raise HTTPException(422, "Each customer price must identify a unique product")
 
     saved = list(before.get("invoice_prices", []))
     for key, item in zip(keys, prices):
+        # Update only a previously saved zone-independent price. Keep legacy
+        # zone-specific records intact so no historical customer price is lost.
         match_index = next(
-            (index for index, existing in enumerate(saved) if customer_invoice_price_key(existing) == key),
+            (
+                index for index, existing in enumerate(saved)
+                if existing.get("zone_independent") is True
+                and customer_invoice_price_key(existing) == key
+            ),
             None,
         )
         if match_index is None:
