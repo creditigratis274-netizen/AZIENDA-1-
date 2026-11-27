@@ -419,8 +419,7 @@ export default function InvoiceEditor({ express = false }) {
 
   const customerPriceZone = (zone) => priceZonesEnabled ? Number(zone) || 1 : 1;
   const normalizedCustomerPriceDescription = (value) => String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
-  const customerInvoicePriceKey = (item, zone = inv.zone) => [
-    customerPriceZone(zone),
+  const customerInvoicePriceKey = (item) => [
     freeformInvoiceItems ? "" : invoicePriceCategory(item.category, unifiedPriceList).trim().toLowerCase(),
     freeformInvoiceItems ? "" : canonicalInvoiceSize(item.size).toLowerCase(),
     freeformInvoiceItems ? normalizedCustomerPriceDescription(item.description) : "",
@@ -428,10 +427,18 @@ export default function InvoiceEditor({ express = false }) {
 
   const findCustomerInvoicePrice = (item, zone = inv.zone, priceList = customerInvoicePrices) => {
     if (freeformInvoiceItems ? !normalizedCustomerPriceDescription(item.description) : !item.category || !item.size) return null;
-    const key = customerInvoicePriceKey(item, zone);
-    return (priceList || []).find((price) =>
-      customerInvoicePriceKey(price, Number(price.zone) || 1) === key
-    ) || null;
+    const key = customerInvoicePriceKey(item);
+    const matches = (priceList || []).filter((price) => customerInvoicePriceKey(price) === key);
+    if (!matches.length) return null;
+
+    // New records are global across zones. Legacy records remain zone-specific
+    // until replaced, preserving previously stored customer pricing.
+    const sharedPrice = matches.find((price) => price.zone_independent === true);
+    if (sharedPrice) return sharedPrice;
+    const zonePrice = matches.find((price) => Number(price.zone) === customerPriceZone(zone));
+    if (zonePrice) return zonePrice;
+    const legacyPrices = new Set(matches.map((price) => Number(price.price)));
+    return legacyPrices.size === 1 ? matches[0] : null;
   };
 
   const applyCustomerInvoicePrice = (item, zone = inv.zone, priceList = customerInvoicePrices) => {
