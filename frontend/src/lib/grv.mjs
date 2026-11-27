@@ -24,9 +24,12 @@ export function grvLineCalculations(line = {}) {
   const containerCount = Number(line.container_count ?? line.accepted_quantity ?? 0) || 0;
   const containerCapacity = Number(line.container_capacity ?? line.size ?? 0) || 0;
   const unitPrice = parseGrvDecimal(line.unit_cost);
-  const priceBasis = line.price_basis
-    || (containerCapacity > 0 && /^(kg|kgs|kilograms?|l|liters?|litres?)$/i.test(String(line.unit || "").trim())
-      ? "per_unit" : "per_container");
+  const isKgr = String(line.unit || "").trim().toUpperCase() === "KGR";
+  const priceBasis = isKgr
+    ? "per_unit"
+    : line.price_basis
+      || (containerCapacity > 0 && /^(kg|kgs|kilograms?|l|liters?|litres?)$/i.test(String(line.unit || "").trim())
+        ? "per_unit" : "per_container");
   const totalQuantity = priceBasis === "per_unit"
     ? containerCount * containerCapacity
     : containerCount;
