@@ -260,3 +260,37 @@ test("a GRV-created category, size, and prices are selectable on invoices in bot
     price: 70, needsConfig: false,
   });
 });
+
+test("Imraan invoice categories and sizes come only from its existing stock records", () => {
+  const stock = [
+    { product: "32 INCH 35MIC", size: "32 INCH" },
+    { product: "34 INCH 35MIC", size: "34 INCH" },
+    { product: "32 INCH 35MIC", size: "32 INCH" },
+  ];
+  const prices = [
+    { zone: 1, category: "32 INCH 35MIC", size: "32 INCH", price: 35, active: true, confirmed: true },
+    { zone: 1, category: "Simple", size: "760x50", price: 105, active: true, confirmed: true },
+    { zone: 1, category: "Orphan product", size: "XL", price: 999, active: true, confirmed: true },
+  ];
+
+  assert.deepEqual(invoiceCategoriesFor(1, false, prices, stock, "imraan-plastics"), [
+    "32 INCH 35MIC",
+    "34 INCH 35MIC",
+  ]);
+  assert.deepEqual(
+    invoiceSizesFor(1, "32 INCH 35MIC", false, prices, stock, "imraan-plastics"),
+    ["32 INCH"],
+  );
+  assert.deepEqual(
+    invoiceSizesFor(1, "Simple", false, prices, stock, "imraan-plastics"),
+    [],
+  );
+  assert.deepEqual(
+    lookupInvoicePrice(1, "32 INCH 35MIC", "32 INCH", false, prices, "imraan-plastics"),
+    { price: 35, needsConfig: false },
+  );
+  assert.deepEqual(
+    lookupInvoicePrice(1, "Simple", "760x50", false, prices, "imraan-plastics"),
+    { price: 105, needsConfig: false },
+  );
+});
