@@ -107,3 +107,22 @@ def test_legacy_purchase_order_receiving_endpoint_is_disabled_without_database_w
 
     assert error.value.status_code == 409
     assert "Create and confirm a GRV" in error.value.detail
+
+
+
+def test_kgr_always_uses_container_capacity_even_for_legacy_per_container_basis():
+    result = validate_grv_line_quantities({
+        "actual_received_quantity": 80,
+        "accepted_quantity": 80,
+        "rejected_quantity": 0,
+        "damaged_quantity": 0,
+        "container_count": 80,
+        "container_capacity": 210,
+        "unit": "KGR",
+        "price_basis": "per_container",
+        "unit_cost": 37.15,
+        "total_value": 2972,
+    })
+
+    assert result["total_quantity"] == 16800
+    assert result["total_value"] == 624120
