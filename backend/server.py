@@ -8868,7 +8868,7 @@ async def load_imraan_stock_catalog(user=Depends(get_current_user)):
                 "product": product,
                 "size": size,
                 "opening": 0,
-                "threshold": 0,
+                "threshold": 5,
                 "catalog_category": category,
                 "catalog_import_version": IMRAAN_STOCK_CATALOG_VERSION,
             })
