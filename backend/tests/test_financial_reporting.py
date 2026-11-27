@@ -710,3 +710,52 @@ def test_edited_invoice_cogs_nets_returned_batch_allocations():
     )
     assert report["summary"]["cogs"] == 30
     assert report["summary"]["final_profit"] == 0
+
+
+
+def test_legacy_kgr_grv_report_recalculates_saved_per_container_lines_and_includes_vat():
+    grv = {
+        "items": [{
+            "accepted_quantity": 80,
+            "container_count": 80,
+            "container_capacity": 210,
+            "unit": "KGR",
+            "price_basis": "per_container",
+            "unit_cost": 37.15,
+            "total_value": 2972,
+        }],
+        "freight_cost": 0,
+        "vat_rate": 15,
+    }
+
+    assert server.grv_accepted_value(grv) == 717738
+
+    report = server.build_financial_report(
+        date(2026, 11, 1), date(2026, 11, 30), "expenses_only",
+        invoices=[], payments=[], linked_payments=[], expenses=[],
+        vehicle_records=[], buyings=[],
+        grvs=[{
+            "id": "legacy-kgr-grv", "received_date": "2026-11-12",
+            "status": "completed", "grv_number": "GRV-KGR-LEGACY", **grv,
+        }],
+        invoice_movements=[],
+    )
+    assert report["summary"]["grv"] == 717738
+    assert report["transactions"]["grvs"][0]["amount"] == 717738
+
+
+def test_kilogram_unit_with_explicit_per_container_basis_remains_per_container():
+    grv = {
+        "items": [{
+            "accepted_quantity": 12,
+            "container_count": 12,
+            "container_capacity": 270,
+            "unit": "KG",
+            "price_basis": "per_container",
+            "unit_cost": 16,
+            "total_value": 192,
+        }],
+        "freight_cost": 0,
+        "vat_rate": 0,
+    }
+    assert server.grv_accepted_value(grv) == 192
