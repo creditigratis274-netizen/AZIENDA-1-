@@ -25,8 +25,8 @@ test("invoice customer balance labels match the company", () => {
     invoice: "REMAINING BLN ON INVOICE",
   });
 
-  test("IMRAAN invoices use freeform items and no price zones", () => {
-    assert.equal(usesFreeformInvoiceItems("imraan-plastics"), true);
+  test("IMRAAN invoices use stock-backed items and keep the existing single price list", () => {
+    assert.equal(usesFreeformInvoiceItems("imraan-plastics"), false);
     assert.equal(usesPriceZones("imraan-plastics"), false);
     assert.equal(usesPriceZones("superiqfoam"), true);
     assert.equal(usesPriceZones("iqfoam-manufactoring"), false);
