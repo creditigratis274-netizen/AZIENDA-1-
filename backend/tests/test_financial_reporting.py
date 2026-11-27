@@ -228,6 +228,20 @@ def test_grv_report_value_includes_container_basis_freight_and_vat():
 
     assert server.grv_accepted_value(grv) == 607166.08
 
+    report = server.build_financial_report(
+        date(2026, 11, 1), date(2026, 11, 30), "expenses_only",
+        invoices=[], payments=[], linked_payments=[], expenses=[],
+        vehicle_records=[], buyings=[],
+        grvs=[{
+            "id": "grv-example", "received_date": "2026-11-12",
+            "status": "completed", "grv_number": "GRV-EXAMPLE", **grv,
+        }],
+        invoice_movements=[],
+    )
+    assert report["summary"]["grv"] == 607166.08
+    assert report["transactions"]["grvs"][0]["amount"] == 607166.08
+    assert next(day for day in report["daily"] if day["date"] == "2026-11-12")["grv"] == 607166.08
+
 
 def test_grv_report_value_keeps_legacy_line_fallback_and_zero_vat():
     grv = {
