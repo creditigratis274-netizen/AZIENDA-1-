@@ -724,3 +724,37 @@ def test_daily_reconciliation_rejects_non_global_owner_before_reading_stock(monk
 
     assert error.value.status_code == 403
     assert read_attempted is False
+
+
+
+def test_imraan_stock_catalog_contains_the_supplied_products_and_categories():
+    assert len(server.IMRAAN_STOCK_CATALOG_ITEMS) == 24
+    categories = {item[0] for item in server.IMRAAN_STOCK_CATALOG_ITEMS}
+    assert categories == {"BIN BAGS", "MATERIALS", "PLASTICS"}
+    identities = {(item[2], item[1]) for item in server.IMRAAN_STOCK_CATALOG_ITEMS}
+    assert len(identities) == 24
+    assert ("62 INCH 35MIC", "62 INCH") in identities
+    assert ("COLOUR MATERIAL", "STD") in identities
+    assert ("MINI WHITE PLASTICS", "MINI") in identities
+
+
+def test_imraan_stock_catalog_requires_imraan_company_admin_before_reading(monkeypatch):
+    read_attempted = False
+
+    async def listall(*_args, **_kwargs):
+        nonlocal read_attempted
+        read_attempted = True
+        return []
+
+    monkeypatch.setattr(server, "listall", listall)
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(server.load_imraan_stock_catalog({
+            "role": "admin",
+            "_active_role": "admin",
+            "company_id": server.DEFAULT_COMPANY_ID,
+            "_active_company_id": server.DEFAULT_COMPANY_ID,
+            "email": "admin@example.com",
+        }))
+
+    assert error.value.status_code == 403
+    assert read_attempted is False
