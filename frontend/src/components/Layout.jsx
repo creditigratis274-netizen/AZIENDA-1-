@@ -13,7 +13,7 @@ import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { companyBrandName, companyProfileName, dedicatedCompanyDomain } from "@/lib/company";
 import { isSectionAvailableForCompany, navigationGroupsForCompany } from "@/lib/navigation";
 
-function SidebarContent({ onNav, companyName, companyId, user, interfaceConfig }) {
+function SidebarContent({ onNav, companyName, companyId, user, interfaceConfig, compact = false }) {
   const reduceMotion = useReducedMotion();
   const [openGroups, setOpenGroups] = useState({});
   const navigationId = (id) => ({
@@ -66,14 +66,14 @@ function SidebarContent({ onNav, companyName, companyId, user, interfaceConfig }
   }
   return (
     <>
-      <div className="erp-sidebar-brand relative z-10 flex items-center gap-3 px-5 h-16 border-b border-white/10">
+      <div className={`erp-sidebar-brand relative z-10 flex h-16 items-center border-b border-white/10 ${compact ? "justify-center px-2" : "gap-3 px-5"}`}>
         <div className="erp-sidebar-brand-icon h-10 w-10 rounded-lg border border-emerald-100/20 bg-[hsl(158_28%_15%)] flex items-center justify-center shrink-0">
             <span className="erp-sidebar-brand-mark font-display text-3xl leading-none text-white" aria-hidden="true">S</span>
         </div>
-        <div>
+        {!compact && <div>
           <div className="text-white font-bold text-base font-display leading-tight">{companyName || "SUPER IQ-FOAM"}</div>
           <div className="erp-sidebar-subtitle text-emerald-100/55 text-[10px] font-semibold uppercase tracking-[0.16em]">Business Management</div>
-        </div>
+        </div>}
       </div>
       <nav className="erp-sidebar-nav relative z-10 flex-1 px-2 py-2 space-y-0.5 overflow-y-auto">
         {navGroups.map((group) => {
@@ -92,53 +92,58 @@ function SidebarContent({ onNav, companyName, companyId, user, interfaceConfig }
             user?.is_worker
               && !user.allowed_sections?.includes(n.accessSection || n.section)
               ? <div key={n.section} aria-disabled="true" title="Your administrator has not granted access to this section" data-testid={`nav-locked-${n.label.toLowerCase()}`}
-                className="flex min-h-9 items-center gap-2.5 rounded-md px-2.5 py-1.5 text-xs font-medium leading-tight text-emerald-50/35">
+                className={`flex min-h-9 items-center rounded-md text-xs font-medium leading-tight text-emerald-50/35 ${compact ? "justify-center px-2 py-2" : "gap-2.5 px-2.5 py-1.5"}`}>
                 <n.icon size={18} />
-                <span className="flex-1">{n.label}</span>
-                <LockKeyhole size={13} />
+                {!compact && <span className="flex-1">{n.label}</span>}
+                {!compact && <LockKeyhole size={13} />}
               </div>
               : <NavLink key={n.section} to={n.to} end={n.end} onClick={onNav} onMouseEnter={() => preloadPage(n.to)} onFocus={() => preloadPage(n.to)} onPointerDown={() => preloadPage(n.to)} data-testid={`nav-${n.label.toLowerCase()}`}
-                className={({ isActive }) => `relative isolate flex min-h-10 items-center gap-3 px-3 py-2 rounded-lg text-[13px] leading-tight font-medium transition-[color,background-color] duration-150 ${isActive ? "text-white" : "text-emerald-50/65 hover:bg-white/5 hover:text-white"}`}>
+                title={compact ? n.label : undefined}
+                className={({ isActive }) => `relative isolate flex min-h-10 items-center rounded-lg text-[13px] leading-tight font-medium transition-[color,background-color] duration-150 ${compact ? "justify-center px-2 py-2" : "gap-3 px-3 py-2"} ${isActive ? "text-white" : "text-emerald-50/65 hover:bg-white/5 hover:text-white"}`}>
                 {({ isActive }) => <>
                   {isActive && <motion.span layoutId={`active-nav-${onNav ? "mobile" : "desktop"}`} className="pointer-events-none absolute inset-0 z-0 rounded-md bg-white/10 shadow-[inset_2px_0_0_hsl(72_42%_65%)]" transition={reduceMotion ? { duration: 0 } : { type: "spring", stiffness: 480, damping: 38, mass: 0.5 }} />}
                   <n.icon className="relative z-10" size={18} />
-                  <span className="relative z-10">{n.label}</span>
+                  {!compact && <span className="relative z-10">{n.label}</span>}
                 </>}
               </NavLink>
           ));
           return (
           <div key={group.id} className="mb-2">
-            {group.collapsible ? (
-              <button
-                type="button"
-                onClick={() => setOpenGroups((current) => ({ ...current, [group.id]: !current[group.id] }))}
-                aria-expanded={expanded}
-                aria-controls={groupNavId}
-                data-testid={`${groupNavId}-toggle`}
-                className={`flex w-full items-center justify-between px-3 pt-3 pb-1 text-left text-[9px] font-bold uppercase tracking-[0.14em] ${headingColor} hover:brightness-110`}
-              >
-                <span>{group.label}</span>
-                <ChevronDown size={13} className={`shrink-0 transition-transform ${expanded ? "rotate-180" : ""}`} />
-              </button>
-            ) : (
-              <p className={`px-3 pt-3 pb-1 text-[10px] font-bold uppercase tracking-[0.14em] ${headingColor}`}>{group.label}</p>
-            )}
-            {group.collapsible ? (
-              <AnimatePresence initial={false}>
-                {expanded && (
-                  <motion.div
-                    id={groupNavId}
-                    initial={reduceMotion ? false : { height: 0, opacity: 0 }}
-                    animate={{ height: "auto", opacity: 1 }}
-                    exit={{ height: 0, opacity: 0 }}
-                    transition={reduceMotion ? { duration: 0 } : { duration: 0.22, ease: "easeInOut" }}
-                    style={{ overflow: "hidden" }}
+            {compact ? <div>{items}</div> : (
+              <>
+                {group.collapsible ? (
+                  <button
+                    type="button"
+                    onClick={() => setOpenGroups((current) => ({ ...current, [group.id]: !current[group.id] }))}
+                    aria-expanded={expanded}
+                    aria-controls={groupNavId}
+                    data-testid={`${groupNavId}-toggle`}
+                    className={`flex w-full items-center justify-between px-3 pt-3 pb-1 text-left text-[9px] font-bold uppercase tracking-[0.14em] ${headingColor} hover:brightness-110`}
                   >
-                    {items}
-                  </motion.div>
+                    <span>{group.label}</span>
+                    <ChevronDown size={13} className={`shrink-0 transition-transform ${expanded ? "rotate-180" : ""}`} />
+                  </button>
+                ) : (
+                  <p className={`px-3 pt-3 pb-1 text-[10px] font-bold uppercase tracking-[0.14em] ${headingColor}`}>{group.label}</p>
                 )}
-              </AnimatePresence>
-            ) : <div>{items}</div>}
+                {group.collapsible ? (
+                  <AnimatePresence initial={false}>
+                    {expanded && (
+                      <motion.div
+                        id={groupNavId}
+                        initial={reduceMotion ? false : { height: 0, opacity: 0 }}
+                        animate={{ height: "auto", opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        transition={reduceMotion ? { duration: 0 } : { duration: 0.22, ease: "easeInOut" }}
+                        style={{ overflow: "hidden" }}
+                      >
+                        {items}
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                ) : <div>{items}</div>}
+              </>
+            )}
           </div>
         );})}
       </nav>
@@ -158,6 +163,7 @@ function AnimatedOutlet({ scrollContainerRef }) {
 export default function Layout() {
   const { user, logout, switchCompany } = useAuth();
   const location = useLocation();
+  const isInvoiceWorkspace = /^\/((express-)?invoices)(\/|$)/.test(location.pathname);
   const { theme, setTheme } = useTheme();
   const reduceMotion = useReducedMotion();
   const [open, setOpen] = useState(false);
@@ -181,6 +187,7 @@ export default function Layout() {
 
   const findHorizontalScrollRegion = (target) => {
     if (!(target instanceof Element)) return null;
+    if (target.closest(".invoice-preview-scroll")) return null;
     const region = target.closest(".overflow-x-auto, .overflow-x-scroll, .grv-horizontal-scroll");
     return region && region.scrollWidth > region.clientWidth ? region : null;
   };
@@ -297,13 +304,13 @@ export default function Layout() {
   return (
     <div className={`app-shell flex h-dvh flex-col overflow-hidden bg-background print:h-auto print:overflow-visible${canTogglePhoneView && phoneOptimized ? " phone-optimized" : ""}`}>
       {/* Desktop sidebar */}
-      <aside className="erp-sidebar desktop-sidebar no-print hidden lg:flex fixed inset-y-0 left-0 w-64 flex-col border-r border-white/10 bg-[hsl(222_47%_11%)] shadow-[4px_0_18px_rgba(15,23,42,0.08)] z-30">
+      <aside className={`erp-sidebar desktop-sidebar no-print hidden lg:flex fixed inset-y-0 left-0 flex-col border-r border-white/10 bg-[hsl(222_47%_11%)] shadow-[4px_0_18px_rgba(15,23,42,0.08)] z-30 transition-[width] duration-200 ${isInvoiceWorkspace ? "w-20" : "w-64"}`}>
         <svg className="erp-sidebar-decoration pointer-events-none absolute inset-x-0 bottom-0 h-56 w-full" viewBox="0 0 280 224" preserveAspectRatio="none" aria-hidden="true">
           <path d="M-25 225c56-68 113-142 188-172 35-14 70-18 126-8-70 27-111 58-154 114-20 27-39 49-64 66Z" fill="#c6d2c8" fillOpacity=".035" />
           <path d="M-24 220c73-77 132-144 197-169 39-15 76-16 116-9M-14 224c76-66 136-117 204-146 36-15 67-20 99-21M-16 211c76-56 136-99 205-123 33-12 62-17 91-18" fill="none" stroke="#c6d2c8" strokeOpacity=".24" strokeWidth="1" />
           <path d="M95 224c43-42 81-71 125-88 30-12 55-16 80-17" fill="none" stroke="#c6d2c8" strokeOpacity=".12" strokeWidth="4" />
         </svg>
-        <SidebarContent companyName={activeBrandName} companyId={user?.company_id} user={user} interfaceConfig={interfaceConfig} />
+        <SidebarContent companyName={activeBrandName} companyId={user?.company_id} user={user} interfaceConfig={interfaceConfig} compact={isInvoiceWorkspace} />
       </aside>
 
       {/* Mobile drawer */}
@@ -321,7 +328,7 @@ export default function Layout() {
         )}
       </AnimatePresence>
 
-      <div className="app-content flex min-h-0 min-w-0 flex-1 flex-col lg:pl-64 print:overflow-visible print:pl-0">
+      <div className={`app-content flex min-h-0 min-w-0 flex-1 flex-col print:overflow-visible print:pl-0 transition-[padding] duration-200 ${isInvoiceWorkspace ? "lg:pl-20" : "lg:pl-64"}`}>
         {/* Topbar */}
         <header className="mobile-topbar no-print liquid-glass-surface sticky top-0 z-20 flex h-16 min-w-0 shrink-0 items-center gap-1 border-b border-white/70 px-3 sm:gap-4 sm:px-6">
           <motion.button whileHover={reduceMotion ? undefined : { scale: 1.04, rotate: 0.5 }} whileTap={reduceMotion ? undefined : { scale: 0.96 }} transition={{ type: "spring", stiffness: 440, damping: 24 }} className="phone-menu-button lg:hidden rounded-full p-2 text-slate-600 hover:bg-white/40" onClick={() => setOpen(true)} aria-label="Open navigation" data-testid="menu-toggle">
@@ -476,7 +483,7 @@ export default function Layout() {
         <main
           ref={mainScrollRef}
           onWheelCapture={handleHorizontalWheel}
-          className="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-y-contain p-3 sm:p-5 lg:p-6 2xl:p-8 w-full max-w-none print:h-auto print:flex-none print:overflow-visible"
+          className={`min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-y-contain w-full max-w-none print:h-auto print:flex-none print:overflow-visible ${isInvoiceWorkspace ? "p-3 sm:p-4 lg:p-5 2xl:p-6" : "p-3 sm:p-5 lg:p-6 2xl:p-8"}`}
         >
           <Suspense fallback={<div className="text-slate-400">Loading...</div>}>
             <AnimatedOutlet scrollContainerRef={mainScrollRef} />
