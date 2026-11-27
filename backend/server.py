@@ -5389,30 +5389,49 @@ class PriceIn(BaseModel):
         return value
 
 class CustomerInvoicePriceIn(BaseModel):
-    zone: int = Field(ge=1, le=2)
-    category: str = Field(min_length=1, max_length=100)
-    size: str = Field(min_length=1, max_length=100)
+    zone: int = Field(default=1, ge=1, le=2)
+    category: str = Field(default="", max_length=100)
+    size: str = Field(default="", max_length=100)
+    description: str = Field(default="", max_length=200)
     price: float = Field(ge=0, allow_inf_nan=False)
 
-    @field_validator("category", "size")
+    @field_validator("category", "size", "description")
     @classmethod
     def customer_price_label_required(cls, value):
-        value = value.strip()
-        if not value:
-            raise ValueError("Category and size are required")
-        return value
+        return " ".join((value or "").split())
+
+    @model_validator(mode="after")
+    def customer_price_product_required(self):
+        has_category = bool(self.category)
+        has_size = bool(self.size)
+        if has_category != has_size:
+            raise ValueError("Category and size must be provided together")
+        if self.description and (has_category or has_size):
+            raise ValueError("Use either category and size or a description")
+        if not self.description and not (has_category and has_size):
+            raise ValueError("A product category and size or a description is required")
+        return self
 
 class CustomerInvoicePricesIn(BaseModel):
     items: List[CustomerInvoicePriceIn] = Field(default_factory=list, max_length=500)
 
+
+def customer_invoice_price_key(item):
+    return (
+        int(item.get("zone") or 1),
+        str(item.get("category") or "").strip().casefold(),
+        canonical_price_size(item.get("size") or "").casefold(),
+        " ".join(str(item.get("description") or "").split()).casefold(),
+    )
+
+
 @api.get("/invoices/customer-prices/{cid}")
 async def get_customer_invoice_prices(cid: str, user=Depends(get_current_user)):
-    if (active_company_id.get() or DEFAULT_COMPANY_ID) != DEFAULT_COMPANY_ID:
-        raise HTTPException(404, "Customer-specific invoice prices are not available")
     customer = await db.customers.find_one({"id": cid}, {"_id": 0, "invoice_prices": 1})
     if customer is None:
         raise HTTPException(404, "Customer not found")
     return customer.get("invoice_prices", [])
+
 
 @api.put("/invoices/customer-prices/{cid}")
 async def save_customer_invoice_prices(
@@ -5420,33 +5439,44 @@ async def save_customer_invoice_prices(
     body: CustomerInvoicePricesIn,
     user=Depends(get_current_user),
 ):
-    if (active_company_id.get() or DEFAULT_COMPANY_ID) != DEFAULT_COMPANY_ID:
-        raise HTTPException(404, "Customer-specific invoice prices are not available")
+    if worker_restrictions_apply(user) and not user.get("worker_can_edit_invoice_prices"):
+        raise HTTPException(403, "You do not have permission to save customer-specific invoice prices")
     before = await db.customers.find_one({"id": cid}, {"_id": 0, "invoice_prices": 1})
     if before is None:
         raise HTTPException(404, "Customer not found")
-    prices = [item.model_dump() for item in body.items]
-    keys = [
-        (item["zone"], item["category"].casefold(), item["size"].casefold())
-        for item in prices
-    ]
+
+    company_id = active_company_id.get() or DEFAULT_COMPANY_ID
+    prices = []
+    for item in body.items:
+        data = item.model_dump()
+        if not data.get("description"):
+            data.pop("description", None)
+        if not uses_price_zones(company_id):
+            data["zone"] = 1
+        prices.append(data)
+
+    keys = [customer_invoice_price_key(item) for item in prices]
     if len(keys) != len(set(keys)):
-        raise HTTPException(422, "Each customer price must have a unique zone, category and size")
-    merged = {
-        (item["zone"], item["category"].casefold(), item["size"].casefold()): item
-        for item in before.get("invoice_prices", [])
-    }
-    merged.update(dict(zip(keys, prices)))
-    saved = sorted(
-        merged.values(),
-        key=lambda item: (item["zone"], item["category"].casefold(), item["size"].casefold()),
-    )
-    await update_doc("customers", cid, {"invoice_prices": saved})
-    await log_audit(
-        "customer", cid, "invoice_prices_updated", user,
-        before={"invoice_prices": before.get("invoice_prices", [])},
-        after={"invoice_prices": saved},
-    )
+        raise HTTPException(422, "Each customer price must identify a unique product and zone")
+
+    saved = list(before.get("invoice_prices", []))
+    for key, item in zip(keys, prices):
+        match_index = next(
+            (index for index, existing in enumerate(saved) if customer_invoice_price_key(existing) == key),
+            None,
+        )
+        if match_index is None:
+            saved.append(item)
+        else:
+            saved[match_index] = item
+
+    if saved != before.get("invoice_prices", []):
+        await update_doc("customers", cid, {"invoice_prices": saved})
+        await log_audit(
+            "customer", cid, "invoice_prices_updated", user,
+            before={"invoice_prices": before.get("invoice_prices", [])},
+            after={"invoice_prices": saved},
+        )
     return saved
 
 @api.get("/prices")
