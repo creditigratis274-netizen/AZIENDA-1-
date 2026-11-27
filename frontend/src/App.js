@@ -8,7 +8,10 @@ import { AuthProvider, useAuth } from "@/context/AuthContext";
 import Layout from "@/components/Layout";
 import { pageLoaders } from "@/lib/pageLoaders";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
-import { ArrowRight, Layers, X } from "lucide-react";
+import { ArrowRight, Layers } from "lucide-react";
+import { api } from "@/lib/api";
+import { today, TZ } from "@/lib/format";
+import { createDailyReportPdf } from "@/lib/dailyReportPdf";
 
 const AuthCallback = lazy(() => import("@/pages/AuthCallback"));
 const Login = lazy(() => import("@/pages/Login"));
@@ -19,7 +22,6 @@ const Customers = lazy(pageLoaders["/customers"]);
 const Suppliers = lazy(pageLoaders["/suppliers"]);
 const ClientPayments = lazy(pageLoaders["/client-payments"]);
 const ExpressClientPayments = lazy(pageLoaders["/express-client-payments"]);
-const Buyings = lazy(pageLoaders["/buyings"]);
 const Intercompany = lazy(pageLoaders["/intercompany"]);
 const InvoiceList = lazy(pageLoaders["/invoices"]);
 const InvoiceEditor = lazy(pageLoaders["/invoices/new"]);
@@ -101,6 +103,82 @@ class SharedInvoiceErrorBoundary extends Component {
   }
 }
 
+function ScheduledDailyReportSender({ user }) {
+  useEffect(() => {
+    if (!user?.is_owner || user?.company_id !== "superiqfoam") return undefined;
+    if (localStorage.getItem("daily-report-whatsapp-enabled") !== "true") return undefined;
+    const token = (localStorage.getItem("daily-report-whatsapp-token") || "").trim().replace(/^['"]|['"]$/g, "");
+    const phone = (localStorage.getItem("daily-report-whatsapp-phone") || "+393932201409").replace(/[^+0-9]/g, "");
+    const scheduledTime = localStorage.getItem("daily-report-whatsapp-time") || "17:00";
+    const timeMatch = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(scheduledTime);
+    if (!token || !/^\+[1-9]\d{7,14}$/.test(phone) || !timeMatch) return undefined;
+
+    let active = true;
+    let timeoutId;
+    const sentDatesKey = "daily-report-whatsapp-sent-dates";
+
+    const scheduleNext = () => {
+      const now = new Date();
+      const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: TZ,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hourCycle: "h23",
+      }).formatToParts(now);
+      const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+      const localDate = new Date(Date.UTC(
+        Number(values.year),
+        Number(values.month) - 1,
+        Number(values.day),
+        Number(values.hour),
+        Number(values.minute),
+        Number(values.second),
+      ));
+      const nextRun = new Date(localDate);
+      nextRun.setUTCHours(Number(timeMatch[1]), Number(timeMatch[2]), 0, 0);
+      if (nextRun <= localDate) nextRun.setUTCDate(nextRun.getUTCDate() + 1);
+      const delay = nextRun.getTime() - localDate.getTime();
+      timeoutId = window.setTimeout(async () => {
+        if (!active) return;
+        const date = today();
+        let sentDates = [];
+        try { sentDates = JSON.parse(localStorage.getItem(sentDatesKey) || "[]"); } catch (_) {}
+        const sentKey = `${date}|${phone}|${scheduledTime}`;
+        if (!sentDates.includes(sentKey)) {
+          try {
+            const report = await api.getUncached("/daily-report", { report_date: date });
+            const { blob, filename } = await createDailyReportPdf(report, report.main_invoice_no);
+            const form = new FormData();
+            form.append("phone", phone);
+            form.append("message", `Daily Report ${date}`);
+            form.append("invoice_id", `daily-report-${date}`);
+            form.append("company_id", "superiqfoam");
+            form.append("invoice", blob, filename);
+            const response = await fetch("http://127.0.0.1:8765/api/v1/whatsapp", {
+              method: "POST",
+              headers: { Authorization: `Bearer ${token}` },
+              body: form,
+            });
+            if (!response.ok) throw new Error(`WhatsApp helper returned ${response.status}`);
+            sentDates = [sentKey, ...sentDates].slice(0, 30);
+            localStorage.setItem(sentDatesKey, JSON.stringify(sentDates));
+          } catch (_) {}
+        }
+        scheduleNext();
+      }, delay);
+    };
+
+    scheduleNext();
+    return () => { active = false; window.clearTimeout(timeoutId); };
+  }, [user]);
+
+  return null;
+}
+
 function Protected({ children }) {
   const { user, booting } = useAuth();
   const location = useLocation();
@@ -127,7 +205,6 @@ function Protected({ children }) {
         : location.pathname.startsWith("/invoices") ? "invoices"
       : location.pathname.startsWith("/customers") ? "customers"
         : location.pathname.startsWith("/suppliers") ? "suppliers"
-          : location.pathname.startsWith("/buyings") ? "buyings"
             : location.pathname.startsWith("/orders") ? "orders"
               : location.pathname.startsWith("/stock") ? "stock"
                 : location.pathname.startsWith("/production/monthly-sheet") ? "superiqfoam-monthly-sheet"
@@ -155,7 +232,6 @@ function Protected({ children }) {
         ["invoices", "/invoices"],
         ["customers", "/customers"],
         ["suppliers", "/suppliers"],
-        ["buyings", "/buyings"],
         ["orders", "/orders"],
         ["stock", "/stock"],
         ["company-inventory", "/company-inventory"],
@@ -181,7 +257,7 @@ function Protected({ children }) {
     }
   }
   if (user.is_owner && user.company_id === "superiqfoam") {
-    return <OwnerWelcome key={localStorage.getItem("token")} user={user}>{children}</OwnerWelcome>;
+    return <><ScheduledDailyReportSender user={user} /><OwnerWelcome key={localStorage.getItem("token")} user={user}>{children}</OwnerWelcome></>;
   }
   return children;
 }
@@ -232,18 +308,6 @@ function OwnerWelcome({ children, user }) {
           transition={{ duration: reduceMotion ? 0 : 0.55, ease: [0.22, 1, 0.36, 1] }}
           className="fixed inset-0 z-[100] flex min-h-screen items-center justify-center overflow-hidden bg-[#091b17] px-5 py-10 text-white"
         >
-          <button
-            type="button"
-            onClick={() => {
-              sessionStorage.setItem("owner-welcome-session", token);
-              setStage("done");
-            }}
-            aria-label="Close popup"
-            title="Close"
-            className="absolute right-4 top-4 z-20 rounded-full border border-white/10 bg-white/[0.06] p-2 text-white/70 transition-colors hover:bg-white/10 hover:text-white"
-          >
-            <X size={20} />
-          </button>
           <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_18%_18%,rgba(52,125,99,0.3),transparent_42%),radial-gradient(ellipse_at_82%_78%,rgba(180,151,81,0.18),transparent_40%)]" />
           <div className="relative w-full max-w-3xl">
             <AnimatePresence mode="wait" initial={false}>
@@ -382,7 +446,6 @@ function AppRouter() {
             <Route path="/suppliers" element={<Suppliers />} />
             <Route path="/client-payments" element={<ClientPayments />} />
             <Route path="/express-client-payments" element={<ExpressClientPayments express />} />
-            <Route path="/buyings" element={<Buyings />} />
             <Route path="/intercompany" element={<Intercompany />} />
             <Route path="/invoices" element={<InvoiceList />} />
             <Route path="/invoices/new" element={<InvoiceEditor />} />
@@ -423,7 +486,7 @@ function App() {
   return (
     <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false} storageKey="erp-theme" disableTransitionOnChange>
       <AuthProvider>
-        <Toaster position="top-right" richColors closeButton />
+        <Toaster position="top-right" richColors />
         <BrowserRouter>
           <AppErrorBoundary>
             <AppRouter />

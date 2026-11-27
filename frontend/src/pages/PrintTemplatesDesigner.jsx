@@ -40,6 +40,7 @@ const EMPTY_TEMPLATE = {
   footer_text: "",
   signature_text: "",
   show_company_details: true,
+  show_company_brand: true,
   alignment: "left",
   columns: [],
   print_trigger: "manual",
@@ -187,6 +188,10 @@ export default function PrintTemplatesDesigner() {
           <Input label="Header text" value={template.header_text} onChange={(event) => update("header_text", event.target.value)} maxLength={200} />
           <Input label="Footer text" value={template.footer_text} onChange={(event) => update("footer_text", event.target.value)} maxLength={300} />
           <Input label="Signature label" value={template.signature_text} onChange={(event) => update("signature_text", event.target.value)} maxLength={100} placeholder="Authorized signature" />
+          <label className="flex items-center gap-2 text-sm text-slate-700">
+            <input type="checkbox" checked={template.show_company_brand} onChange={(event) => update("show_company_brand", event.target.checked)} />
+            Show large company brand name on invoices
+          </label>
           <label className="flex items-center gap-2 text-sm text-slate-700">
             <input type="checkbox" checked={template.show_company_details} onChange={(event) => update("show_company_details", event.target.checked)} />
             Show configured company address, contact, and tax details

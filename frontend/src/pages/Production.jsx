@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { api, apiError } from "@/lib/api";
-import { fmtDate, fmtDateTime, today } from "@/lib/format";
+import { fmtDate, fmtMoney, today } from "@/lib/format";
 import { Card, Btn, Input, Select, Modal, PageHeader, Empty, Badge } from "@/components/common";
 import { Factory, Plus, Save, Trash2, Pencil, RotateCcw, Download } from "lucide-react";
 import BarcodeScanner from "@/components/BarcodeScanner";
 import { useAuth } from "@/context/AuthContext";
+import { usesUnifiedPriceList } from "@/lib/company";
+import { assessBlockYield, expectedWhiteBlockYield } from "@/lib/blockYield.mjs";
 
 const unitFactor = (unit = "") => {
   const normalized = unit.trim().toLowerCase();
@@ -17,20 +19,20 @@ const unitFactor = (unit = "") => {
 };
 export default function Production() {
   const { user } = useAuth();
+  const unifiedPriceList = usesUnifiedPriceList(user?.company_id);
   const canPermanentlyDelete = user?.is_admin || user?.role === "admin" || user?.is_owner;
   const canRecordBlockProduction = user?.company_id === "iqfoam-manufactoring"
     && (!user?.is_worker || (user?.is_supervisor && user?.allowed_sections?.includes("production")));
   const canManageRecipes = !user?.is_worker && (user?.is_owner || user?.is_admin || user?.is_company_owner);
   const [data, setData] = useState(null);
   const [productionPage, setProductionPage] = useState(1);
-  const emptyForm = () => ({ date: today(), blocks: [{ block: "White", quantity: "" }], notes: "" });
-  const [form, setForm] = useState(emptyForm);
   const [stock, setStock] = useState([]);
+  const [prices, setPrices] = useState([]);
   const [blockCuttings, setBlockCuttings] = useState([]);
   const [showArchivedCuttings, setShowArchivedCuttings] = useState(false);
   const [cutOpen, setCutOpen] = useState(false);
   const [cutForm, setCutForm] = useState({
-    block: "", size: "", pieces_recovered: "", has_sheet: false,
+    block: "", size: "", date: today(), pieces_recovered: "", has_sheet: false,
   });
   const [cutScanProduct, setCutScanProduct] = useState(null);
   const [blockRecipes, setBlockRecipes] = useState([]);
@@ -46,8 +48,8 @@ export default function Production() {
     automatic: false, components: [], invoice_reference: "", supplier: "", document_date: "",
   });
   const [recipeDraft, setRecipeDraft] = useState({ block_type: "", components: [], indicated_total_cost: "" });
-  const [busy, setBusy] = useState(false);
   const [cutBusy, setCutBusy] = useState(false);
+  const [downloadingBlockCuttingReport, setDownloadingBlockCuttingReport] = useState(false);
   const dailyLoadRequest = useRef(0);
   const load = () => {
     const requestId = ++dailyLoadRequest.current;
@@ -60,6 +62,7 @@ export default function Production() {
     api.get(showArchivedCuttings ? "/production/block-cutting?include_archived=true" : "/production/block-cutting")
       .then(setBlockCuttings).catch((e) => toast.error(apiError(e)));
     api.get("/stock").then(setStock).catch((e) => toast.error(apiError(e)));
+    api.get("/prices").then(setPrices).catch(() => setPrices([]));
     if (canRecordBlockProduction) {
       api.getUncached("/production/block-recipes").then(setBlockRecipes).catch((e) => toast.error(apiError(e)));
       api.getUncached("/production/block-productions?limit=20").then(setBlockProductions).catch((e) => toast.error(apiError(e)));
@@ -69,6 +72,36 @@ export default function Production() {
   useEffect(() => { load(); }, [showArchivedCuttings, canRecordBlockProduction, productionPage, user?.company_id]);
 
   const availableSizes = [...new Set(stock.map((item) => item.size).filter(Boolean))].sort();
+  const simplePriceCategory = unifiedPriceList ? "Simple" : "Standard";
+  const getYieldPiecePrice = (size) => prices.find((price) =>
+    price.active
+    && price.confirmed
+    && price.price != null
+    && price.zone === 1
+    && String(price.category || "").trim().toLowerCase() === simplePriceCategory.toLowerCase()
+    && String(price.size || "").trim().replace(/\s+/g, "").toLowerCase()
+      .replace("×", "x") === String(size || "").trim().replace(/\s+/g, "").toLowerCase().replace("×", "x")
+  )?.price;
+  const getBlockYield = (record) => assessBlockYield(
+    record.block,
+    record.size,
+    record.pieces_recovered,
+  );
+  const cutExpectedYield = expectedWhiteBlockYield(
+    cutForm.block,
+    cutForm.has_sheet ? "" : cutForm.size,
+  );
+  const cutActualPieces = Number(cutForm.pieces_recovered);
+  const cutHasValidActual = Number.isInteger(cutActualPieces) && cutActualPieces > 0;
+  const cutYieldAssessment = assessBlockYield(
+    cutForm.block,
+    cutForm.has_sheet ? "" : cutForm.size,
+    cutActualPieces,
+  );
+  const cutUnitPrice = getYieldPiecePrice(cutForm.size);
+  const cutEstimatedLoss = cutUnitPrice == null
+    ? null
+    : cutYieldAssessment.missingPieces * Number(cutUnitPrice);
   const selectedRecipe = blockRecipes.find((recipe) => recipe.id === blockProduction.recipe_id);
   const availableChemicalNames = [...new Set(chemicalInventory.map((item) => item.chemical))].sort();
   const remainingChemicalBase = new Map();
@@ -262,19 +295,6 @@ export default function Production() {
     }
   };
 
-  const save = async () => {
-    const blocks = form.blocks
-      .filter((item) => String(item.quantity).trim() !== "")
-      .map((item) => ({ block: item.block.trim(), quantity: Number(item.quantity) }));
-    if (!blocks.length || blocks.some((item) => !item.block || !Number.isInteger(item.quantity) || item.quantity < 0)) {
-      return toast.error("Enter a block name and a valid non-negative quantity");
-    }
-    if (busy) return; setBusy(true);
-    try {
-      await api.post("/production/daily", { ...form, blocks });
-      toast.success("Production saved"); setForm(emptyForm()); setProductionPage(1); load();
-    } catch (e) { toast.error(apiError(e)); } finally { setBusy(false); }
-  };
   const saveBlockCutting = async () => {
     if (!cutForm.block || (!cutForm.has_sheet && !cutForm.size)) {
       return toast.error(cutForm.has_sheet ? "Select a block" : "Select a block and size");
@@ -293,9 +313,18 @@ export default function Production() {
       };
       if (cutForm.id) await api.put(`/production/block-cutting/${cutForm.id}`, payload);
       else await api.post("/production/block-cutting", payload);
-      toast.success(cutForm.id ? "Block cutting updated" : "Block cutting recorded");
+      const yieldAssessment = assessBlockYield(payload.block, payload.size, piecesRecovered);
+      if (yieldAssessment.lossAlert) {
+        const unitPrice = getYieldPiecePrice(payload.size);
+        const estimatedLoss = unitPrice == null
+          ? "estimated value unavailable: no confirmed Simple price"
+          : `estimated loss ${fmtMoney(yieldAssessment.missingPieces * Number(unitPrice))}`;
+        toast.error(`LOSS ALERT: ${yieldAssessment.missingPieces} pieces missing; ${estimatedLoss}.`);
+      } else {
+        toast.success(cutForm.id ? "Block cutting updated" : "Block cutting recorded");
+      }
       setCutOpen(false);
-      setCutForm({ block: "", size: "", pieces_recovered: "", has_sheet: false });
+      setCutForm({ block: "", size: "", date: today(), pieces_recovered: "", has_sheet: false });
       api.get(showArchivedCuttings ? "/production/block-cutting?include_archived=true" : "/production/block-cutting")
         .then(setBlockCuttings).catch((e) => toast.error(apiError(e)));
     } catch (e) {
@@ -317,243 +346,6 @@ export default function Production() {
       toast.error(apiError(error));
     }
   };
-
-  const downloadTodayBlockCuttingReport = async () => {
-    try {
-      const reportDate = today();
-
-      const getLocalDate = (value) => {
-        if (!value) return "";
-        const parsed = new Date(value);
-        if (Number.isNaN(parsed.getTime())) return "";
-        return new Intl.DateTimeFormat("en-CA", {
-          timeZone: "Africa/Johannesburg",
-          year: "numeric",
-          month: "2-digit",
-          day: "2-digit",
-        }).format(parsed);
-      };
-
-      const records = blockCuttings.filter((record) =>
-        !record.archived && getLocalDate(record.created_at) === reportDate
-      );
-
-      const grouped = new Map();
-
-      records.forEach((record) => {
-        const block = String(record.block || "Unspecified").trim();
-        const size = record.has_sheet
-          ? `Sheet${record.sheet_mm ? ` - ${record.sheet_mm} mm` : ""}`
-          : String(record.size || "Unspecified").trim();
-
-        const pieces = Number(
-          record.sheet_pieces_recovered ??
-          record.pieces_recovered ??
-          0
-        ) || 0;
-
-        if (!grouped.has(block)) grouped.set(block, new Map());
-
-        const sizes = grouped.get(block);
-
-        if (!sizes.has(size)) {
-          sizes.set(size, { blocks: 0, pieces: 0 });
-        }
-
-        const item = sizes.get(size);
-        item.blocks += 1;
-        item.pieces += pieces;
-      });
-
-      const { jsPDF } = await import("jspdf");
-      const pdf = new jsPDF({
-        orientation: "landscape",
-        unit: "mm",
-        format: "a4",
-      });
-
-      const pageWidth = pdf.internal.pageSize.getWidth();
-      const pageHeight = pdf.internal.pageSize.getHeight();
-      const margin = 10;
-      const widths = [125, 65, 87];
-      let y = 42;
-      let grandBlocks = 0;
-      let grandPieces = 0;
-
-      const drawPageHeader = () => {
-        pdf.setFillColor(16, 38, 62);
-        pdf.rect(margin, 9, pageWidth - margin * 2, 23, "F");
-
-        pdf.setTextColor(255, 255, 255);
-        pdf.setFont("helvetica", "bold");
-        pdf.setFontSize(16);
-        pdf.text("SUPER IQ-FOAM", margin + 5, 19);
-
-        pdf.setFontSize(12);
-        pdf.text(
-          "BLOCK CUTTING REPORT",
-          pageWidth - margin - 5,
-          19,
-          { align: "right" }
-        );
-
-        pdf.setFontSize(9);
-        pdf.text(`Date: ${reportDate}`, margin + 5, 27);
-      };
-
-      const ensureSpace = (height) => {
-        if (y + height > pageHeight - 12) {
-          pdf.addPage();
-          drawPageHeader();
-          y = 39;
-        }
-      };
-
-      const drawCell = (x, width, value, options = {}) => {
-        pdf.setFillColor(...(options.fill || [255, 255, 255]));
-        pdf.setDrawColor(203, 213, 225);
-        pdf.rect(x, y, width, 8, "FD");
-
-        pdf.setTextColor(...(options.color || [15, 23, 42]));
-        pdf.setFont("helvetica", options.bold ? "bold" : "normal");
-        pdf.setFontSize(8);
-
-        const align = options.align || "left";
-        const textX = align === "right"
-          ? x + width - 3
-          : align === "center"
-            ? x + width / 2
-            : x + 3;
-
-        pdf.text(String(value ?? ""), textX, y + 5.3, { align });
-      };
-
-      const drawTableHeader = () => {
-        let x = margin;
-        const headers = [
-          "Measurement / Size",
-          "Blocks cut",
-          "Pieces recovered",
-        ];
-
-        headers.forEach((header, index) => {
-          drawCell(x, widths[index], header, {
-            fill: [226, 232, 240],
-            color: [15, 23, 42],
-            bold: true,
-            align: index === 0 ? "left" : "center",
-          });
-          x += widths[index];
-        });
-
-        y += 8;
-      };
-
-      drawPageHeader();
-
-      pdf.setFont("helvetica", "normal");
-      pdf.setFontSize(9);
-      pdf.setTextColor(71, 85, 105);
-      pdf.text(`Block cutting records today: ${records.length}`, margin, 37);
-
-      if (grouped.size === 0) {
-        pdf.text("No block cutting records were entered today.", margin, 50);
-      }
-
-      [...grouped.entries()]
-        .sort(([a], [b]) => a.localeCompare(b))
-        .forEach(([block, sizes]) => {
-          ensureSpace(27);
-
-          pdf.setFont("helvetica", "bold");
-          pdf.setFontSize(11);
-          pdf.setTextColor(15, 23, 42);
-          pdf.text(`BLOCK TYPE: ${block.toUpperCase()}`, margin, y);
-          y += 4;
-
-          drawTableHeader();
-
-          let typeBlocks = 0;
-          let typePieces = 0;
-
-          [...sizes.entries()]
-            .sort(([a], [b]) =>
-              a.localeCompare(b, undefined, { numeric: true })
-            )
-            .forEach(([size, values]) => {
-              ensureSpace(8);
-
-              let x = margin;
-              drawCell(x, widths[0], size);
-              x += widths[0];
-
-              drawCell(x, widths[1], values.blocks, { align: "right" });
-              x += widths[1];
-
-              drawCell(x, widths[2], values.pieces.toLocaleString(), {
-                align: "right",
-              });
-
-              y += 8;
-              typeBlocks += values.blocks;
-              typePieces += values.pieces;
-            });
-
-          ensureSpace(8);
-
-          let x = margin;
-          drawCell(x, widths[0], "BLOCK TYPE TOTAL", {
-            fill: [16, 38, 62],
-            color: [255, 255, 255],
-            bold: true,
-          });
-          x += widths[0];
-
-          drawCell(x, widths[1], typeBlocks, {
-            fill: [16, 38, 62],
-            color: [255, 255, 255],
-            bold: true,
-            align: "right",
-          });
-          x += widths[1];
-
-          drawCell(x, widths[2], typePieces.toLocaleString(), {
-            fill: [16, 38, 62],
-            color: [255, 255, 255],
-            bold: true,
-            align: "right",
-          });
-
-          y += 13;
-          grandBlocks += typeBlocks;
-          grandPieces += typePieces;
-        });
-
-      ensureSpace(12);
-
-      pdf.setFillColor(16, 38, 62);
-      pdf.rect(margin, y, pageWidth - margin * 2, 11, "F");
-
-      pdf.setTextColor(255, 255, 255);
-      pdf.setFont("helvetica", "bold");
-      pdf.setFontSize(11);
-      pdf.text("GRAND TOTAL", margin + 5, y + 7);
-
-      pdf.setFontSize(9);
-      pdf.text(
-        `Blocks cut: ${grandBlocks.toLocaleString()}  |  Total pieces: ${grandPieces.toLocaleString()}`,
-        pageWidth - margin - 5,
-        y + 7,
-        { align: "right" }
-      );
-
-      pdf.save(`block-cutting-report-${reportDate}.pdf`);
-      toast.success("Today's Block Cutting PDF downloaded");
-    } catch (error) {
-      toast.error(`Could not generate Block Cutting report: ${error.message}`);
-    }
-  };
-
   const deleteBlockCutting = async (record) => {
     if (!window.confirm(`Archive the ${record.block} ${record.size} block cutting record?`)) return;
     try {
@@ -566,6 +358,146 @@ export default function Production() {
       toast.error(apiError(e));
     }
   };
+  const downloadBlockCuttingReport = async () => {
+    if (downloadingBlockCuttingReport) return;
+    setDownloadingBlockCuttingReport(true);
+    try {
+      const records = await api.get("/production/block-cutting");
+      const compareSize = (first, second) => {
+        const firstParts = String(first).match(/\d+(?:\.\d+)?/g)?.map(Number) || [];
+        const secondParts = String(second).match(/\d+(?:\.\d+)?/g)?.map(Number) || [];
+        for (let index = 0; index < Math.max(firstParts.length, secondParts.length); index += 1) {
+          const difference = (firstParts[index] ?? 0) - (secondParts[index] ?? 0);
+          if (difference) return difference;
+        }
+        return String(first).localeCompare(String(second));
+      };
+      const totals = new Map();
+      records.forEach((record) => {
+        if (record.archived) return;
+        const block = String(record.block || "Uncategorized").trim() || "Uncategorized";
+        const size = record.has_sheet
+          ? (record.sheet_mm ? `Sheet ${record.sheet_mm} mm` : "Sheet")
+          : String(record.size || "—").trim() || "—";
+        const quantity = record.has_sheet
+          ? Number(record.sheet_pieces_recovered || record.pieces_recovered || 0)
+          : Number(record.pieces_recovered || 0);
+        if (quantity <= 0) return;
+        const key = `${block.toLocaleLowerCase()}|${size.toLocaleLowerCase()}`;
+        totals.set(key, {
+          block,
+          size,
+          quantity: (totals.get(key)?.quantity || 0) + quantity,
+        });
+      });
+      const rows = [...totals.values()].sort((first, second) => {
+        const blockDifference = first.block.localeCompare(second.block);
+        return blockDifference || compareSize(first.size, second.size);
+      });
+      const grandTotal = rows.reduce((sum, row) => sum + row.quantity, 0);
+
+      const { jsPDF } = await import("jspdf");
+      const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
+      const navy = [16, 38, 62];
+      const red = [185, 28, 28];
+      const margin = 12;
+      const pageWidth = 210;
+      let y = 14;
+
+      pdf.setFillColor(...navy);
+      pdf.rect(margin, y, pageWidth - margin * 2, 24, "F");
+      pdf.setTextColor(255, 255, 255);
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(18);
+      pdf.text("SUPER IQ-FOAM", margin + 6, y + 10);
+      pdf.setFontSize(14);
+      pdf.text("BLOCK CUTTING REPORT", pageWidth - margin - 6, y + 10, { align: "right" });
+      pdf.setFontSize(9);
+      pdf.text(`Date: ${today()}`, pageWidth - margin - 6, y + 18, { align: "right" });
+
+      y += 31;
+      const categoryWidth = 75;
+      const sizeWidth = 65;
+      const quantityWidth = pageWidth - margin * 2 - categoryWidth - sizeWidth;
+      pdf.setFillColor(226, 232, 240);
+      pdf.setDrawColor(148, 163, 184);
+      pdf.setTextColor(15, 23, 42);
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(8);
+      pdf.rect(margin, y, categoryWidth, 9, "FD");
+      pdf.rect(margin + categoryWidth, y, sizeWidth, 9, "FD");
+      pdf.rect(margin + categoryWidth + sizeWidth, y, quantityWidth, 9, "FD");
+      pdf.text("BLOCK CATEGORY", margin + 3, y + 6);
+      pdf.text("SIZE / SHEET", margin + categoryWidth + 3, y + 6);
+      pdf.text("SHEETS / PCS RECOVERED", pageWidth - margin - 3, y + 6, { align: "right" });
+      y += 9;
+
+      pdf.setFont("helvetica", "normal");
+      if (!rows.length) {
+        pdf.rect(margin, y, pageWidth - margin * 2, 10, "FD");
+        pdf.text("No block cutting records", margin + 3, y + 6.5);
+        y += 10;
+      } else {
+        rows.forEach((row) => {
+          const rowHeight = 11;
+          if (y + rowHeight > 265) {
+            pdf.addPage("a4", "portrait");
+            y = 14;
+            pdf.setFillColor(...navy);
+            pdf.rect(margin, y, pageWidth - margin * 2, 20, "F");
+            pdf.setTextColor(255, 255, 255);
+            pdf.setFont("helvetica", "bold");
+            pdf.setFontSize(15);
+            pdf.text("SUPER IQ-FOAM", margin + 6, y + 9);
+            pdf.text("BLOCK CUTTING REPORT", pageWidth - margin - 6, y + 9, { align: "right" });
+            y += 24;
+            pdf.setFillColor(226, 232, 240);
+            pdf.setDrawColor(148, 163, 184);
+            pdf.setTextColor(15, 23, 42);
+            pdf.rect(margin, y, categoryWidth, 9, "FD");
+            pdf.rect(margin + categoryWidth, y, sizeWidth, 9, "FD");
+            pdf.rect(margin + categoryWidth + sizeWidth, y, quantityWidth, 9, "FD");
+            pdf.text("BLOCK CATEGORY", margin + 3, y + 6);
+            pdf.text("SIZE / SHEET", margin + categoryWidth + 3, y + 6);
+            pdf.text("SHEETS / PCS RECOVERED", pageWidth - margin - 3, y + 6, { align: "right" });
+            y += 9;
+          }
+
+          pdf.setFillColor(255, 255, 255);
+          pdf.setDrawColor(148, 163, 184);
+          pdf.rect(margin, y, categoryWidth, rowHeight, "FD");
+          pdf.rect(margin + categoryWidth, y, sizeWidth, rowHeight, "FD");
+          pdf.rect(margin + categoryWidth + sizeWidth, y, quantityWidth, rowHeight, "FD");
+          pdf.setTextColor(15, 23, 42);
+          pdf.setFont("helvetica", "normal");
+          pdf.setFontSize(9);
+          pdf.text(String(row.block), margin + 3, y + 7, { maxWidth: categoryWidth - 6 });
+          pdf.text(String(row.size), margin + categoryWidth + 3, y + 7, { maxWidth: sizeWidth - 6 });
+          pdf.setFont("helvetica", "bold");
+          pdf.text(String(Number(row.quantity || 0)), pageWidth - margin - 3, y + 7, { align: "right" });
+          y += rowHeight;
+        });
+      }
+
+      y += 5;
+      pdf.setFillColor(254, 242, 242);
+      pdf.setDrawColor(...red);
+      pdf.rect(margin, y, pageWidth - margin * 2, 14, "FD");
+      pdf.setTextColor(...red);
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(13);
+      pdf.text("GRAND TOTAL", margin + 5, y + 9);
+      pdf.text(String(grandTotal), pageWidth - margin - 5, y + 9, { align: "right" });
+
+      pdf.save(`block-cutting-report-${today()}.pdf`);
+      toast.success("Block Cutting Report PDF downloaded");
+    } catch (error) {
+      toast.error(`Could not download block cutting report: ${apiError(error)}`);
+    } finally {
+      setDownloadingBlockCuttingReport(false);
+    }
+  };
+
   const permanentlyDeleteBlockCutting = async (record) => {
     if (!record.archived) return;
     if (!window.confirm(`Permanently delete the ${record.block} ${record.size} block cutting record? This cannot be undone.`)) return;
@@ -598,7 +530,7 @@ export default function Production() {
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Production" subtitle="Record block quantities produced each day" />
+      <PageHeader title="Production" subtitle="Block counts are synchronized from Production Management." />
       {canRecordBlockProduction && <Card className="p-5 space-y-4" data-testid="block-production-card">
         <div>
           <h2 className="font-semibold text-slate-800">Production Warehouse · Block production</h2>
@@ -713,28 +645,39 @@ export default function Production() {
       </Card>}
       <Card className="p-5">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-          <div><h2 className="font-semibold text-slate-800">Block Cutting</h2><p className="text-sm text-slate-500">Record cut block type and size without changing stock quantities.</p></div>
+          <div><h2 className="font-semibold text-slate-800">Block Cutting</h2><p className="text-sm text-slate-500">Record output yield for Big Block White and review cutting losses.</p></div>
           <div className="flex flex-wrap items-center gap-3">
             <label className="flex items-center gap-2 text-sm text-slate-600">
               <input type="checkbox" checked={showArchivedCuttings} onChange={(event) => setShowArchivedCuttings(event.target.checked)} data-testid="show-archived-block-cuttings" />
               Show archived
             </label>
-            <Btn type="button" variant="outline" onClick={downloadTodayBlockCuttingReport} data-testid="download-today-block-cutting-report"><Download size={16} /> Download Today's Report</Btn>
-            <Btn onClick={() => { setCutForm({ block: "", size: "", pieces_recovered: "", has_sheet: false }); setCutScanProduct(null); setCutOpen(true); }} data-testid="add-block-cutting-btn"><Plus size={16} /> Add Block Cutted</Btn>
+            <Btn variant="outline" onClick={downloadBlockCuttingReport} disabled={downloadingBlockCuttingReport} data-testid="download-block-cutting-report">
+              <Download size={16} /> {downloadingBlockCuttingReport ? "Preparing..." : "DOWLOAD BLOCK CUTTING REPORT"}
+            </Btn>
+            <Btn onClick={() => { setCutForm({ block: "", size: "", date: today(), pieces_recovered: "", has_sheet: false }); setCutScanProduct(null); setCutOpen(true); }} data-testid="add-block-cutting-btn"><Plus size={16} /> Add Block Cutted</Btn>
           </div>
         </div>
         {blockCuttings.length === 0 ? <p className="text-sm text-slate-400">{showArchivedCuttings ? "No archived block cutting records." : "No block cutting records yet."}</p> : (
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[800px] text-sm">
-              <thead><tr className="border-b border-border bg-slate-50 text-left text-xs text-slate-500"><th className="px-3 py-2">Block</th><th className="px-3 py-2">Size</th><th className="px-3 py-2">Pieces recovered</th><th className="px-3 py-2">Sheet</th><th className="px-3 py-2">Date and Time</th><th className="px-3 py-2 text-right">Actions</th></tr></thead>
-              <tbody>{blockCuttings.map((record) => <tr key={record.id} className="border-b border-border/70" data-testid={`block-cutting-row-${record.id}`}>
+            <table className="w-full min-w-[1180px] text-sm">
+              <thead><tr className="border-b border-border bg-slate-50 text-left text-xs text-slate-500"><th className="px-3 py-2">Block</th><th className="px-3 py-2">Block size</th><th className="px-3 py-2 text-right">Expected pcs</th><th className="px-3 py-2 text-right">Actual pcs</th><th className="px-3 py-2 text-right">Missing pcs</th><th className="px-3 py-2 text-right">Estimated loss</th><th className="px-3 py-2">Sheet</th><th className="px-3 py-2">Block cut date</th><th className="px-3 py-2 text-right">Actions</th></tr></thead>
+              <tbody>{blockCuttings.map((record) => {
+                const yieldAssessment = getBlockYield(record);
+                const unitPrice = getYieldPiecePrice(record.size);
+                const estimatedLoss = yieldAssessment.missingPieces == null || unitPrice == null
+                  ? null
+                  : yieldAssessment.missingPieces * Number(unitPrice);
+                return <tr key={record.id} className="border-b border-border/70" data-testid={`block-cutting-row-${record.id}`}>
                 <td className="px-3 py-2 font-semibold">{record.block}{record.archived && <Badge cls="ml-2 bg-amber-50 text-amber-700 border-amber-200">Archived</Badge>}</td>
                 <td className="px-3 py-2">{record.size || (record.has_sheet ? "Sheet" : "—")}</td>
-                <td className="px-3 py-2">{record.pieces_recovered ?? "—"}</td>
+                <td className="px-3 py-2 text-right">{yieldAssessment.expectedPieces ?? "—"}</td>
+                <td className="px-3 py-2 text-right">{record.pieces_recovered ?? "—"}</td>
+                <td className="px-3 py-2 text-right">{yieldAssessment.missingPieces == null ? "—" : <>{yieldAssessment.missingPieces}{yieldAssessment.lossAlert && <Badge cls="ml-2 bg-red-50 text-red-700 border-red-200">LOSS ALERT</Badge>}</>}</td>
+                <td className="px-3 py-2 text-right">{estimatedLoss == null ? "—" : fmtMoney(estimatedLoss)}</td>
                 <td className="px-3 py-2">{record.has_sheet ? (record.sheet_mm && record.sheet_pieces_recovered
                   ? `${record.sheet_mm} mm · ${record.sheet_pieces_recovered} pcs`
                   : "Yes") : "—"}</td>
-                <td className="px-3 py-2 text-slate-500">{fmtDateTime(record.created_at)}</td>
+                <td className="px-3 py-2 text-slate-500">{fmtDate(record.date || record.created_at)}</td>
                 <td className="px-3 py-2 text-right whitespace-nowrap">
                   {record.archived ? <>
                     <button onClick={() => restoreBlockCutting(record)} className="mr-3 text-emerald-700 hover:text-emerald-900" aria-label={`Restore ${record.block} ${record.size}`} data-testid={`restore-block-cutting-${record.id}`}><RotateCcw size={15} /></button>
@@ -742,13 +685,14 @@ export default function Production() {
                   </> : <>
                     <button onClick={() => { setCutForm({
                       id: record.id, block: record.block, size: record.size,
+                      date: record.date || record.created_at?.slice(0, 10) || today(),
                       pieces_recovered: record.pieces_recovered == null ? "" : String(record.pieces_recovered),
                       has_sheet: !!record.has_sheet,
                     }); setCutScanProduct(null); setCutOpen(true); }} className="mr-3 text-slate-400 hover:text-primary" aria-label={`Edit ${record.block} ${record.size}`} data-testid={`edit-block-cutting-${record.id}`}><Pencil size={15} /></button>
                     <button onClick={() => deleteBlockCutting(record)} className="text-slate-400 hover:text-red-600" aria-label={`Archive ${record.block} ${record.size}`} data-testid={`delete-block-cutting-${record.id}`}><Trash2 size={15} /></button>
                   </>}
                 </td>
-              </tr>)}</tbody>
+              </tr>})}</tbody>
             </table>
           </div>
         )}
@@ -758,13 +702,15 @@ export default function Production() {
         {!data ? <p className="p-6 text-sm text-slate-400">Loading...</p> : data.rows.length === 0 ? <Empty icon={Factory} title="No production recorded yet" /> : (
           <div className="overflow-x-auto">
           <table className="w-full text-sm">
-            <thead><tr className="text-left text-xs text-slate-400 bg-slate-50 border-b border-border"><th className="px-4 py-3">Date</th><th className="px-4">Blocks</th><th className="px-4 text-right">Total</th><th className="px-4">Notes</th><th className="px-4" /></tr></thead>
+            <thead><tr className="text-left text-xs text-slate-400 bg-slate-50 border-b border-border"><th className="px-4 py-3">Date / period</th><th className="px-4">Blocks</th><th className="px-4 text-right">Total</th><th className="px-4">Notes</th><th className="px-4" /></tr></thead>
             <tbody>{data.rows.map((r) => (
               <tr key={r.id} className="border-b border-border/60" data-testid={`prod-row-${r.id}`}>
-                <td className="px-4 py-3">{fmtDate(r.date)}{r.archived && <Badge cls="ml-2 bg-amber-50 text-amber-700 border-amber-200">Archived</Badge>}</td>
+                <td className="px-4 py-3">{r.period_start
+                  ? `Week ${r.week_number}: ${fmtDate(r.period_start)} - ${fmtDate(r.period_end)}`
+                  : fmtDate(r.date)}{r.archived && <Badge cls="ml-2 bg-amber-50 text-amber-700 border-amber-200">Archived</Badge>}</td>
                 <td className="px-4 font-mono">{(r.blocks || []).map((item) => `${item.block}: ${item.quantity}`).join(" · ") || "—"}</td>
-                <td className="px-4 text-right font-mono font-bold">{r.total_blocks ?? r.white_blocks + r.blue_blocks}</td><td className="px-4 text-slate-500">{r.notes}</td>
-                <td className="px-4 text-right">{r.archived ? <button onClick={() => restoreDaily(r)} className="text-emerald-700" aria-label="Restore production record"><RotateCcw size={15} /></button> : <><button onClick={() => setForm({ date: r.date, blocks: r.blocks?.length ? r.blocks.map((item) => ({ ...item, quantity: String(item.quantity) })) : [{ block: "White", quantity: String(r.white_blocks || "") }, { block: "Blue", quantity: String(r.blue_blocks || "") }], notes: r.notes || "" })} className="text-primary text-xs font-semibold mr-3">Edit</button><button onClick={() => del(r)} className="text-slate-400 hover:text-red-600" aria-label="Archive production record"><Trash2 size={15} /></button></>}</td>
+                <td className="px-4 text-right font-mono font-bold">{r.total_blocks ?? ((r.white_blocks || 0) + (r.blue_blocks || 0))}</td><td className="px-4 text-slate-500">{r.notes}</td>
+                <td className="px-4 text-right">{["monthly_chemical_sheet", "monthly_chemical_sheet_weekly"].includes(r.source) ? <span className="text-xs text-slate-400">From Production Management</span> : r.archived ? <button onClick={() => restoreDaily(r)} className="text-emerald-700" aria-label="Restore production record"><RotateCcw size={15} /></button> : <button onClick={() => del(r)} className="text-slate-400 hover:text-red-600" aria-label="Archive production record"><Trash2 size={15} /></button>}</td>
               </tr>))}</tbody>
           </table>
           </div>)}
@@ -783,6 +729,7 @@ export default function Production() {
           {cutScanProduct && <p className="rounded-lg bg-emerald-50 p-3 text-xs text-emerald-800">
             {cutScanProduct.product} · {cutScanProduct.dimensions} · Available stock: {cutScanProduct.current_stock}
           </p>}
+          <Input label="Block cut date" type="date" value={cutForm.date || today()} onChange={(event) => setCutForm({ ...cutForm, date: event.target.value })} required data-testid="block-cutting-date" />
           <Input label="Which block?" list="block-cutting-options" value={cutForm.block} onChange={(event) => setCutForm({ ...cutForm, block: event.target.value, size: "" })} placeholder="Choose or type a block" data-testid="block-cutting-type-select" />
           <datalist id="block-cutting-options"><option value="Black" /><option value="White" /></datalist>
           <label className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-sm text-slate-700">
@@ -796,6 +743,21 @@ export default function Production() {
             {availableSizes.map((size) => <option key={size} value={size}>{size}</option>)}
           </Select>}
           <Input label={cutForm.has_sheet ? "Pieces recovered from sheet" : "Pieces recovered from this block"} type="number" min="1" step="1" value={cutForm.pieces_recovered} onChange={(event) => setCutForm({ ...cutForm, pieces_recovered: event.target.value })} required data-testid="block-cutting-pieces-recovered" />
+          {cutExpectedYield != null && <div className="rounded-md border border-slate-200 bg-slate-50 p-3 text-sm" data-testid="block-yield-assessment">
+            <p className="font-semibold text-slate-800">Big Block White · {cutForm.size}</p>
+            <p className="mt-1 text-slate-600">Expected: {cutExpectedYield} pieces · Actual: {cutHasValidActual ? cutYieldAssessment.actualPieces : "Enter actual pieces"}</p>
+            {cutHasValidActual && cutYieldAssessment.lossAlert
+              ? <div className="mt-2 rounded border border-red-300 bg-red-50 p-2 text-red-800" role="alert" data-testid="block-loss-alert">
+                <p className="font-bold">LOSS ALERT</p>
+                <p>{cutYieldAssessment.missingPieces} pieces missing.</p>
+                <p>Estimated loss: {cutEstimatedLoss == null
+                  ? `${cutYieldAssessment.missingPieces} pieces; no confirmed price for this size`
+                  : fmtMoney(cutEstimatedLoss)}</p>
+              </div>
+              : cutHasValidActual && <p className="mt-2 font-semibold text-emerald-700" role="status" data-testid="block-yield-ok">
+                No production loss · {cutYieldAssessment.missingPieces} pieces missing
+              </p>}
+          </div>}
           <div className="flex justify-end gap-2"><Btn variant="outline" onClick={() => setCutOpen(false)}>Cancel</Btn><Btn disabled={cutBusy || !cutForm.block || (!cutForm.has_sheet && !cutForm.size)} onClick={saveBlockCutting} data-testid="save-block-cutting-btn">Confirm</Btn></div>
         </div>
       </Modal>

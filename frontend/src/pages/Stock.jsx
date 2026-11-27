@@ -1,4 +1,5 @@
-import { lazy, Suspense, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { toast } from "sonner";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { api, apiError } from "@/lib/api";
@@ -22,47 +23,6 @@ const MOVE_TYPES = [
 ];
 const TYPE_LABEL = { production: "Production Received", production_consumption: "Production Material Used", purchase: "Purchase Received", dispatch: "Delivery Dispatched", invoice: "Invoice Submitted", adjustment_in: "Adjustment In", adjustment_out: "Adjustment Out", return: "Return", damage: "Damage/Waste", reversal: "Reversal" };
 const sign = (m) => (m.direction ? m.direction : ["production", "purchase", "adjustment_in", "return"].includes(m.type) ? 1 : -1);
-const STOCK_PRODUCT_ORDER = ["Simple", "Ribbon Black", "Ribbon Pink", "Strong Boy", "Candy", "Uncovered", "Uncovered Blue 16 Density"];
-const STOCK_SIZE_ORDER = ["50", "75", "100", "120", "125", "150"];
-const PCS_OUT_SIZES = [760, 910, 1070, 1370].flatMap((width) =>
-  STOCK_SIZE_ORDER.map((depth) => `${width}x${depth}`)
-);
-
-const stockSizeValue = (size) => {
-  const match = String(size || "").match(/(?:^|x)(50|75|100|120|125|150)(?:$|x)/i);
-  return match ? match[1] : "";
-};
-
-const compareStockProducts = (a, b) => {
-  const normalize = (value) => canonicalStockProduct(value, STOCK_CATEGORY).toLocaleLowerCase();
-  const indexA = STOCK_PRODUCT_ORDER.findIndex((name) => normalizeStockLabel(normalize(name)) === normalize(a));
-  const indexB = STOCK_PRODUCT_ORDER.findIndex((name) => normalizeStockLabel(normalize(name)) === normalize(b));
-  if (indexA >= 0 || indexB >= 0) {
-    if (indexA < 0) return 1;
-    if (indexB < 0) return -1;
-    if (indexA !== indexB) return indexA - indexB;
-  }
-  return String(a || "").localeCompare(String(b || ""));
-};
-
-const compareStockSizes = (a, b) => {
-  const widthValue = (size) => {
-    const match = String(size || "").match(/^(760|910|1070|1370)[x×](50|75|100|120|125|150)$/i);
-    return match ? Number(match[1]) : 0;
-  };
-  const widthA = widthValue(a);
-  const widthB = widthValue(b);
-  if (widthA !== widthB) return widthA - widthB;
-  const indexA = STOCK_SIZE_ORDER.indexOf(stockSizeValue(a));
-  const indexB = STOCK_SIZE_ORDER.indexOf(stockSizeValue(b));
-  if (indexA !== indexB) {
-    if (indexA < 0) return 1;
-    if (indexB < 0) return -1;
-    return indexA - indexB;
-  }
-  return String(a || "").localeCompare(String(b || ""), undefined, { numeric: true });
-};
-
 const STOCK_CATEGORY = {
   "Ribbon Black": ["Ribbon Black", "Ribbon Balck", "Black"],
   "Ribbon Balck": ["Ribbon Black", "Black"],
@@ -90,54 +50,18 @@ export default function Stock() {
   const [busy, setBusy] = useState(false);
   const [updatingRightStock, setUpdatingRightStock] = useState(false);
   const [dailyCountSheet, setDailyCountSheet] = useState(null);
+  const [dailyCountCategory, setDailyCountCategory] = useState("");
   const [loadingDailyCount, setLoadingDailyCount] = useState(false);
   const [pcsOutRecords, setPcsOutRecords] = useState([]);
   const [pcsOutDraft, setPcsOutDraft] = useState({ product: "", size: "", quantity: "" });
   const [savingPcsOut, setSavingPcsOut] = useState(false);
   const [downloadingRangeReport, setDownloadingRangeReport] = useState(false);
-
-  const pcsOutCatalog = useMemo(() => {
-    const standardCategories = ["Simple", "Ribbon Black", "Ribbon Pink", "Strong Boy", "Candy", "Uncovered", "Uncovered Blue 16 Density"];
-    const categories = new Map();
-    (list || []).forEach((stock) => {
-      const rawProduct = String(stock.product || "").trim();
-      const product = canonicalStockProduct(rawProduct === "Standard" ? "Simple" : rawProduct, STOCK_CATEGORY);
-      if (product) categories.set(normalizeStockLabel(product), product);
-    });
-    (prices || []).forEach((price) => {
-      const rawCategory = String(price.category || "");
-      const normalizedCategory = ["Standard", "Simple/Mix color", "Simple/Mix Color"].includes(rawCategory) ? "Simple" : rawCategory;
-      const product = canonicalStockProduct(normalizedCategory, STOCK_CATEGORY);
-      if (product) categories.set(normalizeStockLabel(product), product);
-    });
-    standardCategories.forEach((product) => {
-      categories.set(normalizeStockLabel(product), product);
-    });
-    const sortedCategories = standardCategories
-      .filter((product) => [...categories.values()].some((value) => normalizeStockLabel(value) === normalizeStockLabel(product)))
-      .sort(compareStockProducts);
-    const sizesByCategory = new Map();
-    sortedCategories.forEach((product) => {
-      const sizes = new Map();
-      (list || []).filter((stock) => {
-        const rawProduct = String(stock.product || "").trim();
-        return canonicalStockProduct(rawProduct === "Standard" ? "Simple" : rawProduct, STOCK_CATEGORY) === product;
-      }).forEach((stock) => { if (stock.size) sizes.set(normalizeStockLabel(stock.size), String(stock.size)); });
-      (prices || []).filter((price) => {
-        const rawCategory = String(price.category || "");
-        const normalizedCategory = ["Standard", "Simple/Mix color", "Simple/Mix Color"].includes(rawCategory) ? "Simple" : rawCategory;
-        return canonicalStockProduct(normalizedCategory, STOCK_CATEGORY) === product;
-      }).forEach((price) => { if (price.size) sizes.set(normalizeStockLabel(price.size), String(price.size)); });
-      const widthOrder = [760, 910, 1070, 1370];
-      const sizeOrder = [50, 75, 100, 120, 125, 150];
-      const allowedSizes = [];
-      widthOrder.forEach((width) => sizeOrder.forEach((depth) => {
-        allowedSizes.push(`${width}x${depth}`);
-      }));
-      sizesByCategory.set(product, allowedSizes.sort(compareStockSizes));
-    });
-    return { categories: sortedCategories, sizesByCategory };
-  }, [list, prices]);
+  const [stockUpdatesMenu, setStockUpdatesMenu] = useState(null);
+  const [reportsMenu, setReportsMenu] = useState(null);
+  const stockUpdatesTriggerRef = useRef(null);
+  const reportsTriggerRef = useRef(null);
+  const stockUpdatesMenuRef = useRef(null);
+  const reportsMenuRef = useRef(null);
   const [valueZone, setValueZone] = useState(1);
   const canManagePcsOut = isSuperIqFoam && user?.is_primary_owner && user?.is_owner;
 
@@ -153,6 +77,33 @@ export default function Stock() {
     if (showHist) void loadMovements();
   };
   useEffect(() => { load(); }, []);
+  useEffect(() => {
+    if (!stockUpdatesMenu && !reportsMenu) return undefined;
+    const closeMenus = (event) => {
+      if (stockUpdatesTriggerRef.current && !stockUpdatesTriggerRef.current.contains(event.target)
+        && stockUpdatesMenuRef.current && !stockUpdatesMenuRef.current.contains(event.target)) setStockUpdatesMenu(null);
+      if (reportsTriggerRef.current && !reportsTriggerRef.current.contains(event.target)
+        && reportsMenuRef.current && !reportsMenuRef.current.contains(event.target)) setReportsMenu(null);
+    };
+    const closeMenusForViewportChange = () => { setStockUpdatesMenu(null); setReportsMenu(null); };
+    document.addEventListener("pointerdown", closeMenus);
+    window.addEventListener("resize", closeMenusForViewportChange);
+    window.addEventListener("scroll", closeMenusForViewportChange, true);
+    return () => {
+      document.removeEventListener("pointerdown", closeMenus);
+      window.removeEventListener("resize", closeMenusForViewportChange);
+      window.removeEventListener("scroll", closeMenusForViewportChange, true);
+    };
+  }, [stockUpdatesMenu, reportsMenu]);
+
+  const openFixedMenu = (event, setMenu) => {
+    event.stopPropagation();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const menuWidth = 256;
+    const left = Math.max(8, Math.min(rect.right - menuWidth, window.innerWidth - menuWidth - 8));
+    setMenu((current) => current ? null : { left, top: rect.bottom + 8 });
+  };
+
   useEffect(() => {
     if (!canManagePcsOut) return;
     api.get("/stock/pcs-out")
@@ -183,114 +134,6 @@ export default function Stock() {
     const quantity = matches.reduce((total, item) => total + Number(item.current || 0), 0);
     return quantity.toLocaleString(undefined, { maximumFractionDigits: 2 });
   };
-  const downloadPcsMadeTodayReport = async () => {
-    try {
-      const sheet = dailyCountSheet || await api.get("/stock/daily-reconciliation");
-      const { jsPDF } = await import("jspdf");
-      const pdf = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
-      const pageWidth = pdf.internal.pageSize.getWidth();
-      const madeRows = [...sheet.rows]
-        .filter((row) => Number(row.made_today || 0) > 0)
-        .sort((a, b) => compareStockProducts(a.product, b.product) || compareStockSizes(a.size, b.size));
-      const pcsRows = [...sheet.rows]
-        .filter((row) => Number(row.pcs_out || 0) > 0)
-        .sort((a, b) => compareStockProducts(a.product, b.product) || compareStockSizes(a.size, b.size));
-
-      pdf.setFillColor(16, 38, 62);
-      pdf.rect(10, 9, pageWidth - 20, 23, "F");
-      pdf.setTextColor(255, 255, 255);
-      pdf.setFont("helvetica", "bold");
-      pdf.setFontSize(16);
-      pdf.text("SUPER IQ-FOAM", 15, 19);
-      pdf.setFontSize(12);
-      pdf.text("PCS MADE TODAY REPORT", pageWidth - 15, 19, { align: "right" });
-      pdf.setFontSize(9);
-      pdf.text(`Date: ${sheet.report_date}`, 15, 27);
-
-      const drawTable = (title, rows, y) => {
-        pdf.setTextColor(15, 23, 42);
-        pdf.setFont("helvetica", "bold");
-        pdf.setFontSize(10);
-        pdf.text(title, 10, y);
-        const startY = y + 4;
-        const widths = [95, 95, 87];
-        const headers = ["Category", "Size", "Quantity"];
-        let x = 10;
-        pdf.setFillColor(226, 232, 240);
-        pdf.setDrawColor(148, 163, 184);
-        pdf.setTextColor(15, 23, 42);
-        pdf.setFont("helvetica", "bold");
-        pdf.setFontSize(8);
-        headers.forEach((header, index) => {
-          pdf.setFillColor(226, 232, 240);
-          pdf.setDrawColor(148, 163, 184);
-          pdf.setTextColor(15, 23, 42);
-          pdf.rect(x, startY, widths[index], 8, "FD");
-          pdf.text(header, x + widths[index] / 2, startY + 5.5, { align: "center" });
-          x += widths[index];
-        });
-        let rowY = startY + 8;
-        let total = 0;
-        if (!rows.length) {
-          x = 10;
-          pdf.setFillColor(255, 255, 255);
-          pdf.setTextColor(100, 116, 139);
-          pdf.setFont("helvetica", "normal");
-          headers.forEach((_, index) => {
-            pdf.rect(x, rowY, widths[index], 8, "FD");
-            x += widths[index];
-          });
-          pdf.text("No entries", 10 + widths[0] + widths[1] / 2, rowY + 5.5, { align: "center" });
-          rowY += 8;
-        }
-        rows.forEach((row) => {
-          const quantity = title === "Pieces Made Today"
-            ? Number(row.made_today_input !== undefined && row.made_today_input !== ""
-              ? row.made_today_input
-              : row.made_today || 0)
-            : Number(row.pcs_out || 0);
-          total += quantity;
-          x = 10;
-          [row.product, row.size, String(quantity)].forEach((value, index) => {
-            pdf.setFillColor(255, 255, 255);
-            pdf.setDrawColor(203, 213, 225);
-            pdf.rect(x, rowY, widths[index], 8, "FD");
-            pdf.setTextColor(15, 23, 42);
-            pdf.setFont("helvetica", index === 2 ? "bold" : "normal");
-            pdf.text(String(value), x + (index === 2 ? widths[index] - 4 : widths[index] / 2), rowY + 5.5, { align: index === 2 ? "right" : "center" });
-            x += widths[index];
-          });
-          rowY += 8;
-        });
-        x = 10;
-        pdf.setFillColor(16, 38, 62);
-        pdf.setTextColor(255, 255, 255);
-        pdf.setFont("helvetica", "bold");
-        pdf.rect(x, rowY, widths[0] + widths[1], 8, "F");
-        pdf.text("TOTAL", x + 3, rowY + 5.5);
-        pdf.rect(x + widths[0] + widths[1], rowY, widths[2], 8, "F");
-        pdf.text(String(total), x + widths[0] + widths[1] + widths[2] - 3, rowY + 5.5, { align: "right" });
-        return { total, endY: rowY + 8 };
-      };
-
-      const made = drawTable("Pieces Made Today", madeRows, 42);
-      const pcs = drawTable("PCS Out", pcsRows, made.endY + 18);
-      const grandY = pcs.endY + 12;
-      pdf.setFillColor(31, 78, 121);
-      pdf.rect(10, grandY, pageWidth - 20, 10, "F");
-      pdf.setTextColor(255, 255, 255);
-      pdf.setFont("helvetica", "bold");
-      pdf.setFontSize(11);
-      pdf.text("GRAND TOTAL", 15, grandY + 7);
-      pdf.text(String(made.total + pcs.total), pageWidth - 15, grandY + 7, { align: "right" });
-
-      pdf.save(`pcs-made-today-${sheet.report_date}.pdf`);
-      toast.success("PCS Made Today report downloaded");
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not download PCS Made Today report");
-    }
-  };
-
   const downloadRangeReport = async ({ blank = false } = {}) => {
     if (downloadingRangeReport) return;
     setDownloadingRangeReport(true);
@@ -316,6 +159,7 @@ export default function Stock() {
     setLoadingDailyCount(true);
     try {
       const report = await api.get("/stock/daily-reconciliation");
+      setDailyCountCategory("");
       setDailyCountSheet({
         ...report,
         rows: report.rows.map((row) => ({
@@ -329,6 +173,158 @@ export default function Stock() {
     } finally {
       setUpdatingRightStock(false);
       setLoadingDailyCount(false);
+    }
+  };
+
+  const downloadDailyStockReport = async () => {
+    if (downloadingRangeReport || updatingRightStock) return;
+    setDownloadingRangeReport(true);
+    setStockUpdatesMenu(null);
+    setReportsMenu(null);
+    try {
+      const report = await api.get("/stock/daily-reconciliation");
+      const rows = report.rows
+        .map((row) => ({
+          ...row,
+          made_today_value: Number(row.made_today || 0),
+          pcs_out_value: Number(row.pcs_out || 0),
+        }))
+        .sort((first, second) => {
+          const productDifference = String(first.product).localeCompare(String(second.product));
+          return productDifference || compareStockSize(first.size, second.size);
+        });
+      const aggregateRows = (sourceRows, valueKey) => {
+        const aggregated = new Map();
+        sourceRows.forEach((row) => {
+          const quantity = Number(row[valueKey] || 0);
+          if (quantity <= 0) return;
+          const product = String(row.product || "Uncategorized").trim() || "Uncategorized";
+          const size = String(row.size || "—").trim() || "—";
+          const key = `${product.toLocaleLowerCase()}|${size.toLocaleLowerCase()}`;
+          const existing = aggregated.get(key);
+          aggregated.set(key, {
+            product,
+            size,
+            [valueKey]: (existing?.[valueKey] || 0) + quantity,
+          });
+        });
+        return [...aggregated.values()].sort((first, second) => {
+          const productDifference = first.product.localeCompare(second.product);
+          return productDifference || compareStockSize(first.size, second.size);
+        });
+      };
+      const madeRows = aggregateRows(rows, "made_today_value");
+      const pcsOutRows = aggregateRows(rows, "pcs_out_value");
+      const madeTotal = madeRows.reduce((sum, row) => sum + row.made_today_value, 0);
+      const pcsOutTotal = pcsOutRows.reduce((sum, row) => sum + row.pcs_out_value, 0);
+
+      const { jsPDF } = await import("jspdf");
+      const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
+      const navy = [16, 38, 62];
+      const red = [185, 28, 28];
+      const pageWidth = 210;
+      const margin = 12;
+      let y = 14;
+
+      pdf.setFillColor(...navy);
+      pdf.rect(margin, y, pageWidth - margin * 2, 24, "F");
+      pdf.setTextColor(255, 255, 255);
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(18);
+      pdf.text("SUPER IQ-FOAM", margin + 6, y + 10);
+      pdf.setFontSize(14);
+      pdf.text("DAILY STOCK REPORT", pageWidth - margin - 6, y + 10, { align: "right" });
+      pdf.setFontSize(9);
+      pdf.text(`Date: ${report.report_date}`, pageWidth - margin - 6, y + 18, { align: "right" });
+
+      const drawTable = (title, tableRows, valueKey, total, addGrandTotal = false) => {
+        y += 31;
+        pdf.setTextColor(...navy);
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(11);
+        pdf.text(title, margin, y);
+        y += 5;
+
+        const x = margin;
+        const categoryWidth = 70;
+        const sizeWidth = 55;
+        const quantityWidth = pageWidth - margin * 2 - categoryWidth - sizeWidth;
+        pdf.setFillColor(226, 232, 240);
+        pdf.setDrawColor(148, 163, 184);
+        pdf.setTextColor(15, 23, 42);
+        pdf.rect(x, y, categoryWidth, 8, "FD");
+        pdf.rect(x + categoryWidth, y, sizeWidth, 8, "FD");
+        pdf.rect(x + categoryWidth + sizeWidth, y, quantityWidth, 8, "FD");
+        pdf.setFontSize(8);
+        pdf.text("CATEGORY", x + 3, y + 5.2);
+        pdf.text("SIZE", x + categoryWidth + 3, y + 5.2);
+        pdf.text("QUANTITY", x + categoryWidth + sizeWidth + quantityWidth - 3, y + 5.2, { align: "right" });
+        y += 8;
+
+        pdf.setFont("helvetica", "normal");
+        if (!tableRows.length) {
+          pdf.rect(x, y, pageWidth - margin * 2, 10, "FD");
+          pdf.setTextColor(100, 116, 139);
+          pdf.setFont("helvetica", "normal");
+          pdf.setFontSize(8);
+          pdf.text("No entries", x + 3, y + 6.5);
+          y += 10;
+        } else {
+          tableRows.forEach((row) => {
+            const rowHeight = 11;
+            pdf.setDrawColor(148, 163, 184);
+            pdf.setFillColor(255, 255, 255);
+            pdf.rect(x, y, categoryWidth, rowHeight, "FD");
+            pdf.rect(x + categoryWidth, y, sizeWidth, rowHeight, "FD");
+            pdf.rect(x + categoryWidth + sizeWidth, y, quantityWidth, rowHeight, "FD");
+            pdf.setTextColor(15, 23, 42);
+            pdf.setFont("helvetica", "normal");
+            pdf.setFontSize(9);
+            pdf.text(String(row.product), x + 3, y + 7);
+            pdf.text(String(row.size), x + categoryWidth + 3, y + 7);
+            pdf.setFont("helvetica", "bold");
+            pdf.text(String(Number(row[valueKey] || 0)), x + categoryWidth + sizeWidth + quantityWidth - 3, y + 7, { align: "right" });
+            y += rowHeight;
+          });
+        }
+
+        pdf.setFillColor(241, 245, 249);
+        pdf.setFont("helvetica", "bold");
+        pdf.rect(x, y, categoryWidth + sizeWidth, 9, "FD");
+        pdf.rect(x + categoryWidth + sizeWidth, y, quantityWidth, 9, "FD");
+        pdf.text("TOTAL", x + 3, y + 6);
+        pdf.text(String(total), x + categoryWidth + sizeWidth + quantityWidth - 3, y + 6, { align: "right" });
+
+        if (addGrandTotal) {
+          y += 15;
+          pdf.setFillColor(254, 242, 242);
+          pdf.setDrawColor(...red);
+          pdf.rect(margin, y, pageWidth - margin * 2, 12, "FD");
+          pdf.setTextColor(...red);
+          pdf.setFontSize(12);
+          pdf.text("GRAND TOTAL", margin + 4, y + 8);
+          pdf.text(String(total), pageWidth - margin - 4, y + 8, { align: "right" });
+        }
+      };
+
+      drawTable("1. PIECES MADE TO STOCK TODAY", madeRows, "made_today_value", madeTotal);
+      drawTable("2. PCS OUT TODAY", pcsOutRows, "pcs_out_value", pcsOutTotal);
+      y += 3;
+      pdf.setFillColor(254, 242, 242);
+      pdf.setDrawColor(...red);
+      pdf.rect(margin, y, pageWidth - margin * 2, 14, "FD");
+      pdf.setTextColor(...red);
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(13);
+      pdf.text("GRAND TOTAL - STOCK + PCS OUT", margin + 5, y + 9);
+      pdf.text(String(madeTotal + pcsOutTotal), pageWidth - margin - 5, y + 9, { align: "right" });
+
+      pdf.save(`daily-stock-report-${report.report_date}.pdf`);
+      toast.success("Daily Stock Report PDF downloaded");
+    } catch (error) {
+      toast.error(`Could not download today's stock report: ${apiError(error)}`);
+    } finally {
+      setDownloadingRangeReport(false);
     }
   };
 
@@ -408,6 +404,25 @@ export default function Stock() {
   };
 
   const getTotalStock = () => getCanonicalStock().reduce((sum, s) => sum + Number(s.current || 0), 0);
+
+  const compareStockSize = (first, second) => {
+    const firstParts = String(first).toLowerCase().match(/\d+(?:\.\d+)?/g)?.map(Number) || [];
+    const secondParts = String(second).toLowerCase().match(/\d+(?:\.\d+)?/g)?.map(Number) || [];
+    const length = Math.max(firstParts.length, secondParts.length);
+    for (let index = 0; index < length; index += 1) {
+      const difference = (firstParts[index] ?? 0) - (secondParts[index] ?? 0);
+      if (difference) return difference;
+    }
+    return String(first).localeCompare(String(second));
+  };
+
+  const dailyCountCategories = [...new Set((dailyCountSheet?.rows || []).map((row) => row.product).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  const visibleDailyCountRows = (dailyCountSheet?.rows || [])
+    .filter((row) => !dailyCountCategory || row.product === dailyCountCategory)
+    .sort((first, second) => {
+      const productDifference = String(first.product).localeCompare(String(second.product));
+      return productDifference || compareStockSize(first.size, second.size);
+    });
 
   const getStockValueTotal = (zone) => {
     let total = 0;
@@ -583,72 +598,99 @@ export default function Stock() {
     <div>
       <PageHeader title="Finished Stock" subtitle="Calculated from the stock movement ledger" />
 
-      {isSuperIqFoam && (
-        <div className="no-print mb-5 flex flex-wrap items-center justify-between gap-4 border-b border-slate-200 pb-4" data-testid="stock-update-actions">
-          <div className="flex flex-wrap items-center gap-2">
-          {user?.is_primary_owner && user?.is_owner && (
-            <>
-              <Btn
-                type="button"
-                variant="outline"
-                onClick={openDailyCountSheet}
-                disabled={updatingRightStock || busy || list === null}
-                data-testid="update-daily-stock"
-              >
-                {loadingDailyCount ? "Loading..." : "COMPILE STOCK UPDATE"}
-              </Btn>
-              <Btn
-                type="button"
-                variant="outline"
-                onClick={updateSuppliedRightStock}
-                disabled={updatingRightStock || busy || list === null}
-                data-testid="update-right-stock"
-              >
-                {updatingRightStock && !loadingDailyCount ? "Updating..." : "UPDATE STOCK"}
-              </Btn>
-            </>
-          )}
+      <div className="no-print relative z-40 mb-5 flex flex-wrap items-center justify-between gap-4 border-b border-slate-200 pb-4" data-testid="stock-update-actions">
+        <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap">
+          {addProductAction}
+          {searchAction}
           {productIdsAction}
           {ledgerAction}
-          </div>
-          <details className="relative">
-            <summary className="inline-flex cursor-pointer list-none items-center gap-2 rounded-md border border-border bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition-colors hover:bg-secondary/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20">
-              <Download size={16} /> Reports <ChevronDown size={15} />
-            </summary>
-            <div className="absolute right-0 z-30 mt-2 flex min-w-64 flex-col gap-2 rounded-lg border border-border bg-white p-2 shadow-lg">
-          <Btn
-            type="button"
-            variant="outline"
-            className="justify-start"
-            onClick={downloadPcsMadeTodayReport}
-            data-testid="download-pcs-made-today"
-          >
-            <Download size={16} /> Download PCS Made Today
-          </Btn>
-          <Btn
-            type="button"
-            variant="outline"
-            className="justify-start"
-            onClick={() => downloadRangeReport({ blank: true })}
-            disabled={downloadingRangeReport}
-            data-testid="download-stock-count-sheet"
-          >
-            <Download size={16} /> {downloadingRangeReport ? "Preparing..." : "Stock Calculating Sheet"}
-          </Btn>
-              <Btn
-                type="button"
-                variant="outline"
-                className="justify-start"
-                onClick={() => downloadRangeReport()}
-                disabled={downloadingRangeReport}
-                data-testid="download-product-range-report"
-              >
-                <Download size={16} /> {downloadingRangeReport ? "Preparing..." : "Current Stock PDF"}
-              </Btn>
-            </div>
-          </details>
         </div>
-      )}
+
+        <div className="flex flex-wrap items-center gap-2">
+          {isSuperIqFoam && user?.is_primary_owner && user?.is_owner && (
+            <>
+              <button
+                ref={stockUpdatesTriggerRef}
+                type="button"
+                onClick={(event) => openFixedMenu(event, setStockUpdatesMenu)}
+                className="inline-flex cursor-pointer list-none items-center gap-2 rounded-md border border-border bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition-colors hover:bg-secondary/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20"
+                aria-expanded={!!stockUpdatesMenu}
+              >
+                <ArrowUpDown size={16} /> Stock updates <ChevronDown size={15} />
+              </button>
+              {stockUpdatesMenu && createPortal(
+              <div ref={stockUpdatesMenuRef} style={{ left: stockUpdatesMenu.left, top: stockUpdatesMenu.top, width: 256, zIndex: 1000 }} className="fixed flex flex-col gap-2 rounded-lg border border-border bg-white p-2 shadow-xl">
+                <Btn
+                  type="button"
+                  variant="outline"
+                  className="w-full justify-start whitespace-normal text-left"
+                  onClick={openDailyCountSheet}
+                  disabled={updatingRightStock || busy || list === null}
+                  data-testid="update-daily-stock"
+                >
+                  {loadingDailyCount ? "Loading..." : "COMPILE STOCK UPDATE"}
+                </Btn>
+                <Btn
+                  type="button"
+                  variant="outline"
+                  className="w-full justify-start whitespace-normal text-left"
+                  onClick={updateSuppliedRightStock}
+                  disabled={updatingRightStock || busy || list === null}
+                  data-testid="update-right-stock"
+                >
+                  {updatingRightStock && !loadingDailyCount ? "Updating..." : "UPDATE STOCK"}
+                </Btn>
+              </div>, document.body)}
+            </>
+          )}
+          {isSuperIqFoam && (
+            <>
+              <button
+                ref={reportsTriggerRef}
+                type="button"
+                onClick={(event) => openFixedMenu(event, setReportsMenu)}
+                className="inline-flex cursor-pointer list-none items-center gap-2 rounded-md border border-border bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition-colors hover:bg-secondary/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20"
+                aria-expanded={!!reportsMenu}
+              >
+                <Download size={16} /> Reports <ChevronDown size={15} />
+              </button>
+              {reportsMenu && createPortal(
+              <div ref={reportsMenuRef} style={{ left: reportsMenu.left, top: reportsMenu.top, width: 256, zIndex: 1000 }} className="fixed flex flex-col gap-2 rounded-lg border border-border bg-white p-2 shadow-xl">
+                <Btn
+                  type="button"
+                  variant="outline"
+                  className="w-full justify-start whitespace-normal text-left"
+                  onClick={() => downloadRangeReport({ blank: true })}
+                  disabled={downloadingRangeReport}
+                  data-testid="download-stock-count-sheet"
+                >
+                  <Download size={16} /> {downloadingRangeReport ? "Preparing..." : "Stock Calculating Sheet"}
+                </Btn>
+                <Btn
+                  type="button"
+                  variant="outline"
+                  className="w-full justify-start whitespace-normal text-left"
+                  onClick={downloadDailyStockReport}
+                  disabled={downloadingRangeReport || updatingRightStock || list === null}
+                  data-testid="open-daily-stock-report"
+                >
+                  <Download size={16} /> {downloadingRangeReport ? "Preparing..." : "Daily Stock Report PDF"}
+                </Btn>
+                <Btn
+                  type="button"
+                  variant="outline"
+                  className="w-full justify-start whitespace-normal text-left"
+                  onClick={() => downloadRangeReport()}
+                  disabled={downloadingRangeReport}
+                  data-testid="download-product-range-report"
+                >
+                  <Download size={16} /> {downloadingRangeReport ? "Preparing..." : "Current Stock PDF"}
+                </Btn>
+              </div>, document.body)}
+            </>
+          )}
+        </div>
+      </div>
 
       <div className="no-print -mt-3 mb-4 flex flex-wrap items-end gap-3">
         <div className="grid w-full max-w-2xl flex-1 gap-3 sm:grid-cols-2">
@@ -668,10 +710,6 @@ export default function Stock() {
             {stockCategories.map((item) => <option key={item} value={item}>{item}</option>)}
           </Select>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          {searchAction}
-          {addProductAction}
-        </div>
       </div>
 
       <Modal
@@ -686,8 +724,17 @@ export default function Stock() {
           <div className="flex min-h-0 flex-col">
             <div className="shrink-0 space-y-3 border-b border-border/70 px-4 py-4 sm:px-6">
               <p className="text-sm text-slate-600">
-                Enter pieces made for stock separately from Pcs Out, which was produced and shipped immediately. The stock ID and book balance are shown alongside today's invoices, dispatches, other movements, and receipts. Physical count is optional; when entered, it reconciles the ledger to the actual count.
+                Enter pieces made for stock separately from Pcs Out, which was produced and shipped immediately. Choose a product category, then enter today's quantities and any optional physical count.
               </p>
+              <Select
+                label="Product category"
+                value={dailyCountCategory}
+                onChange={(event) => setDailyCountCategory(event.target.value)}
+                data-testid="daily-count-category-filter"
+              >
+                <option value="">All categories</option>
+                {dailyCountCategories.map((item) => <option key={item} value={item}>{item}</option>)}
+              </Select>
               {dailyCountSheet.already_submitted && (
                 <p className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800">
                   A production update has already been saved today. Saving again adjusts the production entry to the new total instead of double-counting it.
@@ -703,29 +750,21 @@ export default function Stock() {
               </div>
             </div>
             <div className="min-h-0 overflow-auto px-4 py-3 sm:px-6">
-              <table className="w-full min-w-[1080px] border-collapse text-left text-xs">
+              <table className="w-full min-w-[720px] border-collapse text-left text-xs">
                 <thead className="sticky top-0 z-10 bg-slate-100 text-slate-600">
                   <tr>
                     <th className="p-2">Category</th>
                     <th className="p-2">Size</th>
-                    <th className="p-2 text-right">Book balance</th>
                     <th className="p-2">Pieces made to stock today</th>
                     <th className="p-2 text-right">Pcs Out</th>
-                    <th className="p-2 text-right">Invoice out</th>
-                    <th className="p-2 text-right">Dispatched</th>
-                    <th className="p-2 text-right">Other out</th>
-                    <th className="p-2 text-right">Received in</th>
                     <th className="p-2">Physical count (optional)</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {[...dailyCountSheet.rows].sort((a, b) =>
-                    compareStockProducts(a.product, b.product) || compareStockSizes(a.size, b.size)
-                  ).map((row) => (
+                  {visibleDailyCountRows.map((row) => (
                     <tr key={row.key} className="border-b border-slate-100">
                       <td className="p-2 font-medium">{row.product}</td>
                       <td className="p-2">{row.size}</td>
-                      <td className="p-2 text-right font-mono">{row.book_quantity}</td>
                       <td className="p-2">
                         <Input
                           type="number"
@@ -744,10 +783,6 @@ export default function Stock() {
                         />
                       </td>
                       <td className="p-2 text-right font-mono">{row.pcs_out}</td>
-                      <td className="p-2 text-right font-mono">{row.invoice_out}</td>
-                      <td className="p-2 text-right font-mono">{row.dispatch_out}</td>
-                      <td className="p-2 text-right font-mono">{row.other_out}</td>
-                      <td className="p-2 text-right font-mono">{row.received_in}</td>
                       <td className="p-2">
                         {row.pcs_out > 0 && !row.has_stock_record && (
                           <p className="mb-1 text-[10px] text-slate-400">Rush pieces shipped immediately</p>
@@ -807,13 +842,13 @@ export default function Stock() {
           </div>
           <div className="grid items-end gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_10rem_auto]">
             <Select
-              label="Product"
+              label="Product category"
               value={pcsOutDraft.product}
               onChange={(event) => setPcsOutDraft((current) => ({ ...current, product: event.target.value, size: "" }))}
               data-testid="pcs-out-product"
             >
-              <option value="">Select product</option>
-              {pcsOutCatalog.categories.map((product) => <option key={product} value={product}>{product}</option>)}
+              <option value="">Select category</option>
+              {stockCategories.map((item) => <option key={item} value={item}>{item}</option>)}
             </Select>
             <Select
               label="Size"
@@ -822,7 +857,12 @@ export default function Stock() {
               data-testid="pcs-out-size"
             >
               <option value="">Select size</option>
-              {PCS_OUT_SIZES.map((size) => <option key={size} value={size}>{size}</option>)}
+              {[...new Set(canonicalStock
+                .filter((item) => normalizeStockLabel(canonicalStockProduct(item.product)) === normalizeStockLabel(canonicalStockProduct(pcsOutDraft.product)))
+                .map((item) => item.size)
+                .filter(Boolean))]
+                .sort(compareStockSize)
+                .map((item) => <option key={item} value={item}>{item}</option>)}
             </Select>
             <Input
               label="Pieces"

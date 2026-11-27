@@ -1,9 +1,9 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 import { api, apiError } from "@/lib/api";
 import { fmtMoney, fmtDateTime } from "@/lib/format";
 import { Card, Btn, Input, Select, Badge, Modal, PageHeader } from "@/components/common";
-import { Building2, Receipt, Tag, Truck, Save, Pencil, Plus, ShieldCheck, Fuel, MapPin, Trash2, UserPlus, CirclePause, CirclePlay, KeyRound, Database, RotateCcw, Search, X, Printer } from "lucide-react";
+import { Building2, Receipt, Tag, Truck, Save, Pencil, Plus, ShieldCheck, Users, MapPin, Trash2, UserPlus, CirclePause, CirclePlay, KeyRound, Database, RotateCcw, Search, X, Printer } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { usesFreeformInvoiceItems, usesUnifiedPriceList } from "@/lib/company";
 import shop2shopQr from "@/assets/shop2shop-n29rxh.png";
@@ -15,7 +15,7 @@ const TABS = [
   { k: "invoice", l: "Invoice and Tax", icon: Receipt },
   { k: "prices", l: "Price List and Products", icon: Tag },
   { k: "drivers", l: "Drivers", icon: Truck },
-  { k: "diesel", l: "Diesel", icon: Fuel },
+  { k: "online-users", l: "Online Users", icon: Users },
   { k: "access", l: "Access", icon: ShieldCheck },
   { k: "profiles", l: "Credentials", icon: KeyRound },
   { k: "print-templates", l: "Print Templates", icon: Printer },
@@ -168,6 +168,113 @@ function AccessTab({ users, companies, loading, currentUserId, isPrimaryOwner, o
   );
 }
 
+function OnlineUsersTab({ users, companies, loading, onRefresh }) {
+  const companyName = (id) =>
+    companies.find((company) => company.id === id)?.name || id || "-";
+
+  const online = users.filter((u) => u.active !== false && u.online).length;
+  const offline = users.filter((u) => u.active !== false && !u.online).length;
+  const disabled = users.filter((u) => u.active === false).length;
+
+  const roleName = (account) => {
+    if (account.is_primary_owner) return "Primary Owner";
+    if (account.is_owner) return "Company Owner";
+    if (account.is_worker) return "Worker";
+    const role = account.company_roles?.[account.current_company_id]
+      || Object.values(account.company_roles || {}).find((v) => v !== "none");
+    if (account.is_profile_account && role === "admin") return "Profile Admin";
+    return role === "admin" ? "Admin" : role === "user" ? "User" : "No assigned role";
+  };
+
+  return (
+    <Card className="p-5 space-y-4" data-testid="online-users-tab">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h3 className="font-bold text-slate-800 font-display">Online Users</h3>
+          <p className="text-sm text-slate-500 mt-1">
+            Monitor account activity and connection status.
+          </p>
+        </div>
+        <Btn onClick={onRefresh} disabled={loading} data-testid="refresh-online-users">
+          <RotateCcw size={16} className={loading ? "animate-spin" : ""} />
+          {loading ? "Refreshing..." : "Refresh Users"}
+        </Btn>
+      </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div className="rounded-lg border border-border p-3">
+          <p className="text-xs text-slate-500">Total accounts</p>
+          <p className="text-2xl font-semibold tabular-nums">{users.length}</p>
+        </div>
+        <div className="rounded-lg border border-emerald-200 p-3">
+          <p className="text-xs text-slate-500">Online</p>
+          <p className="text-2xl font-semibold text-emerald-700 tabular-nums">{online}</p>
+        </div>
+        <div className="rounded-lg border border-border p-3">
+          <p className="text-xs text-slate-500">Offline</p>
+          <p className="text-2xl font-semibold tabular-nums">{offline}</p>
+        </div>
+        <div className="rounded-lg border border-border p-3">
+          <p className="text-xs text-slate-500">Disabled</p>
+          <p className="text-2xl font-semibold tabular-nums">{disabled}</p>
+        </div>
+      </div>
+
+      {loading ? (
+        <p className="text-sm text-slate-400 py-4">Loading users...</p>
+      ) : users.length === 0 ? (
+        <p className="text-sm text-slate-400 py-4">No accounts found.</p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[760px] text-sm">
+            <thead>
+              <tr className="border-b border-border text-left text-xs text-slate-400">
+                <th className="py-3 pr-3">Account</th>
+                <th className="py-3 pr-3">Role</th>
+                <th className="py-3 pr-3">Current company</th>
+                <th className="py-3 pr-3">Status</th>
+                <th className="py-3">Last login</th>
+              </tr>
+            </thead>
+            <tbody>
+              {users.map((account) => (
+                <tr key={account.id} className="border-b border-border/60">
+                  <td className="py-3 pr-3">
+                    <p className="font-semibold text-slate-700">
+                      {account.name || account.username || "-"}
+                    </p>
+                    <p className="text-xs text-slate-500">
+                      {account.username || account.email || "-"}
+                    </p>
+                  </td>
+                  <td className="py-3 pr-3">{roleName(account)}</td>
+                  <td className="py-3 pr-3">
+                    {account.current_company_id ? companyName(account.current_company_id) : "-"}
+                  </td>
+                  <td className="py-3 pr-3">
+                    <Badge cls={
+                      account.active === false
+                        ? "bg-slate-100 text-slate-600 border-slate-200"
+                        : account.online
+                          ? "bg-emerald-50 text-emerald-800 border-emerald-200"
+                          : "bg-slate-100 text-slate-600 border-slate-200"
+                    }>
+                      {account.active === false ? "Disabled" : account.online ? "Online" : "Offline"}
+                    </Badge>
+                  </td>
+                  <td className="py-3 text-xs text-slate-500">
+                    {account.last_login ? fmtDateTime(account.last_login) : "No login yet"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
+  );
+}
+
 const R2_FREE_BYTES = 10 * 1024 ** 3;
 const fmtWhen = (entry) => entry ? `${new Date(entry.created_at).toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg" })}${entry.key ? ` (${entry.key})` : ""}` : "None yet";
 
@@ -249,7 +356,7 @@ export default function Settings() {
   const visibleTabs = TABS.filter((item) =>
     (canManageCompanySettings || !["company", "invoice", "profiles"].includes(item.k))
     && (item.k !== "prices" || !freeformInvoiceItems)
-    && (item.k !== "diesel" || user?.is_admin)
+    && (item.k !== "online-users" || (user?.is_primary_owner && user?.is_owner && !user?.is_worker))
     && (item.k !== "print-templates" || (user?.is_primary_owner && user?.is_owner && !user?.is_worker))
     && (item.k !== "access" || user?.is_owner)
     && (item.k !== "backups" || user?.is_primary_owner)
@@ -277,16 +384,26 @@ export default function Settings() {
     });
     return () => { active = false; };
   }, [user?.company_id]);
-  useEffect(() => {
-    if (tab !== "access" || !user?.is_owner) return;
-    setAccessLoading(true);
-    Promise.all([api.get("/access/users"), api.get("/companies/profiles")])
-      .then(([accounts, profiles]) => {
-        setAccessUsers([...new Map(accounts.map((account) => [account.id, account])).values()]);
-        setCompanies([...new Map(profiles.map((profile) => [profile.id, profile])).values()]);
-      })
-      .catch((e) => toast.error(apiError(e))).finally(() => setAccessLoading(false));
-  }, [tab, user?.is_owner]);
+  const refreshAccessUsers = useCallback(async () => {
+  setAccessLoading(true);
+  try {
+    const [accounts, profiles] = await Promise.all([
+      api.getUncached("/access/users"),
+      api.getUncached("/companies/profiles")
+    ]);
+    setAccessUsers([...new Map(accounts.map((account) => [account.id, account])).values()]);
+    setCompanies([...new Map(profiles.map((profile) => [profile.id, profile])).values()]);
+  } catch (e) {
+    toast.error(apiError(e));
+  } finally {
+    setAccessLoading(false);
+  }
+}, []);
+
+useEffect(() => {
+  if (!["access", "online-users"].includes(tab) || !user?.is_owner) return;
+  refreshAccessUsers();
+}, [tab, user?.is_owner, refreshAccessUsers]);
   useEffect(() => {
     if (tab !== "profiles") return;
     if (user?.is_owner) {
@@ -707,19 +824,16 @@ export default function Settings() {
         </div>
       )}
 
-      {tab === "diesel" && user?.is_admin && (
-        <Card className="p-6 max-w-2xl space-y-4" data-testid="diesel-settings-tab">
-          <div>
-            <h3 className="font-bold text-slate-800 font-display">Diesel price · Kokstad</h3>
-            <p className="text-sm text-slate-500 mt-1">Check the current local price on <a href="https://petrolprices.co.za/" target="_blank" rel="noreferrer" className="font-semibold text-primary underline">PetrolPrices.co.za</a>, then enter it here. Only an administrator can save a new price.</p>
-          </div>
-          <Input label="Diesel price per litre (R)" type="number" min="0" step="0.01" value={dieselPrice} onChange={(e) => setDieselPrice(e.target.value)} data-testid="diesel-price-input" />
-          <p className="text-xs text-slate-500">Last updated: {s.diesel_updated_at ? fmtDateTime(s.diesel_updated_at) : "Never"}</p>
-          <div><Btn onClick={saveDieselPrice} disabled={dieselSaving} data-testid="save-diesel-price-btn"><Save size={16} /> {dieselSaving ? "Saving..." : "Save Diesel Price"}</Btn></div>
-        </Card>
-      )}
 
       {tab === "access" && user?.is_owner && <AccessTab users={accessUsers} companies={companies} loading={accessLoading} currentUserId={user.id} isPrimaryOwner={user.is_primary_owner} onRoleChange={changeRole} onStatusChange={changeStatus} onRemove={setRemoveUser} onCreate={createAccessUser} onMakeOwner={makeOwner} />}
+      {tab === "online-users" && user?.is_primary_owner && user?.is_owner && !user?.is_worker && (
+        <OnlineUsersTab
+          users={accessUsers}
+          companies={companies}
+          loading={accessLoading}
+          onRefresh={refreshAccessUsers}
+        />
+      )}
 
       {tab === "backups" && (
         <div className="space-y-4" data-testid="backups-tab">
