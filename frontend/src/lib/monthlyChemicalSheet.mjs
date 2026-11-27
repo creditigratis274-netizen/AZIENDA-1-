@@ -3,9 +3,40 @@ export const MONTHLY_SHEET_CHEMICALS = [
   { key: "tdi", label: "TDI (Isocyanate)" },
   { key: "t9", label: "T-9 Catalyst" },
   { key: "silicone", label: "Silicone" },
-  { key: "amine52", label: "Amine 52" },
+  { key: "amine52", label: "Amine 52 (AMI)" },
   { key: "mcl", label: "MCL" },
+  { key: "h2o", label: "H2O (Water)" },
 ];
+
+export function suggestedChemicalKey(product) {
+  const name = String(product || "")
+    .normalize("NFD")
+    .replace(/[\\u0300-\\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+  if (name.includes("ppg") || name.includes("poliol") || name.includes("polyol")) return "ppg";
+  if (name.includes("tdi") || name.includes("isocianato")) return "tdi";
+  if (name.includes("t9") || name.includes("catalizzatore") || name.includes("catalyst")) return "t9";
+  if (name.includes("silicone") || name === "sili" || name.startsWith("sili")) return "silicone";
+  if (name.includes("amine52") || name.includes("amina52") || name === "ami"
+    || name.includes("amine") || name.includes("amina")) return "amine52";
+  if (name === "mcl" || name.includes("mcl")) return "mcl";
+  if (name === "h2o" || name.includes("water") || name.includes("acqua")) return "h2o";
+  return "";
+}
+
+export function getGrvImportReadiness(items = [], mappings = {}) {
+  const acceptedLines = items.filter((line) => Number(line.accepted_quantity) > 0);
+  const invalidLines = acceptedLines.filter((line) => !(Number(line.quantity_kg) > 0));
+  const unmappedLines = acceptedLines.filter((line) => Number(line.quantity_kg) > 0
+    && !mappings[line.line_index]);
+  return {
+    invalidLines,
+    unmappedLines,
+    readyLines: acceptedLines.filter((line) => Number(line.quantity_kg) > 0
+      && Boolean(mappings[line.line_index])),
+  };
+}
 
 export const MONTHLY_SHEET_BLOCKS = [
   { key: "big_block", label: "Big Block" },
