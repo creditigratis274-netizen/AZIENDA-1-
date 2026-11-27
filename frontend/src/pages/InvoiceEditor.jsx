@@ -803,11 +803,13 @@ export default function InvoiceEditor({ express = false }) {
       const description = freeformInvoiceItems ? normalizedCustomerPriceDescription(item.description) : "";
       if (freeformInvoiceItems ? !description : (!item.category?.trim() || !item.size?.trim())) return;
       const originalPrice = freeformInvoiceItems ? null : lookupPrice(inv.zone, item.category, item.size).price;
+      const existing = findCustomerInvoicePrice(item, inv.zone, customerInvoicePrices);
       const differsFromList = freeformInvoiceItems || originalPrice == null
         || Math.abs(price - Number(originalPrice)) > 0.005;
-      if (!differsFromList) return;
-      const existing = findCustomerInvoicePrice(item, inv.zone, customerInvoicePrices);
-      if (existing && Math.abs(price - Number(existing.price)) <= 0.005) return;
+      const differsFromSaved = existing
+        && Math.abs(price - Number(existing.price)) > 0.005;
+      if (!differsFromList && !differsFromSaved) return;
+      if (existing && !differsFromSaved) return;
       const entry = {
         zone: customerPriceZone(inv.zone),
         category: freeformInvoiceItems ? "" : invoicePriceCategory(item.category, unifiedPriceList),
