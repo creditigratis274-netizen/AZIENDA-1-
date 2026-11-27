@@ -15608,7 +15608,7 @@ def _raw_grv_items(
                 "damaged_quantity": data.get("damaged_quantity", 0),
                 "unit_cost": data.get("unit_cost", 0),
                 "container_count": data.get("container_count", data.get("accepted_quantity", 0)),
-                "container_capacity": data.get("container_capacity") or size,
+                "container_capacity": data.get("container_capacity") or (size if to_chemicals else 0),
                 "price_basis": data.get("price_basis") or ("per_unit" if to_chemicals else "per_container"),
             })
         except (TypeError, ValueError) as error:
@@ -15992,7 +15992,7 @@ async def _grv_items_from_request(
             "damaged_quantity": data.get("damaged_quantity", 0),
             "unit_cost": unit_cost,
             "container_count": data.get("container_count", data.get("accepted_quantity", 0)),
-            "container_capacity": data.get("container_capacity") or size,
+            "container_capacity": data.get("container_capacity") or 0,
             "price_basis": data.get("price_basis") or "per_container",
         }
         try:
