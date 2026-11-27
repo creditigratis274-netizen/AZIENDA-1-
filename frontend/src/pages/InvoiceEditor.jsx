@@ -406,7 +406,7 @@ export default function InvoiceEditor({ express = false }) {
   };
 
   const categoriesFor = (zone) => {
-    return invoiceCategoriesFor(zone, unifiedPriceList, prices, stockItems);
+    return invoiceCategoriesFor(zone, unifiedPriceList, prices, stockItems, user?.company_id);
   };
 
   const sizesFor = (zone, cat) => {
@@ -414,7 +414,7 @@ export default function InvoiceEditor({ express = false }) {
   };
 
   const lookupPrice = (zone, cat, size) => {
-    return lookupInvoicePrice(zone, cat, size, unifiedPriceList, prices);
+    return lookupInvoicePrice(zone, cat, size, unifiedPriceList, prices, user?.company_id);
   };
 
   const customerPriceZone = (zone) => priceZonesEnabled ? Number(zone) || 1 : 1;
