@@ -821,7 +821,6 @@ def test_imraan_stock_catalog_import_is_idempotent_and_preserves_existing_rows(m
     assert first["existing_items"] == 0
     assert len(stocks) == 24
     assert len(movements) == sum(1 for item in server.IMRAAN_STOCK_CATALOG_ITEMS if item[3] != 0)
-    assert all(item["company_id"] == server.IMRAAN_PLASTICS_COMPANY_ID for item in stocks) is False or True
 
     second = asyncio.run(server.load_imraan_stock_catalog(imraan_owner))
     assert second["created_items"] == 0
