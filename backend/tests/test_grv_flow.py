@@ -250,6 +250,38 @@ def test_grv_vat_rate_must_be_between_zero_and_one_hundred(vat_rate):
         server.GRVIn(vat_rate=vat_rate)
 
 
+def test_grv_preserves_container_price_basis_for_accepted_value(monkeypatch):
+    fake_db = FakeDatabase()
+    _install_fake_grv_dependencies(monkeypatch, fake_db)
+    user = {"email": "receiver@example.test", "name": "Receiver", "_active_company_id": "test-company"}
+
+    body = server.GRVIn(
+        purchase_order_id="po-1",
+        received_date="2026-10-29",
+        received_by="Receiver",
+        items=[server.GRVLineIn(
+            stock_id="stock-1",
+            purchase_order_item_index=0,
+            actual_received_quantity=2,
+            accepted_quantity=2,
+            container_count=2,
+            container_capacity=100,
+            price_basis="per_unit",
+        )],
+    )
+
+    async def scenario():
+        created = await server.create_grv(body, user)
+        line = created["items"][0]
+        assert line["container_count"] == 2
+        assert line["container_capacity"] == 100
+        assert line["price_basis"] == "per_unit"
+        assert line["total_quantity"] == 200
+        assert line["total_value"] == 2000
+
+    asyncio.run(scenario())
+
+
 def test_partial_grvs_update_po_and_stock_once_without_creating_buyings(monkeypatch):
     fake_db = FakeDatabase()
     _install_fake_grv_dependencies(monkeypatch, fake_db)
