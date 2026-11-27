@@ -518,11 +518,7 @@ export default function DailyReport() {
   const [financialLoading, setFinancialLoading] = useState(false);
   const [error, setError] = useState("");
   const [downloading, setDownloading] = useState(false);
-  const [whatsappEnabled, setWhatsappEnabled] = useState(() => localStorage.getItem("daily-report-whatsapp-enabled") === "true");
-  const [whatsappToken, setWhatsappToken] = useState(() => localStorage.getItem("daily-report-whatsapp-token") || "");
-  const [whatsappPhone, setWhatsappPhone] = useState(() => localStorage.getItem("daily-report-whatsapp-phone") || "+39 39 322 014 09");
-  const [whatsappTime, setWhatsappTime] = useState(() => localStorage.getItem("daily-report-whatsapp-time") || "17:00");
-  const [whatsappTesting, setWhatsappTesting] = useState(false);
+
   const reportRequestId = useRef(0);
   const companyName = report?.company_name || companyDailyReportName(user?.company_id);
   const accessibleCompanies = Array.isArray(user?.company_ids) && user.company_ids.length
@@ -613,53 +609,6 @@ export default function DailyReport() {
     };
   }, [viewMode, financialValue, accountingMode, reportCompany]);
 
-  const testWhatsAppDailyReport = async () => {
-    if (whatsappTesting) return;
-    if (!whatsappToken) return toast.error("Enter the WhatsApp helper bearer token first.");
-    const normalizedPhone = whatsappPhone.replace(/[^+0-9]/g, "");
-    if (!/^\+[1-9]\d{7,14}$/.test(normalizedPhone)) return toast.error("Enter a valid WhatsApp number with international prefix.");
-    setWhatsappTesting(true);
-    const bearerToken = whatsappToken.trim().replace(/^['"]|['"]$/g, "");
-    try {
-      let health;
-      try {
-        health = await fetch("http://127.0.0.1:8765/health", {
-          method: "GET",
-          headers: { Authorization: `Bearer ${bearerToken}` },
-        });
-      } catch (networkError) {
-        throw new Error("Cannot reach the Mac WhatsApp helper. Keep python3 server.py running and allow this browser origin in the helper.");
-      }
-      if (!health.ok) {
-        throw new Error(`WhatsApp helper health check returned ${health.status}. Restart it and verify the configured bearer token.`);
-      }
-      const report = await api.getUncached("/daily-report", { report_date: today() });
-      const { blob, filename } = await createDailyReportPdf(report, report.main_invoice_no);
-      const form = new FormData();
-      form.append("phone", normalizedPhone);
-      form.append("message", `Daily Report ${today()}`);
-      form.append("invoice_id", `daily-report-${today()}`);
-      form.append("company_id", report.company_id || user?.company_id || "superiqfoam");
-      form.append("invoice", blob, filename);
-      const response = await fetch("http://127.0.0.1:8765/api/v1/whatsapp", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${bearerToken}` },
-        body: form,
-      });
-      if (!response.ok) {
-        const detail = await response.json().catch(() => null);
-        if (response.status === 401) throw new Error("The WhatsApp helper rejected the bearer token. Copy the token again from config.json.");
-        if (response.status === 403) throw new Error("The browser origin is not allowed by the helper. Initialize it with this exact preview origin.");
-        throw new Error(detail?.error || `WhatsApp helper returned ${response.status}`);
-      }
-      toast.success(`Daily Report sent or attached for ${normalizedPhone}.`);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "WhatsApp test failed");
-    } finally {
-      setWhatsappTesting(false);
-    }
-  };
-
   const downloadPdf = async () => {
     setDownloading(true);
     try {
@@ -733,67 +682,6 @@ export default function DailyReport() {
           {downloading ? <RefreshCw size={16} className="animate-spin" /> : <Download size={16} />}
           {downloading ? "Preparing PDF..." : "DOWNLOAD COMPANY PDF"}
         </Btn>}
-        {viewMode === "daily" && user?.is_owner && user?.company_id === "superiqfoam" && (
-          <div className="flex w-full flex-wrap items-end gap-3 border-t border-slate-200 pt-4">
-            <label className="min-w-[280px] flex-1">
-              <span className="mb-2 block text-sm font-bold text-slate-700">WhatsApp helper token</span>
-              <input
-                type="password"
-                value={whatsappToken}
-                onChange={(event) => setWhatsappToken(event.target.value)}
-                onBlur={(event) => localStorage.setItem("daily-report-whatsapp-token", event.target.value.trim().replace(/^['"]|['"]$/g, ""))}
-                placeholder="Private local helper bearer token"
-                className="w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm"
-              />
-            </label>
-            <label className="min-w-[220px]">
-              <span className="mb-2 block text-sm font-bold text-slate-700">Recipient WhatsApp number</span>
-              <input
-                type="tel"
-                value={whatsappPhone}
-                onChange={(event) => {
-                  setWhatsappPhone(event.target.value);
-                  localStorage.setItem("daily-report-whatsapp-phone", event.target.value);
-                }}
-                placeholder="+39 39 322 014 09"
-                className="w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm"
-              />
-            </label>
-            <label className="min-w-[150px]">
-              <span className="mb-2 block text-sm font-bold text-slate-700">Send time (Johannesburg)</span>
-              <input
-                type="time"
-                value={whatsappTime}
-                onChange={(event) => {
-                  setWhatsappTime(event.target.value);
-                  localStorage.setItem("daily-report-whatsapp-time", event.target.value);
-                }}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm"
-              />
-            </label>
-            <Btn
-              type="button"
-              variant="outline"
-              onClick={testWhatsAppDailyReport}
-              disabled={whatsappTesting}
-              className="h-11"
-            >
-              {whatsappTesting ? "Testing WhatsApp..." : "Test send now"}
-            </Btn>
-            <label className="flex h-11 items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 text-sm font-semibold text-slate-700">
-              <input
-                type="checkbox"
-                checked={whatsappEnabled}
-                onChange={(event) => {
-                  setWhatsappEnabled(event.target.checked);
-                  localStorage.setItem("daily-report-whatsapp-enabled", String(event.target.checked));
-                  localStorage.setItem("daily-report-whatsapp-token", whatsappToken.trim().replace(/^['"]|['"]$/g, ""));
-                }}
-              />
-              Send Daily Report automatically
-            </label>
-          </div>
-        )}
       </div>
       {viewMode !== "daily" && (
         <p role="status" className="text-lg font-bold text-red-600" data-testid="financial-report-refresh-info">
