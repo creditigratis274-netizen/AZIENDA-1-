@@ -32,6 +32,8 @@ export default function Stock() {
   const { user } = useAuth();
   const canViewStockCosts = user?.is_owner || user?.is_company_owner || user?.role === "owner";
   const isSuperIqFoam = user?.company_id === "superiqfoam";
+  const isImraanPlastics = user?.company_id === "imraan-plastics";
+  const canLoadImraanCatalog = isImraanPlastics && ["owner", "admin"].includes(user?._active_role);
   const reduceMotion = useReducedMotion();
   const unifiedPriceList = usesUnifiedPriceList(user?.company_id);
   const priceZonesEnabled = usesPriceZones(user?.company_id);
@@ -49,6 +51,7 @@ export default function Stock() {
   const [showProductIds, setShowProductIds] = useState(false);
   const [busy, setBusy] = useState(false);
   const [updatingRightStock, setUpdatingRightStock] = useState(false);
+  const [loadingImraanCatalog, setLoadingImraanCatalog] = useState(false);
   const [dailyCountSheet, setDailyCountSheet] = useState(null);
   const [dailyCountCategory, setDailyCountCategory] = useState("");
   const [loadingDailyCount, setLoadingDailyCount] = useState(false);
@@ -118,10 +121,14 @@ export default function Stock() {
 
   // One row per product+size (latest record), so duplicate legacy rows are not counted twice.
   const canonicalStock = deduplicateStockRows(list || [], STOCK_CATEGORY);
-  const stockCategories = uniqueStockCategories(list || [], STOCK_CATEGORY);
+  const stockCategories = isImraanPlastics
+    ? [...new Set((list || []).map((item) => String(item.catalog_category || "").trim()).filter(Boolean))].sort()
+    : uniqueStockCategories(list || [], STOCK_CATEGORY);
   const getCanonicalStock = () => canonicalStock;
   const filteredList = canonicalStock.filter((item) =>
-    (!category || normalizeStockLabel(canonicalStockProduct(item.product)) === normalizeStockLabel(canonicalStockProduct(category)))
+    (!category || (isImraanPlastics
+      ? item.catalog_category === category
+      : normalizeStockLabel(canonicalStockProduct(item.product)) === normalizeStockLabel(canonicalStockProduct(category))))
     && (!stockSearch.trim() || `${item.product} ${item.size}`.toLowerCase().includes(stockSearch.trim().toLowerCase()))
   );
   const getRangeReportQuantity = (group, size) => {
@@ -394,6 +401,33 @@ export default function Stock() {
     }
   };
 
+  const loadImraanCatalog = async () => {
+    if (loadingImraanCatalog || list === null) return;
+    const confirmed = window.confirm(
+      "Load the 24 supplied IMRAAN PLASTICS products into this company's stock? "
+      + "Only missing products will be created. Existing quantities, invoices, costs and selling prices will not be overwritten. "
+      + "The supplied current quantities for new products will be recorded as audited stock adjustments. "
+      + "Historical invoice movements will not be recreated.",
+    );
+    if (!confirmed) return;
+    setLoadingImraanCatalog(true);
+    try {
+      const result = await api.post("/stock/load-imraan-catalog", {});
+      toast.success(
+        `IMRAAN catalogue loaded: ${result.created_items} new product(s), `
+        + `${result.existing_items} already existed, ${result.categorized_existing} category label(s) added.`,
+      );
+      if (result.category_conflicts > 0) {
+        toast.warning(`${result.category_conflicts} existing product(s) already had a different category; those labels were preserved.`);
+      }
+      load();
+    } catch (error) {
+      toast.error(`Could not load IMRAAN stock catalogue: ${apiError(error)}`);
+    } finally {
+      setLoadingImraanCatalog(false);
+    }
+  };
+
   const getTotalsByCategory = () => {
     const totals = {};
     getCanonicalStock().forEach((s) => {
@@ -601,6 +635,17 @@ export default function Stock() {
       <div className="no-print relative z-40 mb-5 flex flex-wrap items-center justify-between gap-4 border-b border-slate-200 pb-4" data-testid="stock-update-actions">
         <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap">
           {addProductAction}
+          {canLoadImraanCatalog && (
+            <Btn
+              type="button"
+              variant="outline"
+              onClick={loadImraanCatalog}
+              disabled={loadingImraanCatalog || list === null || busy}
+              data-testid="load-imraan-stock-catalog"
+            >
+              <Boxes size={16} /> {loadingImraanCatalog ? "Loading catalogue..." : "Load IMRAAN Categories & Products"}
+            </Btn>
+          )}
           {searchAction}
           {productIdsAction}
           {ledgerAction}
@@ -982,13 +1027,14 @@ export default function Stock() {
           <div className="overflow-x-auto">
             <table className={`w-full text-sm ${canViewStockCosts ? "min-w-[1180px]" : "min-w-[900px]"}`}>
               <thead><tr className="text-left text-xs text-slate-400 bg-slate-50 border-b border-border">
-                <th className="sticky left-0 z-20 bg-slate-50 px-3 py-3 font-semibold">Adjust</th><th className="px-4 py-3 font-semibold">Size</th><th className="px-4 font-semibold">Product</th><th className="px-4 font-semibold text-right">Other</th><th className="px-4 font-semibold text-right">Invoiced</th><th className="px-4 font-semibold text-right">Current Stock</th>{canViewStockCosts && <th className="px-4 font-semibold text-right">Cost (R)</th>}{unifiedPriceList || !priceZonesEnabled ? <><th className="px-4 font-semibold text-right">Selling Price</th>{canViewStockCosts && <th className="px-4 font-semibold text-right">Stock Value</th>}</> : <><th className="px-4 font-semibold text-right">Sell Zone 1</th>{canViewStockCosts && <th className="px-4 font-semibold text-right">Stock Value Zone 1</th>}<th className="px-4 font-semibold text-right">Sell Zone 2</th>{canViewStockCosts && <th className="px-4 font-semibold text-right">Stock Value Zone 2</th>}</>}<th className="sticky right-0 z-20 bg-slate-50 px-4 font-semibold text-right">Actions</th>
+                <th className="sticky left-0 z-20 bg-slate-50 px-3 py-3 font-semibold">Adjust</th>{isImraanPlastics && <th className="px-4 py-3 font-semibold">Category</th>}<th className="px-4 py-3 font-semibold">Size</th><th className="px-4 font-semibold">Product</th><th className="px-4 font-semibold text-right">Other</th><th className="px-4 font-semibold text-right">Invoiced</th><th className="px-4 font-semibold text-right">Current Stock</th>{canViewStockCosts && <th className="px-4 font-semibold text-right">Cost (R)</th>}{unifiedPriceList || !priceZonesEnabled ? <><th className="px-4 font-semibold text-right">Selling Price</th>{canViewStockCosts && <th className="px-4 font-semibold text-right">Stock Value</th>}</> : <><th className="px-4 font-semibold text-right">Sell Zone 1</th>{canViewStockCosts && <th className="px-4 font-semibold text-right">Stock Value Zone 1</th>}<th className="px-4 font-semibold text-right">Sell Zone 2</th>{canViewStockCosts && <th className="px-4 font-semibold text-right">Stock Value Zone 2</th>}</>}<th className="sticky right-0 z-20 bg-slate-50 px-4 font-semibold text-right">Actions</th>
               </tr></thead>
               <tbody>{filteredList.map((s) => (
                 <tr key={s.id} className="border-b border-border/60 hover:bg-slate-50" data-testid={`stock-row-${s.id}`}>
                   <td className="sticky left-0 z-10 bg-white px-3 whitespace-nowrap">
                     <button type="button" onClick={() => setMoveModal({ stock_id: s.id, label: `${s.product} ${s.size}`, current: s.current, type: "adjustment_in", quantity: 1, reason: "", reference: "", notes: "" })} className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300 focus-visible:ring-offset-1" aria-label={`Adjust ${s.product} ${s.size}`} data-testid={`move-stock-${s.id}`}><ArrowUpDown size={13} /> Adjust</button>
                   </td>
+                  {isImraanPlastics && <td className="px-4 py-3 text-xs font-semibold text-slate-600">{s.catalog_category || "—"}</td>}
                   <td className="px-4 py-3 text-slate-500 font-mono">{s.size}</td>
                   <td className="px-4 font-semibold text-slate-800">{s.product}</td>
                   <td className="px-4 text-right font-mono text-slate-500">{s.adjustments || 0}</td>
