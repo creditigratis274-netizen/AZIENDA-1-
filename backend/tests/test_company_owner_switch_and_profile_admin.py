@@ -532,3 +532,67 @@ def test_profile_admin_password_creates_a_real_admin_login(monkeypatch):
         assert admin_counts.documents[0]["count"] == 1
 
     asyncio.run(verify())
+
+
+def test_superiqfoam_worker_can_only_write_orders_with_explicit_permissions():
+    worker = {
+        "id": "jarvis-worker",
+        "role": "user",
+        "is_worker": True,
+        "_active_role": "user",
+        "_active_company_id": "superiqfoam",
+        "worker_allowed_sections": ["orders"],
+        "worker_write_permissions": {
+            "orders": {"create": "allow", "update": "allow", "delete": "deny"},
+        },
+    }
+
+    def request(method, path):
+        return Request({
+            "type": "http",
+            "http_version": "1.1",
+            "method": method,
+            "scheme": "https",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 1234),
+            "server": ("test", 443),
+        })
+
+    # Explicit worker permissions allow only order creation and editing.
+    server.enforce_superiqfoam_read_only(request("POST", "/api/orders"), worker)
+    server.enforce_superiqfoam_read_only(request("PUT", "/api/orders/order-1"), worker)
+    server.enforce_worker_api_access(request("POST", "/api/orders"), worker)
+    server.enforce_worker_api_access(request("PUT", "/api/orders/order-1"), worker)
+
+    # No permission, a denied operation, other sections, and deletion stay blocked.
+    with pytest.raises(HTTPException) as denied_delete:
+        server.enforce_superiqfoam_read_only(request("DELETE", "/api/orders/order-1"), worker)
+    assert denied_delete.value.status_code == 403
+
+    with pytest.raises(HTTPException) as denied_invoice:
+        server.enforce_superiqfoam_read_only(request("POST", "/api/invoices"), worker)
+    assert denied_invoice.value.status_code == 403
+
+    no_create = {
+        **worker,
+        "worker_write_permissions": {
+            "orders": {"create": "deny", "update": "allow", "delete": "deny"},
+        },
+    }
+    with pytest.raises(HTTPException) as denied_create:
+        server.enforce_superiqfoam_read_only(request("POST", "/api/orders"), no_create)
+    assert denied_create.value.status_code == 403
+
+    # Non-worker users do not inherit the worker exception.
+    regular_user = {
+        "id": "regular-user",
+        "role": "user",
+        "_active_role": "user",
+        "_active_company_id": "superiqfoam",
+    }
+    with pytest.raises(HTTPException) as denied_regular_user:
+        server.enforce_superiqfoam_read_only(request("POST", "/api/orders"), regular_user)
+    assert denied_regular_user.value.status_code == 403

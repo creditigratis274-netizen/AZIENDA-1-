@@ -527,18 +527,35 @@ def require_global_owner(user):
 
 
 def enforce_superiqfoam_read_only(request, user):
+    method = request.method.upper()
+    path = request.url.path
+    worker_order_write = (
+        worker_restrictions_apply(user)
+        and (
+            (method == "POST" and path == "/api/orders")
+            or (method == "PUT" and bool(re.fullmatch(r"/api/orders/[^/]+", path)))
+        )
+    )
+    if worker_order_write:
+        permission = worker_write_permission(user, path, method)
+        # A worker may write orders in SUPERIQFOAM only when the owner has
+        # explicitly enabled that exact create/update operation. A "supervisor"
+        # permission still passes through the one-time supervisor grant check.
+        if permission and permission[0] == "orders" and permission[2] in {"allow", "supervisor"}:
+            return
+
     if (
         user.get("_active_company_id") == DEFAULT_COMPANY_ID
         and not is_global_owner_account(user)
-        and request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
-        and request.url.path not in {
+        and method in {"POST", "PUT", "PATCH", "DELETE"}
+        and path not in {
             "/api/auth/switch-company",
             "/api/auth/logout",
             "/api/auth/device",
         }
-        and not request.url.path.startswith(("/api/notifications/", "/api/assistant/sessions"))
+        and not path.startswith(("/api/notifications/", "/api/assistant/sessions"))
     ):
-        raise HTTPException(403, "Only the Global Owner can change SuperIQFoam company data")
+        raise HTTPException(403, "Only the Global Owner can change SuperIQFOAM company data")
 
 
 async def user_from_session(token):
