@@ -57,6 +57,9 @@ const blankGRV = () => ({
   purpose: "selling", is_chemical: false,
 });
 const lineValue = (line) => grvLineCalculations(line).subtotal;
+const lineDisplayValue = (line) => String(line.unit || "").trim().toUpperCase() === "KGR"
+  ? lineValue(line)
+  : (line.total_value ?? lineValue(line));
 const savedGrvTotals = (grv) => grvTotals(grv.items || [], grv.vat_rate || 0, grv.freight_cost || 0);
 const stockItemLabel = (item) => [item.size, item.product].filter(Boolean).join(" ");
 const intercompanyInvoiceItems = (invoice) => (invoice?.items || [])
@@ -186,7 +189,7 @@ async function downloadGRVPdf(grv, companyName, settings = {}) {
       fmtMoney(line.unit_cost || 0),
       line.sale_price_zone_1 == null ? "-" : fmtMoney(line.sale_price_zone_1),
       ...(showZone2 ? [line.sale_price_zone_2 == null ? "-" : fmtMoney(line.sale_price_zone_2)] : []),
-      fmtMoney(line.total_value ?? lineValue(line)),
+      fmtMoney(lineDisplayValue(line)),
     ];
     values.forEach((value, index) => addText(
       String(value),
@@ -1260,7 +1263,7 @@ export default function GRV() {
                     {viewTarget.is_chemical && <span className="block text-[10px] text-slate-500">
                       {line.container_count ?? line.accepted_quantity ?? 0} containers × {line.container_capacity ?? line.size ?? 0} = {line.total_quantity ?? grvLineCalculations(line).totalQuantity} {line.unit || "units"}
                     </span>}
-                    {fmtMoney(line.total_value ?? lineValue(line))}
+                    {fmtMoney(lineDisplayValue(line))}
                   </td>
                 </tr>
               ))}</tbody>
