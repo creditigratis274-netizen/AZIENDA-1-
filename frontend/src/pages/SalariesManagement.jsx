@@ -416,6 +416,10 @@ export default function SalariesManagement() {
   const [ribbonReport, setRibbonReport] = useState(null);
   const [ribbonDrafts, setRibbonDrafts] = useState({});
   const [ribbonSaving, setRibbonSaving] = useState({});
+  const [currentBalances, setCurrentBalances] = useState(null);
+  const [currentBalancesOpen, setCurrentBalancesOpen] = useState(false);
+  const [currentBalancesLoading, setCurrentBalancesLoading] = useState(false);
+  const [currentBalancesRefreshedAt, setCurrentBalancesRefreshedAt] = useState("");
 
   const monthWeeks = useMemo(() => monthSalaryWeeks(monthValue), [monthValue]);
   const period = useMemo(() => {
@@ -644,6 +648,31 @@ export default function SalariesManagement() {
       .finally(() => { if (active) setHistoryLoading(false); });
     return () => { active = false; };
   }, [view, historyLoaded, historyCompanyId, user?.company_id]);
+
+  const refreshAllCurrentBalances = async () => {
+    if (currentBalancesLoading) return;
+    setCurrentBalancesLoading(true);
+    try {
+      // Reuse the existing salary report calculation. Its "balance" field
+      // is the cumulative outstanding total (all advances minus all cuts).
+      const currentDate = today();
+      const currentWeekStart = mondayOf(currentDate);
+      const currentWeekEnd = addDays(currentWeekStart, 5);
+      const result = await api.getUncached("/salaries", {
+        start_date: currentWeekStart,
+        end_date: currentWeekEnd,
+        include_monthly_salaries: true,
+      });
+      setCurrentBalances(result?.employees || []);
+      setCurrentBalancesRefreshedAt(new Date().toLocaleString());
+      setCurrentBalancesOpen(true);
+      toast.success("All current employee balances refreshed.");
+    } catch (error) {
+      toast.error("Could not refresh all current balances: " + apiError(error));
+    } finally {
+      setCurrentBalancesLoading(false);
+    }
+  };
 
   const paymentByEmployee = useMemo(() => Object.fromEntries(
     (report?.employees || []).map((employee) => {
@@ -1266,7 +1295,8 @@ export default function SalariesManagement() {
           <Btn variant={view === "payroll" ? "primary" : "outline"} className="rounded-xl" onClick={() => setView("payroll")} data-testid="salary-view-payroll"><Wallet size={15} /> Payroll</Btn>
           <Btn variant={view === "ribbon" ? "primary" : "outline"} className="rounded-xl" onClick={() => setView("ribbon")} data-testid="salary-view-ribbon"><Wallet size={15} /> Ribbon piecework</Btn>
           <Btn variant={view === "history" ? "primary" : "outline"} className="rounded-xl" onClick={() => setView("history")} data-testid="salary-view-history"><History size={15} /> Payment history</Btn>
-          {view === "payroll" && <Btn variant="outline" className="rounded-xl" disabled={loading || !report} onClick={reload} data-testid="salary-refresh"><History size={15} /> Recalculate</Btn>}
+          {view === "payroll" && <Btn variant="outline" className="rounded-xl" disabled={currentBalancesLoading} onClick={refreshAllCurrentBalances} data-testid="salary-refresh-all-current-balances"><History size={15} /> {currentBalancesLoading ? "Refreshing balances..." : "Refresh all current balances"}</Btn>}
+          {view === "payroll" && <Btn variant="outline" className="rounded-xl" disabled={loading || !report} onClick={reload} data-testid="salary-refresh"><History size={15} /> Recalculate</Btn>
           {view === "payroll" && <Btn className="rounded-xl bg-slate-950 text-white hover:bg-slate-800" disabled={loading || !report || !reportRows.length} onClick={downloadReport} data-testid="salary-download-report"><Download size={15} /> Download report</Btn>}
         </div>
       </div>
@@ -2026,6 +2056,37 @@ export default function SalariesManagement() {
           </div>}
       </Card>}
 
+      <Modal open={currentBalancesOpen} onClose={() => setCurrentBalancesOpen(false)} title="All employees — Current balances">
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
+            <span>{currentBalances?.length || 0} employees</span>
+            <span>Last refreshed: {currentBalancesRefreshedAt || "—"}</span>
+          </div>
+          <div className="max-h-[60vh] overflow-y-auto rounded-xl border border-slate-200">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 bg-slate-50 text-left text-[11px] uppercase tracking-wide text-slate-500">
+                <tr><th className="px-3 py-2">Employee</th><th className="px-3 py-2">Department</th><th className="px-3 py-2 text-right">Total current balance</th></tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {(currentBalances || []).map((employee) => (
+                  <tr key={employee.employee_id}>
+                    <td className="px-3 py-2 font-medium text-slate-800">{employee.name || "Unnamed"}</td>
+                    <td className="px-3 py-2 text-slate-500">{salaryDepartment(employee)}</td>
+                    <td className="px-3 py-2 text-right font-mono font-semibold tabular-nums">{fmtMoney(employee.balance || 0)}</td>
+                  </tr>
+                ))}
+                {!currentBalances?.length && <tr><td colSpan={3} className="px-3 py-6 text-center text-slate-500">No employee balances available.</td></tr>}
+              </tbody>
+              <tfoot className="sticky bottom-0 border-t border-slate-200 bg-slate-50">
+                <tr><td colSpan={2} className="px-3 py-2 font-semibold text-slate-700">Combined total</td><td className="px-3 py-2 text-right font-mono font-bold">{fmtMoney((currentBalances || []).reduce((sum, employee) => sum + Number(employee.balance || 0), 0))}</td></tr>
+              </tfoot>
+            </table>
+          </div>
+          <div className="flex justify-end">
+            <Btn variant="outline" onClick={() => setCurrentBalancesOpen(false)}>Close</Btn>
+          </div>
+        </div>
+      </Modal>
       <Modal open={!!advanceModal} onClose={() => setAdvanceModal(null)} title={"Add borrowed balance — " + (advanceModal?.employee_name || "")}>
         {advanceModal && <div className="space-y-4">
           <Input label="Amount borrowed (R)" type="number" min="0.01" step="0.01" value={advanceModal.amount} onChange={(event) => setAdvanceModal({ ...advanceModal, amount: event.target.value })} data-testid="salary-advance-amount" />
