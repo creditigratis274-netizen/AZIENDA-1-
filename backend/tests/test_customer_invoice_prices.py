@@ -70,9 +70,15 @@ def test_fixed_price_company_saves_prices_in_zone_one_and_preserves_other_produc
     finally:
         server.active_company_id.reset(token)
 
-    assert result[0] == {"zone": 1, "category": "Simple", "size": "910x100", "price": 44.0}
+    # Existing zone-specific prices remain untouched; new saves are shared across zones.
+    assert result[0] == original[0]
     assert result[1] == original[1]
-    assert result[2]["zone"] == 1 and result[2]["size"] == "1070x100"
+    assert result[2] == {
+        "zone": 1, "category": "Simple", "size": "910x100",
+        "description": "", "price": 44.0, "zone_independent": True,
+    }
+    assert result[3]["zone"] == 1 and result[3]["size"] == "1070x100"
+    assert result[3]["zone_independent"] is True
     assert customers.document["invoice_prices"] == result
 
 
@@ -89,6 +95,7 @@ def test_zone_company_keeps_zone_and_freeform_company_saves_description(monkeypa
     finally:
         server.active_company_id.reset(token)
     assert zone_result[0]["zone"] == 2
+    assert zone_result[0]["zone_independent"] is True
 
     freeform_body = server.CustomerInvoicePricesIn(items=[
         {"description": "Foam packaging", "price": 18},
@@ -101,7 +108,9 @@ def test_zone_company_keeps_zone_and_freeform_company_saves_description(monkeypa
     finally:
         server.active_company_id.reset(token)
     assert any(
-        item.get("description") == "Foam packaging" and item["zone"] == 1
+        item.get("description") == "Foam packaging"
+        and item["zone"] == 1
+        and item["zone_independent"] is True
         for item in freeform_result
     )
 
@@ -127,12 +136,22 @@ def test_customer_invoice_price_can_be_replaced_with_original_list_price(monkeyp
     finally:
         server.active_company_id.reset(token)
 
-    assert result == [{
+    # The previous zone-specific entry is retained; the confirmed replacement
+    # becomes the single shared price used in both zones.
+    assert result[0] == {
         "zone": 2,
         "category": "Standard",
         "size": "910x100",
+        "price": 42,
+    }
+    assert result[1] == {
+        "zone": 2,
+        "category": "Standard",
+        "size": "910x100",
+        "description": "",
         "price": 35.0,
-    }]
+        "zone_independent": True,
+    }
     assert customers.document["invoice_prices"] == result
 
 
@@ -151,3 +170,53 @@ def test_worker_without_invoice_price_permission_cannot_save_customer_price(monk
     finally:
         server.active_company_id.reset(token)
     assert error.value.status_code == 403
+
+
+
+def test_shared_customer_price_key_rejects_duplicate_product_across_zones(monkeypatch):
+    install_customer_db(monkeypatch, {"id": "customer-1", "invoice_prices": []})
+    body = server.CustomerInvoicePricesIn(items=[
+        {"zone": 1, "category": "Standard", "size": "910x100", "price": 44},
+        {"zone": 2, "category": "Standard", "size": "910x100", "price": 45},
+    ])
+    token = server.active_company_id.set("superiqfoam")
+    try:
+        with pytest.raises(HTTPException) as error:
+            asyncio.run(server.save_customer_invoice_prices(
+                "customer-1", body, user={"role": "owner"},
+            ))
+    finally:
+        server.active_company_id.reset(token)
+
+    assert error.value.status_code == 422
+
+
+def test_saving_shared_price_updates_only_shared_record_and_preserves_legacy_zone_prices(monkeypatch):
+    legacy_zone_prices = [
+        {"zone": 1, "category": "Standard", "size": "910x100", "price": 40},
+        {"zone": 2, "category": "Standard", "size": "910x100", "price": 42},
+    ]
+    existing_shared = {
+        "zone": 1, "category": "Standard", "size": "1070x100",
+        "price": 50, "zone_independent": True,
+    }
+    customers = install_customer_db(monkeypatch, {
+        "id": "customer-1",
+        "invoice_prices": legacy_zone_prices + [existing_shared],
+    })
+    body = server.CustomerInvoicePricesIn(items=[
+        {"zone": 2, "category": "Standard", "size": "1070x100", "price": 48},
+    ])
+    token = server.active_company_id.set("superiqfoam")
+    try:
+        result = asyncio.run(server.save_customer_invoice_prices(
+            "customer-1", body, user={"role": "owner"},
+        ))
+    finally:
+        server.active_company_id.reset(token)
+
+    assert result[:2] == legacy_zone_prices
+    assert result[2]["price"] == 48.0
+    assert result[2]["zone_independent"] is True
+    assert len(result) == 3
+    assert customers.document["invoice_prices"] == result
