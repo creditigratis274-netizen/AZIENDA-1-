@@ -7552,36 +7552,6 @@ class StockIn(BaseModel):
 
 
 
-IMRAAN_STOCK_CATALOG_VERSION = "2026-11-27-v1"
-# Current quantities supplied by the owner. These are imported as audited stock
-# adjustments; historical invoices and existing stock balances are never rewritten.
-IMRAAN_STOCK_CATALOG_ITEMS = [
-    ("BIN BAGS", "30 MIC", "30 MICRON BINBAGS", 0),
-    ("BIN BAGS", "32 INCH", "32 INCH 35MIC", 169),
-    ("BIN BAGS", "34 INCH", "34 INCH 35MIC", 123),
-    ("BIN BAGS", "36 INCH", "36 INCH 35MICRON", 0),
-    ("BIN BAGS", "38 INCH", "38 INCH 35MIC", 30),
-    ("BIN BAGS", "40 INCH", "40 INCH 35MIC", 48),
-    ("BIN BAGS", "40 MIC", "40 MICRON BINBAGS", 0),
-    ("BIN BAGS", "42 INCH", "42 INCH 35MIC", 141),
-    ("BIN BAGS", "43 INCH", "43 INCH 35MIC", 20),
-    ("BIN BAGS", "45INCH", "45 INCH 35MIC", 104),
-    ("BIN BAGS", "46 INCH", "46 INCH 35MIC", 1),
-    ("BIN BAGS", "47 INCH", "47 INCH 35MIC", 122),
-    ("BIN BAGS", "60 INCH", "60 INCH 35MIC", 1),
-    ("BIN BAGS", "62 INCH", "62 INCH 35MIC", -65),
-    ("BIN BAGS", "74 INCH", "74 INCH 35MIC", 0),
-    ("MATERIALS", "BLK", "BLACK MATERIAL", 0),
-    ("MATERIALS", "CLR", "COLOUR MATERIAL", 0),
-    ("MATERIALS", "STD", "COLOUR MATERIAL", -2500),
-    ("MATERIALS", "SMK", "SMOKEY MATERIAL", 0),
-    ("PLASTICS", "JUMBO", "JUMBO BLACK PLASTICS", 0),
-    ("PLASTICS", "MIDI", "MIDI BLACK PLASTICS", 0),
-    ("PLASTICS", "MINI", "MINI BLACK PLASTICS", 0),
-    ("PLASTICS", "MINI", "MINI WHITE PLASTICS", 0),
-    ("PLASTICS", "S/JUM", "SUPER JUMBO PLASTICS", 0),
-]
-
 RIGHT_STOCK_UPDATE_ITEMS = [
     ("Simple", "760x50", 150),
     ("Simple", "760x75", 305),
