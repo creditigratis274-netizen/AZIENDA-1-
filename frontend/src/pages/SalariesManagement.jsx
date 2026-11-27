@@ -982,11 +982,27 @@ export default function SalariesManagement() {
   const saveAdvance = async () => {
     if (!advanceModal || !(Number(advanceModal.amount) > 0)) return toast.error("Enter an amount greater than zero.");
     try {
-      await api.post("/salaries/advances", {
+      const savedAdvance = await api.post("/salaries/advances", {
         ...advanceModal,
         amount: Number(advanceModal.amount),
       });
-      toast.success("Borrowed balance added. Previous paid payrolls were not changed.");
+      // Update the live balance cell immediately from the server-confirmed
+      // outstanding balance; the period opening/remaining balances stay intact.
+      if (Number.isFinite(Number(savedAdvance?.balance))) {
+        setReport((current) => current ? ({
+          ...current,
+          employees: (current.employees || []).map((employee) =>
+            employee.employee_id === advanceModal.employee_id
+              ? {
+                  ...employee,
+                  balance: Number(savedAdvance.balance),
+                  available_balance: Number(savedAdvance.available_balance ?? savedAdvance.balance),
+                }
+              : employee
+          ),
+        }) : current);
+      }
+      toast.success("Borrowed balance added. Current balance updated immediately.");
       setAdvanceModal(null);
       const reloaded = await reload({ showLoading: false, resetExpanded: false });
       updateBalanceHistoryModal(reloaded?.report, advanceModal.employee_id);
