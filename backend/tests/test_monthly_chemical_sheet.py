@@ -15,6 +15,7 @@ def valid_monthly_sheet(**overrides):
         "silicone": None,
         "amine52": None,
         "mcl": None,
+        "h2o": None,
     }
     blocks = {
         key: {"quantity": None, "weight_kg": None}
