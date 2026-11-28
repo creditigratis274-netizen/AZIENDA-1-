@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { isPieceworkTailor, moneyToCents, sumPayrollRows } from "./salaryReportMath.mjs";
+import {
+  isPieceworkTailor,
+  moneyToCents,
+  payrollPaymentSummary,
+  sumPayrollRows,
+} from "./salaryReportMath.mjs";
 
 test("payroll totals add each included employee row in integer cents", () => {
   const rows = [
@@ -44,4 +49,26 @@ test("a report's totals equal exactly the rows selected for that report", () => 
     netCents: reportRows.reduce((sum, row) => sum + row.netCents, 0),
   });
   assert.equal(totals.netCents, totals.grossCents - totals.cutCents);
+});
+
+test("payment summary uses actual weekly partial payments and calculates the remaining balance", () => {
+  assert.deepEqual(
+    payrollPaymentSummary({ netCents: 10000 }, { paid_cents: 3500 }),
+    { amountPaidCents: 3500, remainingCents: 6500, status: "PARTIALLY PAID" },
+  );
+  assert.deepEqual(
+    payrollPaymentSummary({ netCents: 10000 }, { paid_cents: 10000 }),
+    { amountPaidCents: 10000, remainingCents: 0, status: "PAID" },
+  );
+});
+
+test("payment summary retains completed payroll payments and leaves unpaid rows pending", () => {
+  assert.deepEqual(
+    payrollPaymentSummary({ netCents: 10000, payment: { net_amount: "100.00" } }),
+    { amountPaidCents: 10000, remainingCents: 0, status: "PAID" },
+  );
+  assert.deepEqual(
+    payrollPaymentSummary({ netCents: 10000 }),
+    { amountPaidCents: 0, remainingCents: 10000, status: "PENDING" },
+  );
 });

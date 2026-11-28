@@ -17,3 +17,21 @@ export const sumPayrollRows = (rows) => rows.reduce((totals, row) => ({
   cutCents: totals.cutCents + row.cutCents,
   netCents: totals.netCents + row.netCents,
 }), { grossCents: 0, cutCents: 0, netCents: 0 });
+
+export const payrollPaymentSummary = (row, weeklyPayment) => {
+  const payableCents = Math.max(0, Math.trunc(Number(row.netCents) || 0));
+  const amountPaidCents = weeklyPayment
+    ? Math.max(0, Math.trunc(Number(weeklyPayment.paid_cents) || 0))
+    : row.payment
+      ? Math.max(0, moneyToCents(row.payment.net_amount))
+      : 0;
+  return {
+    amountPaidCents,
+    remainingCents: Math.max(0, payableCents - amountPaidCents),
+    status: payableCents > 0 && amountPaidCents >= payableCents
+      ? "PAID"
+      : amountPaidCents > 0
+        ? "PARTIALLY PAID"
+        : "PENDING",
+  };
+};

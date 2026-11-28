@@ -6,7 +6,12 @@ import {
 } from "lucide-react";
 import { api, apiError } from "@/lib/api";
 import { fmtMoney, today } from "@/lib/format";
-import { isPieceworkTailor, moneyToCents, sumPayrollRows } from "@/lib/salaryReportMath.mjs";
+import {
+  isPieceworkTailor,
+  moneyToCents,
+  payrollPaymentSummary,
+  sumPayrollRows,
+} from "@/lib/salaryReportMath.mjs";
 import { monthSalaryWeeks } from "@/lib/salaryPeriodMath.mjs";
 import { Badge, Btn, Card, Empty, Input, Modal, Select } from "@/components/common";
 import { useAuth } from "@/context/AuthContext";
@@ -1223,8 +1228,22 @@ export default function SalariesManagement() {
       const pageWidth = pdf.internal.pageSize.getWidth();
       const pageHeight = pdf.internal.pageSize.getHeight();
       const margin = 12;
-      const colWidths = [47, 35, 24, 30, 30, 28, 31, 27];
-      const headers = ["EMPLOYEE", "DEPARTMENT", "TYPE", "DAYS / PIECES", "GROSS", "DEDUCTION", "NET PAYABLE", "STATUS"];
+      const colWidths = [58, 27, 42, 38, 38, 34, 36];
+      const headers = ["EMPLOYEE", "TYPE", "DAYS / PIECES", "NET PAYABLE", "AMOUNT PAID", "REMAINING", "PAYMENT STATUS"];
+      const weeklyPaymentsByEmployee = new Map(
+        weeklyPlanEmployees(weeklyPlan).map((employee) => [employee.employee_id, employee]),
+      );
+      const paymentSummaries = new Map(reportRows.map((row) => [
+        row.employee.employee_id,
+        payrollPaymentSummary(
+          row,
+          periodType === "weekly" && !row.monthly
+            ? weeklyPaymentsByEmployee.get(row.employee.employee_id)
+            : null,
+        ),
+      ]));
+      const actuallyPaidCents = [...paymentSummaries.values()]
+        .reduce((sum, payment) => sum + payment.amountPaidCents, 0);
       let y = 16;
       const periodTitle = periodType === "monthly" ? "Monthly salary report" : "Weekly salary report";
       pdf.setFont("helvetica", "bold");
@@ -1239,9 +1258,9 @@ export default function SalariesManagement() {
       pdf.text("Generated: " + today(), pageWidth - margin, y, { align: "right" });
       y += 9;
       const totalsLabels = [
-        ["GROSS PAY", fmtMoney(totals.grossCents / 100)],
-        ["BALANCE DEDUCTIONS", fmtMoney(totals.cutCents / 100)],
+        ["TOTAL OUTPUT", fmtMoney(totals.grossCents / 100)],
         ["NET PAYABLE", fmtMoney(totals.netCents / 100)],
+        ["FINAL PAYMENT MADE", fmtMoney(actuallyPaidCents / 100)],
       ];
       const cardWidth = (pageWidth - margin * 2 - 8) / 3;
       totalsLabels.forEach((metric, index) => {
@@ -1284,15 +1303,15 @@ export default function SalariesManagement() {
           : showPieces
             ? String(employee.total_pieces || 0) + " pieces"
             : String(employee.present_days || 0) + " full / " + String(employee.half_days || 0) + " half";
+        const paymentSummary = paymentSummaries.get(employee.employee_id);
         const values = [
           employee.name || "Unnamed",
-          salaryDepartment(employee),
           row.monthly ? "Monthly" : (showPieces ? "Piecework" : "Weekly"),
           basis,
-          fmtMoney(row.grossCents / 100),
-          fmtMoney(row.cutCents / 100),
           fmtMoney(row.netCents / 100),
-          row.payment ? "PAID " + row.payment.payment_date : "PENDING",
+          fmtMoney(paymentSummary.amountPaidCents / 100),
+          fmtMoney(paymentSummary.remainingCents / 100),
+          paymentSummary.status,
         ];
         pdf.setFillColor(255, 255, 255);
         pdf.rect(margin, y, tableWidth, 8, "F");
