@@ -175,7 +175,7 @@ def test_dashboard_profit_uses_same_period_filters_and_excludes_reversed_payment
             {
                 "id": "grv-accepted", "received_date": "2026-10-13",
                 "status": "partially_received",
-                "items": [{"accepted_quantity": 3, "unit_cost": 10, "total_value": 30}],
+                "items": [{"accepted_quantity": 3, "unit_cost": 10, "total_value": 30, "size": "910x100"}],
             },
             {
                 "id": "grv-reversed", "received_date": "2026-10-14",

@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP
 def grv_line_total_quantity(line, accepted=None):
     accepted_quantity = float(line.get("accepted_quantity", 0) if accepted is None else accepted)
     container_count = float(line.get("container_count") or accepted_quantity)
-    container_capacity = float(line.get("container_capacity") or line.get("size") or 0)
+    container_capacity = float(line.get("container_capacity") or 0)
     unit = str(line.get("unit") or "").strip().casefold()
     price_basis = line.get("price_basis")
     # KGR is the ERP's explicit per-kilogram unit, including legacy records
@@ -21,7 +21,7 @@ def grv_line_total_quantity(line, accepted=None):
 
 def grv_line_total_value(line):
     container_count = Decimal(str(float(line.get("container_count") or line.get("accepted_quantity", 0))))
-    container_capacity = Decimal(str(float(line.get("container_capacity") or line.get("size") or 0)))
+    container_capacity = Decimal(str(float(line.get("container_capacity") or 0)))
     unit_cost = Decimal(str(float(line.get("unit_cost", 0))))
     unit = str(line.get("unit") or "").strip().casefold()
     price_basis = line.get("price_basis")
@@ -66,7 +66,7 @@ def validate_grv_line_quantities(line, *, remaining=None):
     if remaining is not None and actual_decimal > Decimal(str(remaining)):
         raise ValueError(f"Actual received quantity cannot exceed the remaining quantity ({remaining:g})")
     container_count = float(line.get("container_count") or accepted)
-    container_capacity = float(line.get("container_capacity") or line.get("size") or 0)
+    container_capacity = float(line.get("container_capacity") or 0)
     price_basis = line.get("price_basis")
     total_quantity = grv_line_total_quantity({
         **line,
