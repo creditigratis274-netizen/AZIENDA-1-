@@ -16,8 +16,9 @@ test("monthly sheet chemical names are displayed in English", () => {
     "TDI (Isocyanate)",
     "T-9 Catalyst",
     "Silicone",
-    "Amine 52",
+    "Amine 52 (AMI)",
     "MCL",
+    "H2O (Water)",
   ]);
 });
 
