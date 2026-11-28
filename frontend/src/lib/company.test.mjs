@@ -38,4 +38,3 @@ test("IMRAAN invoices use stock-backed items and keep the existing single price 
   assert.equal(usesPriceZones("iqfoam-manufactoring"), false);
   assert.equal(usesFreeformInvoiceItems("iqfoam-manufactoring"), false);
 });
-});
