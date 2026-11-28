@@ -262,7 +262,7 @@ export function createMonthlyChemicalSheetPdf(sheet, totals) {
         label,
         ...MONTHLY_SHEET_CHEMICALS.map(({ key: chemicalKey }) => quantity(sheet.formula_rates[key][chemicalKey])),
       ]),
-      widths: [60, ...Array(6).fill(34)],
+      widths: [52, ...Array(MONTHLY_SHEET_CHEMICALS.length).fill(31)],
       y,
     });
     drawTable(pdf, {
