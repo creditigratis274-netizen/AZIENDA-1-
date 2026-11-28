@@ -240,6 +240,76 @@ def test_six_day_schedule_totals_46_worked_hours():
     assert sum(day["overtime_hours"] for day in result) == 0
 
 
+def test_fixed_weekly_salary_1100_for_four_days_and_five_overtime_hours(monkeypatch):
+    employee = {
+        "id": "employee-fixed",
+        "name": "Fixed Worker",
+        "weekly_salary": 1100,
+        "overtime_rate": 50,
+    }
+    records = {
+        "employees": [employee],
+        "attendance": [
+            {
+                "employee_id": "employee-fixed",
+                "date": f"2026-10-{day:02d}",
+                "status": "Present",
+                "overtime_hours": 5 if day == 29 else 0,
+            }
+            for day in range(26, 30)
+        ],
+        "piece_production": [],
+        "salary_advances": [],
+        "salary_cuts": [],
+    }
+
+    async def fake_listall(collection, *_args, **_kwargs):
+        return records[collection]
+
+    monkeypatch.setattr(server, "listall", fake_listall)
+
+    result = asyncio.run(
+        server.salary_report("2026-10-26", "2026-10-31")
+    )["employees"][0]
+
+    assert result["fixed_weekly_salary"] == 1100
+    assert result["total_days_worked"] == 4
+    assert result["normal_salary"] == 733.33
+    assert result["overtime_hours"] == 5
+    assert result["overtime_pay"] == 105
+    assert result["gross_salary"] == 838.33
+
+
+def test_fixed_weekly_salary_six_days_is_full_salary(monkeypatch):
+    employee = {
+        "id": "employee-fixed",
+        "name": "Fixed Worker",
+        "weekly_salary": 1100,
+    }
+    records = {
+        "employees": [employee],
+        "attendance": [
+            {"employee_id": "employee-fixed", "date": f"2026-10-{day:02d}", "status": "Present"}
+            for day in range(26, 32)
+        ],
+        "piece_production": [],
+        "salary_advances": [],
+        "salary_cuts": [],
+    }
+
+    async def fake_listall(collection, *_args, **_kwargs):
+        return records[collection]
+
+    monkeypatch.setattr(server, "listall", fake_listall)
+
+    result = asyncio.run(
+        server.salary_report("2026-10-26", "2026-10-31")
+    )["employees"][0]
+
+    assert result["normal_salary"] == 1100
+    assert result["overtime_pay"] == 0
+
+
 def test_salary_report_pays_only_hours_after_17_as_overtime(monkeypatch):
     employee = {
         "id": "employee-1",

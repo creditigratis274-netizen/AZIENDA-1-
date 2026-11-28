@@ -10514,10 +10514,18 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
         overtime_hours = sum(day["overtime_hours"] for day in days)
         present_days = sum(day["status"] == "Present" for day in days)
         half_days = sum(day["status"] == "Half Day" for day in days)
+        worked_days = r2(D(present_days) + D(half_days) * D("0.5"))
         for day in days:
             if is_monthly_fixed:
                 day["regular_pay"] = 0
                 day["overtime_pay"] = 0
+            elif not is_piece_paid:
+                day["regular_pay"] = r2(
+                    D(weekly_salary or 0)
+                    * D("1" if day["status"] == "Present" else "0.5" if day["status"] == "Half Day" else "0")
+                    / D(STANDARD_PAID_DAYS_PER_WEEK)
+                )
+                day["overtime_pay"] = r2(D(day["overtime_hours"]) * D(OVERTIME_HOURLY_RATE))
             else:
                 day["regular_pay"] = r2(
                     D(weekly_salary or 0)
@@ -10534,17 +10542,25 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
                     ))
             day["pay"] = r2(D(day["regular_pay"]) + D(day["overtime_pay"]))
         override_weeks = {}
-        effective_overtime_rate = employee.get("overtime_rate")
+        effective_overtime_rate = (
+            D(OVERTIME_HOURLY_RATE) if not is_piece_paid and not is_monthly_fixed
+            else employee.get("overtime_rate")
+        )
         for day in days:
             if day.get("salary_overtime_override") is None:
                 continue
             work_date = date.fromisoformat(day["date"])
             week_start = work_date - timedelta(days=work_date.weekday())
+            overtime_rate = (
+                D(OVERTIME_HOURLY_RATE)
+                if not is_piece_paid and not is_monthly_fixed
+                else D(day.get("salary_overtime_rate_override", employee.get(
+                    "overtime_rate", OVERTIME_HOURLY_RATE,
+                )))
+            )
             override_weeks[week_start] = (
                 D(day["salary_overtime_override"]),
-                D(day.get("salary_overtime_rate_override", employee.get(
-                    "overtime_rate", OVERTIME_HOURLY_RATE,
-                ))),
+                overtime_rate,
             )
         if override_weeks and not is_monthly_fixed:
             for week_start, (override_hours, overtime_rate) in override_weeks.items():
@@ -10586,12 +10602,12 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
         regular_pay = r2(sum(
             (
                 D(weekly_salary)
-                * D(day.get("attendance_fraction", 0))
+                * D("1" if day["status"] == "Present" else "0.5" if day["status"] == "Half Day" else "0")
                 / D(STANDARD_PAID_DAYS_PER_WEEK)
                 for day in days
             ),
             Decimal("0"),
-        )) if not is_monthly_fixed else 0
+        )) if not is_piece_paid and not is_monthly_fixed else 0
         overtime_pay = r2(sum(
             (D(day["overtime_pay"]) for day in days),
             Decimal("0"),
@@ -10703,9 +10719,9 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
         if not is_piece_paid and not is_monthly_fixed:
             standard_salary_detail = calculate_salary_rule(
                 weekly_salary or 0,
-                worked_hours,
+                float(worked_days),
                 overtime_amount=overtime_pay,
-                divisor=float(employee.get("pay_divisor", 48)),
+                divisor=STANDARD_PAID_DAYS_PER_WEEK,
             )
         result.append({
             "employee_id": employee["id"], "name": employee.get("name", ""),
@@ -10733,6 +10749,10 @@ async def salary_report(start_date, end_date, *, include_monthly_salaries=False)
             "piece_days": employee_piecework["days"],
             "piece_weeks": employee_piecework["weeks"],
             "days": days, "present_days": present_days, "half_days": half_days,
+            "worked_days": float(worked_days),
+            "total_days_worked": float(worked_days),
+            "fixed_weekly_salary": r2(weekly_salary) if not is_piece_paid and not is_monthly_fixed and weekly_salary is not None else None,
+            "normal_salary": regular_pay if not is_piece_paid and not is_monthly_fixed else 0,
             "worked_hours": worked_hours,
             "regular_hours": regular_hours, "overtime_hours": overtime_hours,
             "regular_pay": regular_pay, "overtime_pay": overtime_pay, "gross_salary": gross,

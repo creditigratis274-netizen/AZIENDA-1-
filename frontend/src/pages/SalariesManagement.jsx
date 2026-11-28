@@ -218,10 +218,18 @@ function PayrollEmployeeCard({
           <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Salary this period</p>
           <p className="mt-1 font-mono text-sm font-semibold tabular-nums text-slate-700 sm:text-base">{fmtMoney(grossCents / 100)}</p>
         </div>
+        {!monthly && !showPieces && <div>
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Fixed weekly salary</p>
+          <p className="mt-1 font-mono text-sm font-semibold tabular-nums text-slate-700 sm:text-base">{fmtMoney(Number(employee.fixed_weekly_salary || employee.weekly_salary || 0))}</p>
+        </div>}
+        {!monthly && !showPieces && <div>
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Normal salary</p>
+          <p className="mt-1 font-mono text-sm font-semibold tabular-nums text-slate-700 sm:text-base">{fmtMoney(Number(employee.normal_salary || 0))}</p>
+        </div>}
         <div>
           <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Days attended</p>
           <p className="mt-1 text-sm font-semibold tabular-nums text-slate-700 sm:text-base">
-            {showPieces ? `${employee.piece_days?.length || 0} days` : `${employee.present_days || 0} full · ${employee.half_days || 0} half`} · {Number(employee.overtime_hours || 0).toLocaleString("en-ZA", { maximumFractionDigits: 2 })} {Number(employee.overtime_hours || 0) === 1 ? "hour" : "hours"} overtime
+            {showPieces ? `${employee.piece_days?.length || 0} days` : `${employee.total_days_worked ?? ((employee.present_days || 0) + (employee.half_days || 0) * 0.5)} total days · ${employee.present_days || 0} full · ${employee.half_days || 0} half`} · {Number(employee.overtime_hours || 0).toLocaleString("en-ZA", { maximumFractionDigits: 2 })} {Number(employee.overtime_hours || 0) === 1 ? "hour" : "hours"} overtime
           </p>
         </div>
         <div>
@@ -236,6 +244,17 @@ function PayrollEmployeeCard({
           <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Take-home salary</p>
           <p className="mt-1 font-mono text-sm font-bold tabular-nums text-slate-950 sm:text-base">{fmtMoney(netCents / 100)}</p>
         </div>
+        {!monthly && !showPieces && <div>
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Overtime</p>
+          <p className="mt-1 text-sm font-semibold tabular-nums text-slate-700 sm:text-base">
+            {Number(employee.overtime_hours || 0).toLocaleString("en-ZA", { maximumFractionDigits: 2 })} h · R21/h
+          </p>
+          <p className="mt-1 font-mono text-xs text-slate-500">Payment {fmtMoney(Number(employee.overtime_pay || 0))}</p>
+        </div>}
+        {!monthly && !showPieces && <div>
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Final salary</p>
+          <p className="mt-1 font-mono text-sm font-bold tabular-nums text-slate-950 sm:text-base">{fmtMoney(Number(employee.gross_salary || 0))}</p>
+        </div>}
       </div>
 
       <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
@@ -518,6 +537,14 @@ export default function SalariesManagement() {
       return null;
     } finally {
       if (showLoading) setLoading(false);
+    }
+  };
+
+  const reRecalculateWages = async () => {
+    if (!period) return;
+    const refreshed = await reload({ showLoading: true, resetExpanded: false });
+    if (refreshed) {
+      toast.success("Fixed weekly wages recalculated using 6 worked days and R21 overtime per hour.");
     }
   };
 
@@ -1302,7 +1329,7 @@ export default function SalariesManagement() {
           <Btn variant={view === "ribbon" ? "primary" : "outline"} className="rounded-xl" onClick={() => setView("ribbon")} data-testid="salary-view-ribbon"><Wallet size={15} /> Ribbon piecework</Btn>
           <Btn variant={view === "history" ? "primary" : "outline"} className="rounded-xl" onClick={() => setView("history")} data-testid="salary-view-history"><History size={15} /> Payment history</Btn>
           {view === "payroll" && <Btn variant="outline" className="rounded-xl" disabled={currentBalancesLoading} onClick={refreshAllCurrentBalances} data-testid="salary-refresh-all-current-balances"><History size={15} /> {currentBalancesLoading ? "Refreshing balances..." : "Refresh all current balances"}</Btn>}
-          {view === "payroll" && <Btn variant="outline" className="rounded-xl" disabled={loading || !report} onClick={reload} data-testid="salary-refresh"><History size={15} /> Recalculate</Btn>}
+          {view === "payroll" && <Btn variant="outline" className="rounded-xl" disabled={loading || !report} onClick={reRecalculateWages} data-testid="salary-re-recalculate-wages"><History size={15} /> Re-recalculate wages</Btn>}
           {view === "payroll" && <Btn className="rounded-xl bg-slate-950 text-white hover:bg-slate-800" disabled={loading || !report || !reportRows.length} onClick={downloadReport} data-testid="salary-download-report"><Download size={15} /> Download report</Btn>}
         </div>
       </div>
